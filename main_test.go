@@ -3,15 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestMain doubles as an escape helper: re-invoked with the env var set, it
@@ -252,6 +255,85 @@ func TestRunFailingToolCommandIsOrdinaryResult(t *testing.T) {
 	}
 	if !strings.Contains(tool.Content, "exit code: 7") {
 		t.Errorf("tool content = %q, want it to carry the exit-code line for 7", tool.Content)
+	}
+}
+
+func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
+	// Process-boundary proof: a real `seq 1 100000` generator floods the
+	// pipes, and the Tool Result message the next request carries must be
+	// the tail-truncated form — marker, bounded length, tail preserved,
+	// exit-code line last.
+	old := bashToolMaxOutput
+	bashToolMaxOutput = 256
+	defer func() { bashToolMaxOutput = old }()
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_g","type":"function","function":{"name":"bash","arguments":"{\"command\":\"seq 1 100000\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"truncation acknowledged"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"flood", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (truncation must not crash the loop); stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "truncation acknowledged\n" {
+		t.Errorf("stdout = %q, want the final answer after the flooded turn", stdout.String())
+	}
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(msgs))
+	}
+	tool := msgs[1][len(msgs[1])-1]
+	if tool.Role != "tool" || tool.ToolCallID != "call_g" {
+		t.Errorf("tool result message = %+v, want role tool with tool_call_id call_g", tool)
+	}
+	if len(tool.Content) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
+		t.Errorf("tool content = %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(tool.Content), bashToolMaxOutput)
+	}
+	if !strings.Contains(tool.Content, truncatedOutputMarker(bashToolMaxOutput)) {
+		t.Errorf("tool content = %q, want the truncation marker", tool.Content)
+	}
+	if !strings.HasSuffix(tool.Content, "exit code: 0") {
+		t.Errorf("tool content = %q, want it to end with the exit-code line", tool.Content)
+	}
+	if !strings.Contains(tool.Content, "99999\n100000") {
+		t.Errorf("tool content = %q, want the tail of the generated output (99999, 100000) present", tool.Content)
+	}
+}
+
+func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
+	// Process-boundary proof: a real `sleep 30` subprocess outlives the
+	// injected short timeout, gets killed, and the Driver keeps looping —
+	// the next request must carry the timeout as an ordinary Tool Result
+	// message, and the scripted final answer must still be reached.
+	old := bashToolTimeout
+	bashToolTimeout = 200 * time.Millisecond
+	defer func() { bashToolTimeout = old }()
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_t","type":"function","function":{"name":"bash","arguments":"{\"command\":\"sleep 30\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"recovered from timeout"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"hang up", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (timeout must not crash the loop); stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "recovered from timeout\n" {
+		t.Errorf("stdout = %q, want the final answer after the timed-out turn", stdout.String())
+	}
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 2 {
+		t.Fatalf("POSTs = %d, want 2 (loop must continue past the timeout)", len(msgs))
+	}
+	tool := msgs[1][len(msgs[1])-1]
+	if tool.Role != "tool" || tool.ToolCallID != "call_t" {
+		t.Errorf("tool result message = %+v, want role tool with tool_call_id call_t", tool)
+	}
+	if !strings.Contains(tool.Content, "timed out after 200ms") {
+		t.Errorf("tool content = %q, want it to carry the timeout wording naming the injected duration", tool.Content)
 	}
 }
 
@@ -692,6 +774,73 @@ func TestRunBashToolSignalKillReportsSignal(t *testing.T) {
 	}
 }
 
+func TestRunBashToolTimeoutKillsAndReports(t *testing.T) {
+	// A command that outlives the tool timeout must be killed and reported
+	// as a timeout naming the duration — distinct from a plain signal kill,
+	// so the model can tell them apart — and no process of that command may
+	// survive the kill.
+	old := bashToolTimeout
+	bashToolTimeout = 100 * time.Millisecond
+	defer func() { bashToolTimeout = old }()
+
+	// Reach sleep through a per-test temp dir so the exec'd sleeper's argv[0]
+	// (its full path) is unique: pgrep -f can only match this test's process,
+	// not an unrelated host "sleep 5". The symlink keeps the basename "sleep"
+	// because coreutils multicall dispatches on argv[0]'s basename.
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Fatalf("sleep not found: %v", err)
+	}
+	dir := t.TempDir()
+	probe := dir + "/sleep"
+	if err := os.Symlink(sleepBin, probe); err != nil {
+		t.Fatalf("cannot link sleep into %s: %v", dir, err)
+	}
+
+	result := runBashTool("exec " + probe + " 5")
+	if !strings.Contains(result, "timed out after 100ms") {
+		t.Errorf("runBashTool(%q) = %q, want a timeout result naming the injected duration", "exec "+probe+" 5", result)
+	}
+	out, err := exec.Command("pgrep", "-f", dir).Output()
+	if err == nil && len(bytes.TrimSpace(out)) > 0 {
+		t.Errorf("processes from the timed-out command survived: pgrep -f %q = %s", dir, out)
+	}
+}
+
+func TestRunBashToolTimeoutWithOversizedOutput(t *testing.T) {
+	// Truncation and the timeout exit line are separate code paths (truncate
+	// the tail, then append the exit line); this pins their interaction on a
+	// command that both floods the cap and outlives the timeout.
+	oldTimeout := bashToolTimeout
+	oldMax := bashToolMaxOutput
+	bashToolTimeout = 100 * time.Millisecond
+	bashToolMaxOutput = 256
+	defer func() {
+		bashToolTimeout = oldTimeout
+		bashToolMaxOutput = oldMax
+	}()
+
+	result := runBashTool("while true; do seq 1 100000; done")
+
+	// pins the timeout path
+	if !strings.Contains(result, "timed out after 100ms") {
+		t.Errorf("runBashTool = %q, want a timeout result naming the injected duration", result)
+	}
+	// pins the truncation path; seq is pure ASCII so the marker names exactly
+	// the injected cap
+	if !strings.Contains(result, truncatedOutputMarker(bashToolMaxOutput)) {
+		t.Errorf("runBashTool = %q, want the truncation marker naming %d kept bytes", result, bashToolMaxOutput)
+	}
+	if len(result) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
+		t.Errorf("runBashTool returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), bashToolMaxOutput)
+	}
+	// pins the ordering invariant: the exit line is appended after truncation,
+	// so it must survive as the very last thing in the result
+	if !strings.HasSuffix(result, "exit code: timed out after 100ms") {
+		t.Errorf("runBashTool = %q, want trailing 'exit code: timed out after 100ms' line", result)
+	}
+}
+
 func TestRunBashToolReturnsWhenEscapedChildHoldsPipes(t *testing.T) {
 	// A child that detaches into a new session survives the process-group
 	// SIGKILL and inherits the output-pipe write-ends. os/exec's Wait then
@@ -712,6 +861,42 @@ func TestRunBashToolReturnsWhenEscapedChildHoldsPipes(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("runBashTool(%q) did not return within 10s: Wait blocks on the escaped child's pipe", escaping)
+	}
+}
+
+func TestRunBashToolTruncatesToTail(t *testing.T) {
+	// A generator producing far more output than the cap must come back as
+	// the TAIL of that output, capped before the exit-code line is appended
+	// — so the exit-code line always survives and the model sees where the
+	// output ended, not where it began.
+	old := bashToolMaxOutput
+	bashToolMaxOutput = 256
+	defer func() { bashToolMaxOutput = old }()
+
+	result := runBashTool("seq 1 100000")
+
+	if len(result) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
+		t.Errorf("runBashTool(seq 1 100000) returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), bashToolMaxOutput)
+	}
+	if !strings.HasSuffix(result, "exit code: 0") {
+		t.Errorf("runBashTool = %q, want trailing exit-code line even under truncation", result)
+	}
+	if !strings.Contains(result, "99999\n100000") {
+		t.Errorf("runBashTool = %q, want the tail of the generated output (99999, 100000) present", result)
+	}
+	// seq never emits a bare "1" line except as the first line, so finding
+	// "\n1\n" would mean the head survived truncation.
+	if strings.Contains(result, "\n1\n") {
+		t.Errorf("runBashTool = %q, want the head of the generated output dropped", result)
+	}
+	if !strings.Contains(result, "truncated") {
+		t.Errorf("runBashTool = %q, want a truncation marker", result)
+	}
+	// seq output is pure ASCII, so the UTF-8 guard drops nothing and the
+	// kept tail is exactly the cap; the marker must name that real count,
+	// not a literal "N".
+	if !strings.Contains(result, fmt.Sprintf("showing last %d bytes", bashToolMaxOutput)) {
+		t.Errorf("runBashTool = %q, want marker naming the kept byte count %d", result, bashToolMaxOutput)
 	}
 }
 
