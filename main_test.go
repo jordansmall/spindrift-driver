@@ -10,8 +10,22 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
+
+// TestMain doubles as an escape helper: re-invoked with the env var set, it
+// detaches into a new session — outside the process group a timeout SIGKILL
+// targets — and sleeps holding the inherited stdout pipe. No setsid binary
+// ships in this environment, so the test binary itself is the escape vehicle.
+func TestMain(m *testing.M) {
+	if os.Getenv("BASH_TOOL_ESCAPE_HELPER") == "1" {
+		syscall.Setsid()
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func TestRunChatRoundTrip(t *testing.T) {
 	// mutex: the handler goroutine writes, the test goroutine reads
@@ -675,6 +689,29 @@ func TestRunBashToolSignalKillReportsSignal(t *testing.T) {
 	}
 	if !strings.HasSuffix(result, "exit code: signal killed") {
 		t.Errorf("runBashTool = %q, want trailing 'exit code: signal killed' line", result)
+	}
+}
+
+func TestRunBashToolReturnsWhenEscapedChildHoldsPipes(t *testing.T) {
+	// A child that detaches into a new session survives the process-group
+	// SIGKILL and inherits the output-pipe write-ends. os/exec's Wait then
+	// blocks on their EOF unless WaitDelay bounds it — and a runBashTool
+	// that never returns wedges the Driver even though the timeout fired.
+	old := bashToolTimeout
+	bashToolTimeout = 100 * time.Millisecond
+	defer func() { bashToolTimeout = old }()
+
+	t.Setenv("BASH_TOOL_ESCAPE_HELPER", "1")
+	escaping := os.Args[0] + " & wait"
+	done := make(chan string, 1)
+	go func() { done <- runBashTool(escaping) }()
+	select {
+	case result := <-done:
+		if !strings.Contains(result, "timed out after 100ms") {
+			t.Errorf("runBashTool(%q) = %q, want a timeout result", escaping, result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("runBashTool(%q) did not return within 10s: Wait blocks on the escaped child's pipe", escaping)
 	}
 }
 
