@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -82,6 +83,182 @@ func TestRunChatRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "/chat/completions") {
 		t.Errorf("stderr = %q, want a progress line naming the request target", stderr.String())
+	}
+}
+
+// scriptedChatServer returns the i-th scripted JSON response for the i-th
+// POST and records every request body for later inspection.
+type scriptedChatServer struct {
+	mu        sync.Mutex
+	responses []string
+	rawBodies [][]byte
+	srv       *httptest.Server
+}
+
+func newScriptedChatServer(t *testing.T, responses ...string) *scriptedChatServer {
+	s := &scriptedChatServer{responses: responses}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s.mu.Lock()
+		n := len(s.rawBodies)
+		s.rawBodies = append(s.rawBodies, body)
+		resp := ""
+		exhausted := n >= len(s.responses)
+		if !exhausted {
+			resp = s.responses[n]
+		}
+		s.mu.Unlock()
+		if exhausted {
+			http.Error(w, "no scripted response left", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, resp)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+type recordedMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls"`
+	ToolCallID string     `json:"tool_call_id"`
+}
+
+func (s *scriptedChatServer) requestBodies(t *testing.T) [][]byte {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][]byte, len(s.rawBodies))
+	copy(out, s.rawBodies)
+	return out
+}
+
+func (s *scriptedChatServer) messageBodies(t *testing.T) [][]recordedMessage {
+	t.Helper()
+	var out [][]recordedMessage
+	for _, raw := range s.requestBodies(t) {
+		var reqBody struct {
+			Messages []recordedMessage `json:"messages"`
+		}
+		if err := json.Unmarshal(raw, &reqBody); err != nil {
+			t.Fatalf("request body is not valid JSON: %v; body = %q", err, raw)
+		}
+		out = append(out, reqBody.Messages)
+	}
+	return out
+}
+
+func TestRunAutonomousLoopFullSequence(t *testing.T) {
+	// three rounds: tool call, tool call, final answer
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo again\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"do the thing", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "all done\n" {
+		t.Errorf("stdout = %q, want final answer with trailing newline", stdout.String())
+	}
+
+	bodies := srv.requestBodies(t)
+	if len(bodies) != 3 {
+		t.Fatalf("POSTs = %d, want 3", len(bodies))
+	}
+
+	// every request must advertise exactly one function tool named bash
+	for i, body := range bodies {
+		var parsed struct {
+			Tools []toolSpec `json:"tools"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("unmarshal request %d: %v", i+1, err)
+		}
+		if len(parsed.Tools) != 1 || parsed.Tools[0].Type != "function" || parsed.Tools[0].Function.Name != "bash" {
+			t.Errorf("request %d tools = %+v, want one function tool named bash", i+1, parsed.Tools)
+		}
+	}
+
+	msgs := srv.messageBodies(t)
+
+	// request 2 carries the assistant tool_calls message plus the tool result
+	want2 := []recordedMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: "do the thing"},
+		{Role: "assistant", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: "{\"command\":\"echo hello\"}"}}}},
+		{Role: "tool", Content: "hello\nexit code: 0", ToolCallID: "call_1"},
+	}
+	if !reflect.DeepEqual(msgs[1], want2) {
+		t.Errorf("request 2 messages = %+v, want %+v", msgs[1], want2)
+	}
+
+	// request 3 carries both rounds: system, user, assistant(tool_calls), tool, assistant(tool_calls), tool
+	want3 := append(append([]recordedMessage{}, want2...),
+		recordedMessage{Role: "assistant", ToolCalls: []toolCall{{ID: "call_2", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: "{\"command\":\"echo again\"}"}}}},
+		recordedMessage{Role: "tool", Content: "again\nexit code: 0", ToolCallID: "call_2"},
+	)
+	if !reflect.DeepEqual(msgs[2], want3) {
+		t.Errorf("request 3 messages = %+v, want %+v", msgs[2], want3)
+	}
+
+	// one progress line per POST
+	stderrLines := strings.Count(strings.TrimSuffix(stderr.String(), "\n"), "\n") + 1
+	if stderrLines != 3 {
+		t.Errorf("stderr has %d lines, want 3 progress lines: %q", stderrLines, stderr.String())
+	}
+}
+
+func TestRunFailingToolCommandIsOrdinaryResult(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 7\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"gave up gracefully"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (failing command must not crash); stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "gave up gracefully\n" {
+		t.Errorf("stdout = %q, want the final answer", stdout.String())
+	}
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(msgs))
+	}
+	tool := msgs[1][len(msgs[1])-1]
+	if tool.Role != "tool" || tool.ToolCallID != "call_e" {
+		t.Errorf("tool result message = %+v, want role tool with tool_call_id call_e", tool)
+	}
+	if !strings.Contains(tool.Content, "exit code: 7") {
+		t.Errorf("tool content = %q, want it to carry the exit-code line for 7", tool.Content)
+	}
+}
+
+func TestRunTurnCap(t *testing.T) {
+	srv := newScriptedChatServer(t) // server runs dry on purpose; cap must hit first
+	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+	srv.responses = []string{forever, forever, forever, forever}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--max-turns", "3", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty (no final answer was produced)", stdout.String())
+	}
+	if bodies := srv.requestBodies(t); len(bodies) != 3 {
+		t.Errorf("POSTs = %d, want exactly max-turns 3", len(bodies))
+	}
+	if !strings.Contains(stderr.String(), "turn") {
+		t.Errorf("stderr = %q, want a message about exhausting the turns", stderr.String())
 	}
 }
 

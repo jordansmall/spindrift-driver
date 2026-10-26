@@ -46,16 +46,53 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		fmt.Fprintf(stderr, "spindrift-driver: %v\n%s", err, usage)
 		return 2
 	}
-	resp, err := sendChat(cfg, stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "spindrift-driver: %v\n", err)
-		return 1
+	// Autonomous tool loop: each turn posts the whole conversation with the
+	// tools parameter; the server decides tool calls (never parsed from text).
+	messages := []chatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: cfg.prompt},
 	}
-	if !strings.HasSuffix(resp, "\n") {
-		resp += "\n"
+	for turn := 0; turn < cfg.maxTurns; turn++ {
+		assistant, err := sendChat(cfg, messages, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "spindrift-driver: %v\n", err)
+			return 1
+		}
+		if len(assistant.ToolCalls) == 0 {
+			// No tool calls: the content is the final answer.
+			final := assistant.Content
+			if !strings.HasSuffix(final, "\n") {
+				final += "\n"
+			}
+			fmt.Fprint(stdout, final)
+			return 0
+		}
+		// OpenAI convention: replay the assistant message verbatim (with its
+		// tool_calls), then one tool message per call.
+		messages = append(messages, assistant)
+		for _, call := range assistant.ToolCalls {
+			result := executeToolCall(call)
+			messages = append(messages, chatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
+		}
 	}
-	fmt.Fprint(stdout, resp)
-	return 0
+	fmt.Fprintf(stderr, "spindrift-driver: reached the turn limit of %d without a final answer\n", cfg.maxTurns)
+	return 1
+}
+
+// executeToolCall runs one assistant tool call and returns its Tool Result
+// content. Unknown tools and unparseable arguments are ordinary results too,
+// so the loop can hand them back to the model instead of crashing.
+func executeToolCall(call toolCall) string {
+	if call.Function.Name != "bash" {
+		return fmt.Sprintf("error: unknown tool %q", call.Function.Name)
+	}
+	var args struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		return fmt.Sprintf("error: cannot parse tool arguments: %v", err)
+	}
+	return runBashTool(args.Command)
 }
 
 func main() {
@@ -250,47 +287,45 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
-// sendChat performs the one-shot chat completion round trip against an
-// OpenAI-compatible server and returns the assistant's reply text.
-func sendChat(cfg config, stderr io.Writer) (string, error) {
+// sendChat performs one chat completion round trip against an
+// OpenAI-compatible server and returns the full assistant message
+// (content and tool calls).
+func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
 	reqBody, err := json.Marshal(chatRequest{
-		Model: cfg.model,
-		Messages: []chatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: cfg.prompt},
-		},
-		Tools: []toolSpec{bashTool},
+		Model:    cfg.model,
+		Messages: messages,
+		Tools:    []toolSpec{bashTool},
 	})
 	if err != nil {
-		return "", err
+		return chatMessage{}, err
 	}
 	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(reqBody))
 	if err != nil {
-		return "", err
+		return chatMessage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	fmt.Fprintf(stderr, "spindrift-driver: POST %s\n", target)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return chatMessage{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return chatMessage{}, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return chatMessage{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var parsed chatResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
+		return chatMessage{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", errors.New("server returned no choices")
+		return chatMessage{}, errors.New("server returned no choices")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	return parsed.Choices[0].Message, nil
 }
