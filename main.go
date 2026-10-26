@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 )
 
 const defaultBaseURL = "http://localhost:8080/v1"
@@ -20,15 +22,17 @@ const envBaseURL = "SPINDRIFT_BASE_URL"
 const systemPrompt = "You are a coding agent working in this repository. Answer with the final response only; it is printed to stdout."
 
 type config struct {
-	model   string
-	baseURL string
-	prompt  string
+	model    string
+	baseURL  string
+	prompt   string
+	maxTurns int
 }
 
-const usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>]
+const usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>]
 
 The prompt may be given positionally or on stdin. --model is required.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
+--max-turns caps the number of agent turns (default 50).
 `
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
@@ -63,6 +67,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	fs.SetOutput(io.Discard) // usage errors are reported by run, keep parse silent
 	baseURL := fs.String("base-url", "", "OpenAI-compatible API base URL (default: $SPINDRIFT_BASE_URL or "+defaultBaseURL+")")
 	model := fs.String("model", "", "model name (required)")
+	maxTurns := fs.Int("max-turns", 50, "maximum agent turns")
 	pre, post := splitAtEndOfFlags(args)
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
 		return config{}, err
@@ -72,9 +77,14 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		return config{}, fmt.Errorf("unexpected argument %q: only one prompt is accepted", positional[1])
 	}
 
+	if *maxTurns < 1 {
+		return config{}, fmt.Errorf("--max-turns must be at least 1, got %d", *maxTurns)
+	}
+
 	cfg := config{
-		model:   *model,
-		baseURL: *baseURL,
+		model:    *model,
+		baseURL:  *baseURL,
+		maxTurns: *maxTurns,
 	}
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
@@ -154,14 +164,84 @@ func promptFrom(args []string, stdin io.Reader) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// runBashTool executes one tool call's shell command and returns the Tool
+// Result: combined stdout+stderr plus a trailing exit-code line. It runs
+// under bash -c in the Driver's own cwd (no persistence between calls). A
+// failing command — non-zero exit, or one that cannot even start — is an
+// ordinary Tool Result for the model, never a Go error.
+func runBashTool(command string) string {
+	cmd := exec.Command("bash", "-c", command)
+	output, err := cmd.CombinedOutput()
+	// trim exactly one trailing newline so the exit-code line sits directly
+	// after the last output line without collapsing intentional blank lines.
+	result := strings.TrimSuffix(string(output), "\n")
+	if err == nil {
+		return result + "\nexit code: 0"
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.ExitCode() < 0 {
+			// no exit code: the process was killed by a signal
+			return result + fmt.Sprintf("\nexit code: signal %s", exitErr.Sys().(syscall.WaitStatus).Signal())
+		}
+		return result + fmt.Sprintf("\nexit code: %d", exitErr.ExitCode())
+	}
+	// command could not be started at all (e.g. bash missing)
+	return fmt.Sprintf("error: cannot start command: %v", err)
+}
+
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// toolCall mirrors the OpenAI assistant tool_calls entry; Arguments stays a
+// JSON-encoded string on the wire, not a decoded object.
+type toolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function toolCallFunction `json:"function"`
+}
+
+type toolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type toolSpec struct {
+	Type     string       `json:"type"`
+	Function functionSpec `json:"function"`
+}
+
+type functionSpec struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// bashTool is the single tool advertised to the model: tool calling happens
+// only via the tools parameter, never by parsing model text.
+var bashTool = toolSpec{
+	Type: "function",
+	Function: functionSpec{
+		Name:        "bash",
+		Description: "Run a shell command in the repository and return its output.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "The shell command to run."},
+			},
+			"required": []string{"command"},
+		},
+	},
 }
 
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	Tools    []toolSpec    `json:"tools,omitempty"`
 }
 
 type chatResponse struct {
@@ -181,6 +261,7 @@ func sendChat(cfg config, stderr io.Writer) (string, error) {
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: cfg.prompt},
 		},
+		Tools: []toolSpec{bashTool},
 	})
 	if err != nil {
 		return "", err
