@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -263,6 +264,101 @@ func TestParseArgsStdinReadError(t *testing.T) {
 	}
 }
 
+func TestParseArgsMaxTurns(t *testing.T) {
+	// default when the flag is absent
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.maxTurns != 50 {
+		t.Errorf("default maxTurns = %d, want 50", cfg.maxTurns)
+	}
+
+	// prompt before flags: the issue's argv shape
+	cfg, err = parseArgs([]string{"p", "--model", "m", "--max-turns", "7"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs (prompt first) returned error: %v", err)
+	}
+	if cfg.maxTurns != 7 {
+		t.Errorf("maxTurns = %d, want 7", cfg.maxTurns)
+	}
+
+	// = form
+	cfg, err = parseArgs([]string{"--max-turns=3", "--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs (= form) returned error: %v", err)
+	}
+	if cfg.maxTurns != 3 {
+		t.Errorf("maxTurns = %d, want 3", cfg.maxTurns)
+	}
+}
+
+func TestChatRequestWireShape(t *testing.T) {
+	req := chatRequest{
+		Model: "m",
+		Messages: []chatMessage{
+			{Role: "assistant", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: "{\"command\":\"ls\"}"}}}},
+			{Role: "tool", Content: "file listing", ToolCallID: "call_1"},
+		},
+		Tools: []toolSpec{bashTool},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"model", "messages", "tools"} {
+		if _, ok := top[key]; !ok {
+			t.Errorf("request JSON missing key %q; body = %s", key, raw)
+		}
+	}
+
+	// exactly one function tool, named bash, with a command:string schema
+	tools, ok := top["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v, want an array with exactly one entry", top["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "function" {
+		t.Errorf("tools[0].type = %v, want function", tool["type"])
+	}
+	fn, _ := tool["function"].(map[string]any)
+	if fn["name"] != "bash" {
+		t.Errorf("tools[0].function.name = %v, want bash", fn["name"])
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	props, _ := params["properties"].(map[string]any)
+	cmd, _ := props["command"].(map[string]any)
+	if cmd == nil || cmd["type"] != "string" {
+		t.Errorf("tools[0].function.parameters = %v, want a command:string property", fn["parameters"])
+	}
+
+	// assistant tool_calls and tool-role message marshal to the OpenAI keys
+	msgs, _ := top["messages"].([]any)
+	assistant, _ := msgs[0].(map[string]any)
+	calls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant message = %v, want one tool_calls entry", assistant)
+	}
+	call, _ := calls[0].(map[string]any)
+	for _, key := range []string{"id", "type", "function"} {
+		if _, ok := call[key]; !ok {
+			t.Errorf("tool_calls[0] missing key %q: %v", key, call)
+		}
+	}
+	if assistant["role"] != "assistant" {
+		t.Errorf("assistant role = %v", assistant["role"])
+	}
+	toolMsg, _ := msgs[1].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["content"] != "file listing" || toolMsg["tool_call_id"] != "call_1" {
+		t.Errorf("tool message = %v, want role/content/tool_call_id", toolMsg)
+	}
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
@@ -304,6 +400,117 @@ func TestParseArgsPositionalPromptNotTrimmed(t *testing.T) {
 	}
 	if cfg.prompt != "  padded prompt  " {
 		t.Errorf("prompt = %q, want the argv prompt verbatim (no trimming)", cfg.prompt)
+	}
+}
+
+func TestRunBashToolSuccess(t *testing.T) {
+	result := runBashTool("echo hello")
+	want := "hello\nexit code: 0"
+	if result != want {
+		t.Errorf("runBashTool(echo hello) = %q, want %q", result, want)
+	}
+}
+
+func TestRunBashToolFailureIsResultNotError(t *testing.T) {
+	// A non-zero exit is ordinary tool output for the model, not a Go error.
+	result := runBashTool("echo before; exit 3")
+	want := "before\nexit code: 3"
+	if result != want {
+		t.Errorf("runBashTool(echo before; exit 3) = %q, want %q", result, want)
+	}
+}
+
+func TestRunBashToolIncludesStderr(t *testing.T) {
+	result := runBashTool("echo out; echo err >&2")
+	if !strings.Contains(result, "out") || !strings.Contains(result, "err") {
+		t.Errorf("runBashTool = %q, want both stdout and stderr combined", result)
+	}
+	if !strings.HasSuffix(result, "exit code: 0") {
+		t.Errorf("runBashTool = %q, want trailing exit-code line", result)
+	}
+}
+
+func TestRunBashToolRunsInDriverCwd(t *testing.T) {
+	// bash -c inherits the Driver's cwd; a relative write must land there.
+	// O_EXCL: a stale probe file from an earlier run must fail the test
+	// loudly, not get silently deleted by the pre-clean.
+	const name = "spindrift-cwd-probe.txt"
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("create probe %s: %v (stale file from a previous run?)", name, err)
+	}
+	f.Close()
+	defer os.Remove(name)
+
+	result := runBashTool("echo written > " + name)
+	if !strings.HasSuffix(result, "exit code: 0") {
+		t.Errorf("runBashTool = %q, want success", result)
+	}
+	data, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("file %s not written to the process cwd: %v (result %q)", name, err, result)
+	}
+	if strings.TrimSpace(string(data)) != "written" {
+		t.Errorf("file content = %q, want %q", data, "written")
+	}
+}
+
+func TestRunBashToolNonexistentCommandExits127(t *testing.T) {
+	// bash itself starts fine and reports 127 for a command it cannot find;
+	// the model still gets an ordinary Tool Result.
+	result := runBashTool("nonexistent-spindrift-cmd-xyz")
+	if !strings.Contains(result, "not found") || !strings.Contains(result, "exit code: 127") {
+		t.Errorf("runBashTool = %q, want error text plus exit-code line", result)
+	}
+}
+
+func TestRunBashToolUnstartableBashIsWellFormedResult(t *testing.T) {
+	// With PATH emptied, bash itself cannot be started; the Tool Result must
+	// still be a well-formed string, not a glued "exit code: error:" line.
+	// Setenv before the call: exec.Command resolves bash via LookPath at
+	// command-construction time, inheriting the current env.
+	t.Setenv("PATH", "")
+	result := runBashTool("echo hi")
+	if !strings.HasPrefix(result, "error: cannot start command:") {
+		t.Errorf("runBashTool = %q, want a plain 'error: cannot start command: ...' result", result)
+	}
+	if strings.Contains(result, "exit code:") {
+		t.Errorf("runBashTool = %q, want no exit-code line when the command never started", result)
+	}
+}
+
+func TestRunBashToolPreservesTrailingBlankLines(t *testing.T) {
+	// Only the final newline is trimmed so the exit-code line sits flush;
+	// intentional blank lines before it must survive.
+	result := runBashTool("printf 'a\\n\\n\\n'")
+	want := "a\n\n\nexit code: 0"
+	if result != want {
+		t.Errorf("runBashTool = %q, want %q", result, want)
+	}
+}
+
+func TestRunBashToolSignalKillReportsSignal(t *testing.T) {
+	// A signal-killed command has no exit code (ExitCode is -1); report the
+	// signal instead of the meaningless -1.
+	result := runBashTool("kill -9 $$")
+	if strings.Contains(result, "exit code: -1") {
+		t.Errorf("runBashTool = %q, want the signal reported instead of -1", result)
+	}
+	if !strings.HasSuffix(result, "exit code: signal killed") {
+		t.Errorf("runBashTool = %q, want trailing 'exit code: signal killed' line", result)
+	}
+}
+
+func TestParseArgsRejectsNonPositiveMaxTurns(t *testing.T) {
+	for _, value := range []string{"0", "-2"} {
+		_, err := parseArgs([]string{"--model", "m", "--max-turns", value, "p"}, nil, func(string) (string, bool) { return "", false })
+		if err == nil {
+			t.Errorf("parseArgs --max-turns %s: want an error, got nil", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--max-turns") || !strings.Contains(err.Error(), value) {
+			t.Errorf("parseArgs --max-turns %s: err = %v, want it to name the flag and value", value, err)
+		}
 	}
 }
 
