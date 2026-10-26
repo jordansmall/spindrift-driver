@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const defaultBaseURL = "http://localhost:8080/v1"
@@ -201,17 +203,69 @@ func promptFrom(args []string, stdin io.Reader) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// bashToolTimeout bounds one bash tool call; tests inject a short value.
+var bashToolTimeout = 120 * time.Second
+
+// bashToolMaxOutput caps how many bytes of command output a Tool Result
+// keeps; tests inject a small value.
+var bashToolMaxOutput = 10 * 1024
+
+// truncatedOutputMarker precedes the kept tail when output exceeded the cap,
+// naming the real kept byte count (may fall a few bytes under the cap after
+// the UTF-8 guard drops a partial rune).
+func truncatedOutputMarker(kept int) string {
+	return fmt.Sprintf("... output truncated, showing last %d bytes ...", kept)
+}
+
 // runBashTool executes one tool call's shell command and returns the Tool
 // Result: combined stdout+stderr plus a trailing exit-code line. It runs
 // under bash -c in the Driver's own cwd (no persistence between calls). A
 // failing command — non-zero exit, or one that cannot even start — is an
 // ordinary Tool Result for the model, never a Go error.
 func runBashTool(command string) string {
-	cmd := exec.Command("bash", "-c", command)
-	output, err := cmd.CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), bashToolTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	// kill the whole process group on timeout: children of bash would
+	// otherwise outlive the kill as orphans still holding the output pipes.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// a child that escaped the group (e.g. setsid) survives the SIGKILL
+	// still holding the output pipes; without a bound, Wait blocks forever
+	// on their EOF and the fired timeout never produces a Tool Result.
+	cmd.WaitDelay = time.Second
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := cmd.Start()
+	if err != nil {
+		return fmt.Sprintf("error: cannot start command: %v", err)
+	}
+	err = cmd.Wait()
 	// trim exactly one trailing newline so the exit-code line sits directly
 	// after the last output line without collapsing intentional blank lines.
-	result := strings.TrimSuffix(string(output), "\n")
+	result := strings.TrimSuffix(output.String(), "\n")
+	// keep only the tail: a runaway generator must not flood the model's
+	// context, and truncating here — before the exit-code line is appended —
+	// guarantees that line always survives.
+	if len(result) > bashToolMaxOutput {
+		tail := result[len(result)-bashToolMaxOutput:]
+		// never split a multi-byte UTF-8 rune: drop continuation bytes at the cut
+		for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
+			tail = tail[1:]
+		}
+		result = truncatedOutputMarker(len(tail)) + "\n" + string(tail)
+	}
+	if ctx.Err() != nil {
+		// a command finishing in the window between Wait returning and this
+		// check can be misreported as a timeout; accepted race, since avoiding
+		// it would need a second Wait.
+		// must be distinct from a plain signal kill so the model can tell a
+		// timeout apart from a command that died on a signal
+		return result + fmt.Sprintf("\nexit code: timed out after %s", bashToolTimeout)
+	}
 	if err == nil {
 		return result + "\nexit code: 0"
 	}
