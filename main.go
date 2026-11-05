@@ -390,10 +390,16 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 	if attempts < 1 {
 		attempts = 1
 	}
+	// A hand-built config carries no --timeout, and Client.Timeout 0 means no
+	// bound at all rather than no wait, so fall back to the package default.
+	timeout := cfg.timeout
+	if timeout <= 0 {
+		timeout = chatAttemptTimeout
+	}
 	// Bounded per attempt: http.DefaultClient is process-global and has no
 	// timeout, so a server that accepts the connection and never answers would
 	// hang the run forever. Client.Timeout covers dial, headers and body read.
-	client := &http.Client{Timeout: chatAttemptTimeout}
+	client := &http.Client{Timeout: timeout}
 	var lastErr error
 	delay := chatRetryBackoff
 	// Only a 5xx or a transport failure is retried, and only inside this one
