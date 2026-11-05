@@ -35,11 +35,15 @@ type config struct {
 	apiKey string
 }
 
-const usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>]
+// usage is a var, not a const: the --timeout default is interpolated from
+// chatAttemptTimeout so the text cannot drift from the value in effect.
+var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>]
 
 The prompt may be given positionally or on stdin. --model is required.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
+--timeout bounds one chat attempt (dial, response headers, body read), default ` + chatAttemptTimeout.String() + `;
+raise it when the server generates slowly — a local model can take minutes per turn.
 The API key is read from $` + envAPIKey + ` only, never from argv.
 `
 

@@ -5,11 +5,13 @@ It talks to an OpenAI-compatible **Model** server, offers that Model a single Ba
 **Tool**, runs the Tool Calls the Model asks for, and loops until the Model answers.
 
 ```
-usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>]
+usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>]
 ```
 
 The prompt is positional or on stdin; `--model` is required; `--max-turns` caps the
-agent loop (default 50).
+agent loop (default 50). `--timeout` bounds each chat attempt — dial, response headers
+and body read — and defaults to 5m0s; raise it (`--timeout 15m`) when the server
+generates slowly, which a local model often does.
 
 ## Build
 
@@ -79,8 +81,9 @@ hand and is not part of `nix flake check` or CI.
 
 Expected: the Model's final answer on stdout, exit status 0. Progress — each
 `POST`, each retry — goes to stderr, so stdout stays clean enough to pipe. A failure
-prints one line to stderr and exits non-zero: unreachable server, rejected request,
-or the `--max-turns` cap reached without an answer.
+prints one line to stderr and exits non-zero: unreachable server, rejected request, an
+attempt that exceeds `--timeout` (default 5m0s — raise it for slow generation), or the
+`--max-turns` cap reached without an answer.
 
 ## Not packaged
 

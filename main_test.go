@@ -1271,6 +1271,19 @@ func TestParseArgsTimeout(t *testing.T) {
 	}
 }
 
+func TestUsageDocumentsTimeoutFlag(t *testing.T) {
+	// --help output is the only place an operator learns the knob exists, so it
+	// must name the flag and the default actually in effect. The default is read
+	// from chatAttemptTimeout rather than typed here, so bumping it fails this
+	// test until the usage text is updated too.
+	if !strings.Contains(usage, "--timeout") {
+		t.Errorf("usage does not document the --timeout flag:\n%s", usage)
+	}
+	if want := chatAttemptTimeout.String(); !strings.Contains(usage, want) {
+		t.Errorf("usage does not state the default timeout %s:\n%s", want, usage)
+	}
+}
+
 func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
 	// One attempt can stream a whole long generation, so the default must be
 	// minutes-scale; a sub-minute default would expire healthy turns.
