@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,92 @@ func stripNixComments(s string) string {
 		keep = append(keep, line)
 	}
 	return strings.Join(keep, "\n")
+}
+
+// attrListEntries returns the entries of the first `[ ... ]` list assigned to
+// `name` in src, or nil when there is none. Whitespace is deliberately kept on
+// this path: squash()ing the whole file fuses adjacent entries ([pkgs.gogo...])
+// and makes membership checks meaningless.
+func attrListEntries(src, name string) []string {
+	i := strings.Index(src, name)
+	if i < 0 {
+		return nil
+	}
+	open := strings.Index(src[i:], "[")
+	if open < 0 {
+		return nil
+	}
+	depth, end := 0, -1
+	for j := i + open; j < len(src); j++ {
+		switch src[j] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				end = j
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	var out []string
+	for _, entry := range strings.Fields(src[i+open+1 : end]) {
+		out = append(out, strings.TrimPrefix(entry, "pkgs."))
+	}
+	return out
+}
+
+// TestFlakeDevShellProvidesGoTools pins the dev-shell half of the issue: a
+// shell must hand out go, gopls and goimports. nixpkgs has no top-level
+// `goimports` attribute -- that binary ships as gotools' $out/bin/goimports --
+// so gotools is the only correct provider and pkgs.goimports must never appear.
+func TestFlakeDevShellProvidesGoTools(t *testing.T) {
+	raw, err := os.ReadFile("flake.nix")
+	if err != nil {
+		t.Fatalf("read flake.nix: %v", err)
+	}
+	stripped := stripNixComments(string(raw))
+	// comment-stripped, so prose naming the banned attribute cannot trip the assertion below
+	flat := squash(stripped)
+
+	// devShells.<system>.default as a dotted attr path (with or without the
+	// eachSystem wrapper) or a nested attrset.
+	devShell := regexp.MustCompile(`devShells(?:\.[-A-Za-z0-9_<>{}$+]+)*\.default\s*=|devShells\s*=\s*\{[^{}]*\bdefault\s*=`)
+	match := devShell.FindStringIndex(stripped)
+	if match == nil {
+		t.Fatal("flake.nix must expose devShells.<system>.default")
+	}
+
+	// Scope the remaining assertions to the shell definition itself.
+	scope := stripped[match[0]:min(match[1]+400, len(stripped))]
+	if !strings.Contains(scope, "mkShell") {
+		t.Error("devShells.default must be built with pkgs.mkShell")
+	}
+
+	entries := attrListEntries(scope, "packages")
+	if len(entries) == 0 {
+		t.Fatal("devShells.default must list its tools in a packages attribute")
+	}
+	for _, want := range []string{"go", "gopls", "gotools"} {
+		if !slices.Contains(entries, want) {
+			t.Errorf("devShells.default packages is missing %s (got %v)", want, entries)
+		}
+	}
+
+	// attrListEntries already drops the `pkgs.` qualifier, so bare-under-`with pkgs` matches here too
+	for _, entry := range entries {
+		if entry == "goimports" {
+			t.Error("devShells.default must provide goimports via pkgs.gotools; nixpkgs has no top-level goimports attribute")
+		}
+	}
+	if strings.Contains(flat, "pkgs.goimports") {
+		t.Error("flake.nix references pkgs.goimports, which does not exist in nixpkgs; goimports ships in pkgs.gotools")
+	}
 }
 
 func TestFlakeNixBuildsDriverWithBuildGoModule(t *testing.T) {
