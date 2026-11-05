@@ -114,13 +114,4 @@ func TestReadmeDocumentsNixWorkflowAndSmokeTest(t *testing.T) {
 	if !regexp.MustCompile(`not packaged|is not included|excluded|never packaged|not bundled`).MatchString(llama) {
 		t.Error("the llama.cpp note must say it is deliberately not packaged")
 	}
-
-	// flake.lock is deliberately uncommitted here, so the README has to explain
-	// where it comes from instead of implying a pin already exists.
-	if _, err := os.Stat("flake.lock"); err == nil {
-		t.Skip("flake.lock is committed; no generation note needed")
-	}
-	if !strings.Contains(norm, "flake.lock") {
-		t.Errorf("README never mentions flake.lock while none is committed; say the first `nix build` writes it")
-	}
 }

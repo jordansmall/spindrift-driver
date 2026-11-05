@@ -22,8 +22,9 @@ nix build
 `./result/bin/spindrift-driver`. The flake targets `x86_64-linux` and
 `aarch64-linux`.
 
-No `flake.lock` is committed yet: the first `nix build` resolves the nixpkgs input
-and writes it, and committing that file pins the input for everyone afterwards.
+`flake.lock` is committed and pins the nixpkgs input to one reviewed revision, so
+every `nix build` builds the same tree instead of following a moving branch. To
+refresh the pin deliberately, run `nix flake update` and commit the lock it writes.
 
 Without nix, any Go toolchain at or above the `go` line in `go.mod` builds the same
 binary — the driver uses the standard library alone (see [docs/adr/](docs/adr/)):
