@@ -685,6 +685,74 @@ func TestRunServerErrorStatus(t *testing.T) {
 	}
 }
 
+// The endpoint must be dead in a way that is certain on any host: a closed
+// httptest.Server hands back a port that just refused connections a moment
+// ago, whereas a hardcoded address such as 127.0.0.1:1 may be filtered (a
+// hang, not a refusal) or already in use.
+func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("dead endpoint received POST %s", r.URL.Path)
+	}))
+	deadURL := srv.URL
+	srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero when the endpoint refuses connections; stderr = %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on stdout when the API is unreachable", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "spindrift-driver:") || !strings.Contains(strings.ToLower(stderr.String()), "connection refused") {
+		t.Errorf("stderr = %q, want the connection failure reported to the operator", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), deadURL) {
+		t.Errorf("stderr = %q, want the failing endpoint %s named", stderr.String(), deadURL)
+	}
+}
+
+// The POST count is the discriminating assertion here: too few means the loop
+// abandoned a retry it still had budget for, too many means it cannot stop.
+func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 4, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	var mu sync.Mutex
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		posts++
+		mu.Unlock()
+		http.Error(w, "upstream exploded", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once the retry budget is spent; stderr = %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on stdout, especially not a 5xx body", stdout.String())
+	}
+	if posts != 4 {
+		t.Errorf("POSTs = %d, want exactly 4 (the full injected budget, no more)", posts)
+	}
+	if !strings.Contains(stderr.String(), "server returned 502") {
+		t.Errorf("stderr = %q, want the last failing status in the existing server-returned wording", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "retry 4/4") {
+		t.Errorf("stderr = %q, want the final attempt announced as retry 4/4", stderr.String())
+	}
+}
+
 func TestRunEmptyResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[]}`)
