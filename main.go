@@ -18,6 +18,7 @@ import (
 
 const defaultBaseURL = "http://localhost:8080/v1"
 const envBaseURL = "SPINDRIFT_BASE_URL"
+const envAPIKey = "SPINDRIFT_API_KEY"
 
 // systemPrompt is deliberately minimal and hardcoded: slice 2 has no tool
 // loop, so the Model just gets repo context via the user prompt.
@@ -28,6 +29,9 @@ type config struct {
 	baseURL  string
 	prompt   string
 	maxTurns int
+	// apiKey is env-only by design: a --api-key flag would put the secret in
+	// argv, where process listings and shell history expose it.
+	apiKey string
 }
 
 const usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>]
@@ -35,6 +39,7 @@ const usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url
 The prompt may be given positionally or on stdin. --model is required.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
+The API key is read from $` + envAPIKey + ` only, never from argv.
 `
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
@@ -134,6 +139,11 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		} else {
 			cfg.baseURL = defaultBaseURL
 		}
+	}
+
+	// a set-but-empty key reads as unset, so no Authorization header is sent
+	if v, ok := lookupEnv(envAPIKey); ok {
+		cfg.apiKey = v
 	}
 
 	prompt, err := promptFrom(positional, stdin)
@@ -360,6 +370,10 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 		return chatMessage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if cfg.apiKey != "" {
+		// absent key means no header, not a bare (invalid) "Bearer "
+		req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+	}
 	fmt.Fprintf(stderr, "spindrift-driver: POST %s\n", target)
 
 	resp, err := http.DefaultClient.Do(req)

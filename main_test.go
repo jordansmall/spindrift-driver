@@ -103,6 +103,81 @@ func TestRunChatRoundTrip(t *testing.T) {
 	}
 }
 
+// The API key is env-only and never a flag: argv leaks into process listings.
+// With SPINDRIFT_API_KEY unset the driver must send no Authorization header at
+// all — an empty one is as wrong as a wrong one.
+func TestRunSendsNoAuthorizationWithoutAPIKey(t *testing.T) {
+	var mu sync.Mutex
+	var gotReq *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotReq = r
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	mu.Lock()
+	req := gotReq
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("Driver sent no request to the fake server")
+	}
+	if _, ok := req.Header["Authorization"]; ok {
+		t.Errorf("Authorization = %q, want the header absent when no API key is configured", req.Header.Get("Authorization"))
+	}
+	if !strings.Contains(usage, envAPIKey) {
+		t.Errorf("usage does not document %s the way it documents %s:\n%s", envAPIKey, envBaseURL, usage)
+	}
+}
+
+func TestRunSendsAuthorizationBearerWithAPIKey(t *testing.T) {
+	var mu sync.Mutex
+	var gotReq *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotReq = r
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	// the stub is keyed by name: the key answers only for SPINDRIFT_API_KEY
+	env := func(name string) (string, bool) {
+		switch name {
+		case envAPIKey:
+			return "sk-test-123", true
+		case envBaseURL:
+			return "http://env:9/v1", true
+		}
+		return "", false
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, env)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	mu.Lock()
+	req := gotReq
+	mu.Unlock()
+	if req == nil {
+		t.Fatal("Driver sent no request to the fake server")
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-test-123" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer sk-test-123")
+	}
+}
+
 // scriptedChatServer returns the i-th scripted JSON response for the i-th
 // POST and records every request body for later inspection.
 type scriptedChatServer struct {
