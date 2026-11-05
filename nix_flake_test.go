@@ -79,9 +79,10 @@ func TestFlakeDevShellProvidesGoTools(t *testing.T) {
 	// comment-stripped, so prose naming the banned attribute cannot trip the assertion below
 	flat := squash(stripped)
 
-	// devShells.<system>.default as a dotted attr path (with or without the
-	// eachSystem wrapper) or a nested attrset.
-	devShell := regexp.MustCompile(`devShells(?:\.[-A-Za-z0-9_<>{}$+]+)*\.default\s*=|devShells\s*=\s*\{[^{}]*\bdefault\s*=`)
+	// devShells.<system>.default as a dotted attr path, a nested attrset, or the
+	// attrset the flake's own genAttrs-based helper returns. Only the `default`
+	// key is load-bearing; how the per-system map is built is not.
+	devShell := regexp.MustCompile(`devShells(?:\.[-A-Za-z0-9_<>{}$+]+)*\.default\s*=|devShells\s*=\s*\{[^{}]*\bdefault\s*=|devShells\s*=\s*[^=;]{0,64}\bdefault\s*=`)
 	match := devShell.FindStringIndex(stripped)
 	if match == nil {
 		t.Fatal("flake.nix must expose devShells.<system>.default")
@@ -133,9 +134,9 @@ func TestFlakeNixBuildsDriverWithBuildGoModule(t *testing.T) {
 	}
 
 	// A `packages` entry must be reachable as a per-system `default`, whether
-	// written as a dotted attr path (packages.<system>.default /
-	// packages.default inside eachSystem) or a nested attrset.
-	packagesDefault := regexp.MustCompile(`packages(\.[-A-Za-z0-9_<>{}$+]+)*\.default=|packages=\{[^}]*\bdefault=`)
+	// written as a dotted attr path (packages.<system>.default), a nested
+	// attrset, or the attrset the flake's own genAttrs-based helper returns.
+	packagesDefault := regexp.MustCompile(`packages(\.[-A-Za-z0-9_<>{}$+]+)*\.default=|packages=\{[^}]*\bdefault=|packages=[^=;]{0,64}\bdefault=`)
 	if !packagesDefault.MatchString(flat) {
 		t.Error(`flake.nix must expose packages.<system>.default`)
 	}
@@ -162,12 +163,14 @@ func TestFlakeCheckRunsGoTestSuite(t *testing.T) {
 		t.Error("flake.nix must expose a checks output; nix flake check runs nothing otherwise")
 	}
 
-	// checks.<system>.go-test, written as a dotted attr path, a quoted key, or
-	// a nested attrset -- but always an override of the driver binding, so
-	// buildGoModule may be spelled exactly once in the file.
-	goTest := regexp.MustCompile(`checks[.A-Za-z0-9_<>{}$+\[\]"-]*go-test"?\]?=[A-Za-z_][-A-Za-z0-9_]*\.overrideAttrs`)
+	// checks.<system>.go-test, written as a dotted attr path, a quoted key, a
+	// nested attrset, or inside a helper's lambda -- but always the result of
+	// overrideAttrs applied to the driver, whether spelled `driver.overrideAttrs`
+	// or `(driver pkgs).overrideAttrs`. The semantic pin is the override plus the
+	// single buildGoModule below, not the binding syntax.
+	goTest := regexp.MustCompile(`checks[^;]{0,64}?go-test"?\]?=[^=;]{0,48}?\.overrideAttrs`)
 	if !goTest.MatchString(flat) {
-		t.Error("flake.nix must define checks.<system>.go-test as driver.overrideAttrs")
+		t.Error("flake.nix must define checks.<system>.go-test by calling overrideAttrs on the driver package")
 	}
 	if n := strings.Count(flat, "buildGoModule"); n != 1 {
 		t.Errorf("flake.nix declares %d buildGoModule derivations; the check must reuse the driver package", n)
@@ -189,6 +192,33 @@ func TestFlakeCheckRunsGoTestSuite(t *testing.T) {
 				t.Errorf("flake.nix nativeCheckInputs is missing %s, which the test suite shells out to", tool)
 			}
 		}
+	}
+}
+
+// TestFlakeIteratesSystemsWithAnExistingLibHelper pins how the flake maps its
+// system list: nixpkgs' lib provides no eachSystem, eachDefaultSystem or
+// perSystem -- those are flake-utils helpers -- so a flake calling them fails
+// to evaluate the moment anyone runs nix build.
+func TestFlakeIteratesSystemsWithAnExistingLibHelper(t *testing.T) {
+	raw, err := os.ReadFile("flake.nix")
+	if err != nil {
+		t.Fatalf("read flake.nix: %v", err)
+	}
+	flat := squash(stripNixComments(string(raw)))
+
+	// A call into nixpkgs' lib is the only defect: a local binding that merely
+	// carries one of these names is not the flake-utils helper. No trailing \b --
+	// squash() glues the argument on, so a call reads `lib.eachSystemsystems...`.
+	banned := regexp.MustCompile(`(?:nixpkgs\.)?lib\.each(?:Default)?System|(?:nixpkgs\.)?lib\.perSystem`)
+	if call := banned.FindString(flat); call != "" {
+		t.Errorf("flake.nix iterates systems with %s, a flake-utils helper nixpkgs.lib does not provide; the flake fails to evaluate", call)
+	}
+
+	// lib.genAttrs is the nixpkgs idiom and already returns the
+	// { <system> = <attrset> } shape a flake output needs.
+	iter := regexp.MustCompile(`(?:nixpkgs\.)?lib\.genAttrs\s+systems\s*\(\s*system\s*:`)
+	if !iter.MatchString(stripNixComments(string(raw))) {
+		t.Error("flake.nix must iterate its systems with nixpkgs.lib.genAttrs systems (system: ...)")
 	}
 }
 
