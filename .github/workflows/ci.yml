@@ -15,3 +15,43 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test ./...
+
+  # The Go matrix above never evaluates flake.nix, so a flake that fails to
+  # evaluate -- or a lock refreshed below go.mod's toolchain floor -- ships
+  # green. This job is the nix gate; it stays separate so the Go job's
+  # runtime does not inherit nix's.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Verify flake.lock is current
+        run: |
+          # Neither Nix nor Lix has a --locked flag. `nix flake lock` only
+          # fills in missing inputs and never updates existing ones, so it
+          # touching a committed lock means flake.nix drifted from flake.lock.
+          nix flake lock
+          if ! git diff --exit-code flake.lock; then
+            echo "::error::flake.lock is stale for flake.nix; run 'nix flake lock' (or 'nix flake update' to also refresh pins) and commit the result"
+            exit 1
+          fi
+      - name: Evaluate every package, check and dev shell
+        run: nix flake check --no-build --all-systems
+      - name: Assert the pinned nixpkgs go clears the go.mod floor
+        run: |
+          floor=$(awk '$1 == "go" { print $2 }' go.mod)
+          pinned=$(nix eval --raw --impure \
+            --expr 'let i = (builtins.getFlake (toString ./.)).inputs.nixpkgs; in i.legacyPackages.x86_64-linux.go.version')
+          echo "go.mod floor: $floor; pinned nixpkgs go: $pinned"
+          # buildGoModule sets GOTOOLCHAIN=local: an older pinned go cannot
+          # download its way out, so the build would fail with no rescue.
+          if [ "$(printf '%s\n%s\n' "$floor" "$pinned" | sort -V | tail -1)" != "$pinned" ]; then
+            echo "::error::pinned nixpkgs provides go $pinned, older than the $floor floor in go.mod"
+            exit 1
+          fi
+      - name: Build and test through the flake
+        run: nix flake check
+

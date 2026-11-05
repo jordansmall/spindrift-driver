@@ -27,6 +27,9 @@ nix build
 `flake.lock` is committed and pins the nixpkgs input to one reviewed revision, so
 every `nix build` builds the same tree instead of following a moving branch. To
 refresh the pin deliberately, run `nix flake update` and commit the lock it writes.
+A refreshed nixpkgs must provide `go` at or above the `go 1.26.8` line in `go.mod`:
+`buildGoModule` pins `GOTOOLCHAIN=local` and cannot download a toolchain, so an
+older pin fails the build outright. CI asserts the floor.
 
 Without nix, any Go toolchain at or above the `go` line in `go.mod` builds the same
 binary — the driver uses the standard library alone (see [docs/adr/](docs/adr/)):
