@@ -220,6 +220,14 @@ var bashToolTimeout = 120 * time.Second
 // keeps; tests inject a small value.
 var bashToolMaxOutput = 10 * 1024
 
+// chatRetryAttempts is the total number of attempts made for one chat request
+// (so 3 means two retries); tests inject a smaller value.
+var chatRetryAttempts = 3
+
+// chatRetryBackoff is the wait before the second attempt, doubled on each
+// further attempt; tests inject a shorter value.
+var chatRetryBackoff = 100 * time.Millisecond
+
 // truncatedOutputMarker precedes the kept tail when output exceeded the cap,
 // naming the real kept byte count (may fall a few bytes under the cap after
 // the UTF-8 guard drops a partial rune).
@@ -365,35 +373,75 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 	if err != nil {
 		return chatMessage{}, err
 	}
-	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(reqBody))
-	if err != nil {
-		return chatMessage{}, err
+	// clamped so an injected knob of 0 (or less) still makes one attempt
+	// instead of reporting an empty answer with a nil error.
+	attempts := chatRetryAttempts
+	if attempts < 1 {
+		attempts = 1
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.apiKey != "" {
-		// absent key means no header, not a bare (invalid) "Bearer "
-		req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
-	}
-	fmt.Fprintf(stderr, "spindrift-driver: POST %s\n", target)
+	// Only a 5xx or a transport failure is retried, and only inside this one
+	// request: a 4xx, an unparseable 200 and an empty-choices 200 are answers,
+	// not flakiness, so they return immediately.
+	var lastErr error
+	delay := chatRetryBackoff
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			fmt.Fprintf(stderr, "spindrift-driver: retry %d/%d in %s (%s)\n", attempt, attempts, delay, lastErr)
+			time.Sleep(delay)
+			delay *= 2
+		}
+		// reqBody is marshalled once above, but the bytes.Reader over it is
+		// one-shot, so every attempt needs a freshly built request.
+		req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(reqBody))
+		if err != nil {
+			return chatMessage{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if cfg.apiKey != "" {
+			// absent key means no header, not a bare (invalid) "Bearer "
+			req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+		}
+		fmt.Fprintf(stderr, "spindrift-driver: POST %s\n", target)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return chatMessage{}, err
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response: %w", err)
+			continue
+		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			lastErr = fmt.Errorf("server returned %s: %s", resp.Status, boundBody(body))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return chatMessage{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		var parsed chatResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return chatMessage{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
+		}
+		if len(parsed.Choices) == 0 {
+			return chatMessage{}, errors.New("server returned no choices")
+		}
+		return parsed.Choices[0].Message, nil
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return chatMessage{}, fmt.Errorf("read response: %w", err)
+	return chatMessage{}, lastErr
+}
+
+// boundBody flattens and caps a server-supplied body: the retry note is one
+// line per attempt, so raw newlines would let the server forge extra driver
+// log lines and an unbounded body would flood stderr. Rune-wise cap so a cut
+// cannot split a multibyte rune.
+func boundBody(body []byte) string {
+	const maxBodyRunes = 200
+	flat := strings.Join(strings.Fields(string(body)), " ")
+	if r := []rune(flat); len(r) > maxBodyRunes {
+		return string(r[:maxBodyRunes]) + "..."
 	}
-	if resp.StatusCode != http.StatusOK {
-		return chatMessage{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	var parsed chatResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return chatMessage{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
-	}
-	if len(parsed.Choices) == 0 {
-		return chatMessage{}, errors.New("server returned no choices")
-	}
-	return parsed.Choices[0].Message, nil
+	return flat
 }

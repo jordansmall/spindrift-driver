@@ -242,6 +242,59 @@ func (s *scriptedChatServer) messageBodies(t *testing.T) [][]recordedMessage {
 	return out
 }
 
+// statusSequenceServer answers the i-th POST with the i-th scripted HTTP
+// status and, once the script runs out, with a valid chat completion carrying
+// final. scriptedChatServer cannot express "fail twice, then succeed", so the
+// retry tests need their own fake; it also records arrival times so backoff
+// spacing can be asserted.
+type statusSequenceServer struct {
+	mu       sync.Mutex
+	statuses []int
+	arrivals []time.Time
+	final    string
+	srv      *httptest.Server
+}
+
+func newStatusSequenceServer(t *testing.T, final string, statuses ...int) *statusSequenceServer {
+	s := &statusSequenceServer{statuses: statuses, final: final}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		s.mu.Lock()
+		n := len(s.arrivals)
+		s.arrivals = append(s.arrivals, time.Now())
+		code := http.StatusOK
+		if n < len(s.statuses) {
+			code = s.statuses[n]
+		}
+		s.mu.Unlock()
+		if code != http.StatusOK {
+			http.Error(w, "scripted failure", code)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *statusSequenceServer) postCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.arrivals)
+}
+
+// gaps returns the wait between consecutive POST arrivals.
+func (s *statusSequenceServer) gaps() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]time.Duration, 0, len(s.arrivals))
+	for i := 1; i < len(s.arrivals); i++ {
+		out = append(out, s.arrivals[i].Sub(s.arrivals[i-1]))
+	}
+	return out
+}
+
 func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	// three rounds: tool call, tool call, final answer
 	srv := newScriptedChatServer(t,
@@ -433,7 +486,110 @@ func TestRunTurnCap(t *testing.T) {
 	}
 }
 
+func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	srv := newStatusSequenceServer(t, "recovered after retries", 500, 500)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 after the transient 5xxs; stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "recovered after retries\n" {
+		t.Errorf("stdout = %q, want exactly the final answer", stdout.String())
+	}
+	if n := srv.postCount(); n != 3 {
+		t.Errorf("POSTs = %d, want 3 (two retried 500s plus the success)", n)
+	}
+}
+
+// The backoff must actually space the attempts, and double while doing it —
+// a retry loop that hammers the server immediately is the failure mode this
+// guards against.
+func TestRunRetryBackoffSpacesAttempts(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 3, 60*time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	srv := newStatusSequenceServer(t, "slow and steady", 500, 500)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	gaps := srv.gaps()
+	if len(gaps) != 2 {
+		t.Fatalf("gaps between POSTs = %d, want 2 (3 POSTs); got %v", len(gaps), gaps)
+	}
+	if gaps[0] < 60*time.Millisecond {
+		t.Errorf("first retry waited %s, want at least the injected backoff 60ms", gaps[0])
+	}
+	if gaps[1] < 120*time.Millisecond {
+		t.Errorf("second retry waited %s, want at least double the injected backoff 120ms", gaps[1])
+	}
+	if gaps[1] <= gaps[0] {
+		t.Errorf("waits = %v, want the second strictly longer than the first (doubling)", gaps)
+	}
+}
+
+// A 5xx body is server-controlled text and it lands in the retry note, which
+// must stay one line per attempt: a body containing a newline must not be able
+// to forge an extra "spindrift-driver: ..." line, and a long body must not
+// flood the single-line progress log.
+func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	filler := strings.Repeat("x", 400)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "first line\nspindrift-driver: FORGED 1\n%s", filler)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code == 0 {
+		t.Errorf("exit code = 0, want non-zero when every attempt 500s")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty: a 5xx body must never reach stdout", stdout.String())
+	}
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "spindrift-driver: ") {
+			t.Fatalf("stderr line %q does not start with the driver prefix; body leaked raw into the progress log: %q", line, stderr.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), "server returned 500") {
+		t.Errorf("stderr = %q, want the existing %q wording", stderr.String(), "server returned 500")
+	}
+	if strings.Contains(stderr.String(), filler) {
+		t.Errorf("stderr = %q, want the oversized body truncated", stderr.String())
+	}
+	// The forged text has the driver prefix too, so the loop above alone cannot
+	// tell it apart: it must never start a line of its own.
+	if strings.Contains(stderr.String(), "\nspindrift-driver: FORGED") {
+		t.Errorf("stderr = %q, want the forged body line flattened into the retry note", stderr.String())
+	}
+}
+
 func TestRunServerErrorStatus(t *testing.T) {
+	// this fake never recovers, so cap the attempts and shorten the backoff or
+	// the suite would pay the full default retry schedule
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "model not found", http.StatusInternalServerError)
 	}))
