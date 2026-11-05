@@ -1,5 +1,11 @@
 name: CI
 
+# The only token-authenticated step in this workflow is checkout; the nix and
+# Go steps install toolchains over plain HTTPS. Read-only contents keeps a
+# leaked GITHUB_TOKEN worthless (CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
