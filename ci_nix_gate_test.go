@@ -79,6 +79,38 @@ func TestCIHasNixGateJob(t *testing.T) {
 	}
 }
 
+// TestCIRestrictsTokenPermissions pins the CodeQL finding
+// actions/missing-workflow-permissions (security alert #2 raised on PR #30,
+// #3 on main): with no permissions block, GITHUB_TOKEN gets the repo's
+// default, which can be write. Nothing this workflow does needs more than
+// reading contents -- checkout is the only token-authenticated step -- so the
+// workflow must say so at top level, and no job may silently escalate back
+// above read.
+func TestCIRestrictsTokenPermissions(t *testing.T) {
+	raw, err := os.ReadFile(".github/workflows/ci.yml")
+	if err != nil {
+		t.Fatalf("read .github/workflows/ci.yml: %v", err)
+	}
+	src := string(raw)
+
+	// Top-level key at column 0 (a per-job block is not the fix CodeQL asks
+	// for -- and a comment mentioning it must not count either).
+	if !regexp.MustCompile(`(?m)^permissions:\s*$`).MatchString(src) {
+		t.Fatal("ci.yml must declare a top-level permissions block for GITHUB_TOKEN")
+	}
+	permissions := regexp.MustCompile(`(?m)^permissions:\s*\n((?:[ \t]+\S.*\n)+)`)
+	block := permissions.FindStringSubmatch(src)
+	if block == nil || !strings.Contains(block[1], "contents: read") {
+		t.Fatal("the top-level permissions block must set contents: read")
+	}
+
+	// Escalation guard: any scope set to write (or given at job level)
+	// reopens the finding.
+	if esc := regexp.MustCompile(`(?m)^\s*[a-z-]+:\s*(write|admin)\s*$`).FindString(src); esc != "" {
+		t.Errorf("ci.yml grants a write/admin scope (%s); the workflow only reads contents", strings.TrimSpace(esc))
+	}
+}
+
 // TestReadmeBuildDocumentsNixpkgsGoFloor: refreshing flake.lock to an old
 // nixpkgs breaks every build (GOTOOLCHAIN=local cannot download go), so the
 // Build section must state the floor next to the `nix flake update` prose.
