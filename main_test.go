@@ -853,6 +853,83 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 	}
 }
 
+// The config value, not the package default, must bound the client: the package
+// var here is far longer than the stall, so a run that finishes early can only
+// be explained by --timeout reaching the http.Client.
+func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 30*time.Second, 2, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	const stall = 2 * time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-time.After(stall):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("run took %s, want the 100ms --timeout to bound it well before the %s package default", elapsed, 30*time.Second)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
+	}
+}
+
+func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 1, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	const stall = 2 * time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-time.After(stall):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+	}))
+	defer srv.Close()
+
+	// A hand-built config leaves cfg.timeout zero, and http.Client{Timeout: 0}
+	// means no bound at all rather than no wait — the attempt must still land
+	// on the finite package default.
+	start := time.Now()
+	msg, err := sendChat(config{baseURL: srv.URL, model: "m"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("sendChat = (%+v, nil), want the attempt to time out", msg)
+	}
+	if elapsed > time.Second {
+		t.Errorf("sendChat took %s, want it bounded by the %s package default, well under the %s stall", elapsed, chatAttemptTimeout, stall)
+	}
+	if !strings.Contains(err.Error(), srv.URL) {
+		t.Errorf("error = %q, want it to name the endpoint %s", err, srv.URL)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
+		t.Errorf("error = %q, want it to name the bound %s", err, chatAttemptTimeout)
+	}
+}
+
 func TestRunEmptyResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[]}`)
