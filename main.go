@@ -29,6 +29,7 @@ type config struct {
 	baseURL  string
 	prompt   string
 	maxTurns int
+	timeout  time.Duration
 	// apiKey is env-only by design: a --api-key flag would put the secret in
 	// argv, where process listings and shell history expose it.
 	apiKey string
@@ -112,6 +113,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	baseURL := fs.String("base-url", "", "OpenAI-compatible API base URL (default: $SPINDRIFT_BASE_URL or "+defaultBaseURL+")")
 	model := fs.String("model", "", "model name (required)")
 	maxTurns := fs.Int("max-turns", 50, "maximum agent turns")
+	timeout := fs.Duration("timeout", chatAttemptTimeout, "per-attempt timeout for one chat request (dial, headers, body read); accepts Go durations such as 90s or 2m")
 	pre, post := splitAtEndOfFlags(args)
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
 		return config{}, err
@@ -124,11 +126,15 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if *maxTurns < 1 {
 		return config{}, fmt.Errorf("--max-turns must be at least 1, got %d", *maxTurns)
 	}
+	if *timeout <= 0 {
+		return config{}, fmt.Errorf("--timeout must be positive, got %v", *timeout)
+	}
 
 	cfg := config{
 		model:    *model,
 		baseURL:  *baseURL,
 		maxTurns: *maxTurns,
+		timeout:  *timeout,
 	}
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
@@ -229,8 +235,9 @@ var chatRetryAttempts = 3
 var chatRetryBackoff = 100 * time.Millisecond
 
 // chatAttemptTimeout bounds a single attempt: dial, response headers and
-// response body read; tests inject a shorter value.
-var chatAttemptTimeout = 30 * time.Second
+// response body read. It is the fallback default for hand-built configs and
+// the --timeout flag default; tests inject a shorter value.
+var chatAttemptTimeout = 5 * time.Minute
 
 // truncatedOutputMarker precedes the kept tail when output exceeded the cap,
 // naming the real kept byte count (may fall a few bytes under the cap after

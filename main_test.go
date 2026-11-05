@@ -1042,6 +1042,43 @@ func TestParseArgsMaxTurns(t *testing.T) {
 	}
 }
 
+func TestParseArgsTimeout(t *testing.T) {
+	// default when the flag is absent
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.timeout != chatAttemptTimeout {
+		t.Errorf("default timeout = %v, want %v", cfg.timeout, chatAttemptTimeout)
+	}
+
+	// prompt before flags: the issue's argv shape
+	cfg, err = parseArgs([]string{"p", "--model", "m", "--timeout", "90s"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs (prompt first) returned error: %v", err)
+	}
+	if cfg.timeout != 90*time.Second {
+		t.Errorf("timeout = %v, want %v", cfg.timeout, 90*time.Second)
+	}
+
+	// = form
+	cfg, err = parseArgs([]string{"--timeout=2m", "--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs (= form) returned error: %v", err)
+	}
+	if cfg.timeout != 2*time.Minute {
+		t.Errorf("timeout = %v, want %v", cfg.timeout, 2*time.Minute)
+	}
+}
+
+func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
+	// One attempt can stream a whole long generation, so the default must be
+	// minutes-scale; a sub-minute default would expire healthy turns.
+	if chatAttemptTimeout < time.Minute {
+		t.Errorf("chatAttemptTimeout = %v, want at least %v", chatAttemptTimeout, time.Minute)
+	}
+}
+
 func TestChatRequestWireShape(t *testing.T) {
 	req := chatRequest{
 		Model: "m",
@@ -1385,6 +1422,19 @@ func TestParseArgsRejectsNonPositiveMaxTurns(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "--max-turns") || !strings.Contains(err.Error(), value) {
 			t.Errorf("parseArgs --max-turns %s: err = %v, want it to name the flag and value", value, err)
+		}
+	}
+}
+
+func TestParseArgsRejectsNonPositiveTimeout(t *testing.T) {
+	for _, value := range []string{"0", "-1s"} {
+		_, err := parseArgs([]string{"--model", "m", "--timeout", value, "p"}, nil, func(string) (string, bool) { return "", false })
+		if err == nil {
+			t.Errorf("parseArgs --timeout %s: want an error, got nil", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--timeout") || !strings.Contains(err.Error(), value) {
+			t.Errorf("parseArgs --timeout %s: err = %v, want it to name the flag and value", value, err)
 		}
 	}
 }
