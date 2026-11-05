@@ -256,6 +256,67 @@ func TestGitignoreCoversNixBuildArtifacts(t *testing.T) {
 	}
 }
 
+// jsonBlock returns the first balanced `{ ... }` object written for the JSON key
+// `name` in src, or "" when there is none. Brace matching, not regex, bounds it:
+// a lock node nests `locked` inside `nixpkgs`, so `[^}]*` would stop short and a
+// greedy one would run past the node into its siblings.
+func jsonBlock(src, name string) string {
+	i := strings.Index(src, `"`+name+`":`)
+	if i < 0 {
+		return ""
+	}
+	open := strings.Index(src[i:], "{")
+	if open < 0 {
+		return ""
+	}
+	depth := 0
+	for j := i + open; j < len(src); j++ {
+		switch src[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[i+open : j+1]
+			}
+		}
+	}
+	return ""
+}
+
+// TestFlakeLockPinsNixpkgs pins reproducibility: the committed flake.lock must
+// hold a fully resolved nixpkgs entry -- a github fetch with a concrete rev and
+// the narHash to verify it with -- so `nix build` rebuilds from that lock instead
+// of following the moving nixpkgs-unstable branch to whatever it points at today.
+// The pinned rev's go is 1.26.10, which clears the `go 1.26.8` floor in go.mod; a
+// lock refreshed to an older nixpkgs would fail there because buildGoModule sets
+// GOTOOLCHAIN = local and cannot download a newer toolchain.
+func TestFlakeLockPinsNixpkgs(t *testing.T) {
+	raw, err := os.ReadFile("flake.lock")
+	if err != nil {
+		t.Fatalf("flake.lock must be committed at the repo root for reproducible builds: %v", err)
+	}
+	flat := squash(string(raw))
+
+	node := jsonBlock(flat, "nixpkgs")
+	if node == "" {
+		t.Fatal(`flake.lock has no "nixpkgs" node`)
+	}
+	locked := jsonBlock(node, "locked")
+	if locked == "" {
+		t.Fatal(`flake.lock's nixpkgs node has no "locked" block`)
+	}
+	if !strings.Contains(locked, `"type":"github"`) {
+		t.Errorf(`flake.lock's nixpkgs lock is not a github fetch (got %s)`, locked)
+	}
+	if rev := regexp.MustCompile(`"rev":"[0-9a-f]{40}"`); !rev.MatchString(locked) {
+		t.Errorf(`flake.lock's nixpkgs lock must pin a full 40-hex rev, not a branch (got %s)`, locked)
+	}
+	if nh := regexp.MustCompile(`"narHash":"sha[0-9]+-[A-Za-z0-9+/=]+"`); !nh.MatchString(locked) {
+		t.Errorf(`flake.lock's nixpkgs lock must carry a narHash so the fetch verifies (got %s)`, locked)
+	}
+}
+
 // TestNoThirdPartyGoDependencies pins the second half of the flake acceptance
 // criterion: flake.nix may only claim vendorHash = null while ADR-0001 holds.
 // A new dependency has to be justified in a future ADR and re-flaked before
