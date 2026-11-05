@@ -222,6 +222,40 @@ func TestFlakeIteratesSystemsWithAnExistingLibHelper(t *testing.T) {
 	}
 }
 
+// gitignoreEntries returns the effective patterns of a .gitignore: trimmed,
+// with blank and '#' comment lines dropped, so neither ordering nor the
+// comment blocks contributors add around entries breaks the assertions.
+func gitignoreEntries(src string) []string {
+	var out []string
+	for _, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+// TestGitignoreCoversNixBuildArtifacts pins the housekeeping end of the flake:
+// `nix build` writes a `result` symlink into the cwd, which for anyone building
+// inside a checkout means the repo root. Without an entry it shows up as
+// untracked noise and gets committed. The binary entry predates the flake and
+// must survive.
+func TestGitignoreCoversNixBuildArtifacts(t *testing.T) {
+	raw, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	entries := gitignoreEntries(string(raw))
+
+	for _, want := range []string{"result", "spindrift-driver"} {
+		if !slices.Contains(entries, want) {
+			t.Errorf(".gitignore is missing an entry for %q (got %v)", want, entries)
+		}
+	}
+}
+
 // TestNoThirdPartyGoDependencies pins the second half of the flake acceptance
 // criterion: flake.nix may only claim vendorHash = null while ADR-0001 holds.
 // A new dependency has to be justified in a future ADR and re-flaked before
