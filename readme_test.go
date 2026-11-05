@@ -115,3 +115,37 @@ func TestReadmeDocumentsNixWorkflowAndSmokeTest(t *testing.T) {
 		t.Error("the llama.cpp note must say it is deliberately not packaged")
 	}
 }
+
+// TestReadmeDocumentsChatTimeout pins the README to the --timeout flag: the
+// default is read from chatAttemptTimeout instead of typed here, so raising it
+// fails this test until the prose states the new value, and a timed-out attempt
+// has to appear among the failure modes an operator can hit.
+func TestReadmeDocumentsChatTimeout(t *testing.T) {
+	const file = "README.md"
+	norm := normalizeMarkdown(t, file)
+
+	if !strings.Contains(norm, "--timeout") {
+		t.Errorf("%s does not document the --timeout flag", file)
+	}
+	if want := chatAttemptTimeout.String(); !strings.Contains(norm, want) {
+		t.Errorf("%s does not state the default timeout %s", file, want)
+	}
+
+	usageBlock := markdownSectionAround(norm, "usage: spindrift-driver")
+	if usageBlock == "" {
+		t.Fatal("no usage block in " + file)
+	}
+	// The fenced usage line is what a reader copies, so the flag has to appear in
+	// its bracketed option form there, not merely in the prose below it.
+	if !regexp.MustCompile(`usage: spindrift-driver.*\[--timeout <dur>\]`).MatchString(usageBlock) {
+		t.Error("the usage line does not list [--timeout <dur>] next to [--max-turns <n>]")
+	}
+
+	smoke := markdownSectionAround(norm, "smoke test")
+	if smoke == "" {
+		t.Fatal("no section documents the manual live smoke test")
+	}
+	if !regexp.MustCompile(`timed[- ]out|times out|timeout`).MatchString(smoke) {
+		t.Error("the smoke-test failure modes must name an attempt that times out alongside the unreachable server, rejected request and --max-turns cap")
+	}
+}
