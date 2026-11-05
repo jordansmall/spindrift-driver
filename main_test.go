@@ -583,6 +583,83 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 	}
 }
 
+// droppedConnServer kills the FIRST POST at the connection level: it hijacks
+// the connection and closes it without writing a single response byte, so the
+// client's Do returns a transport error (EOF), not an HTTP status. Every later
+// POST gets a valid completion. No existing fake can fail a request without
+// producing a status line, so the transport-retry test needs its own.
+type droppedConnServer struct {
+	mu    sync.Mutex
+	posts int
+	final string
+	srv   *httptest.Server
+}
+
+func newDroppedConnServer(t *testing.T, final string) *droppedConnServer {
+	s := &droppedConnServer{final: final}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		s.mu.Lock()
+		s.posts++
+		first := s.posts == 1
+		s.mu.Unlock()
+		if first {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("test server is not hijackable, cannot drop the connection")
+				http.Error(w, "not hijackable", http.StatusNotImplemented)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *droppedConnServer) postCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.posts
+}
+
+// A dead connection is the classic transient failure: there is no status code
+// to branch on, only the error Do returns, and the retried attempt must carry
+// the same body — the one-shot reader over the marshalled request means a
+// request cannot simply be resent.
+func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	srv := newDroppedConnServer(t, "recovered after dropped conn")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 after the dropped connection; stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "recovered after dropped conn\n" {
+		t.Errorf("stdout = %q, want exactly the final answer", stdout.String())
+	}
+	// One POST per attempt: the dropped request never reached a response, and
+	// Go's own transparent rewind-retry only applies to reused connections.
+	if n := srv.postCount(); n != 2 {
+		t.Errorf("POSTs = %d, want 2 (the dropped one plus the success)", n)
+	}
+	if !strings.Contains(stderr.String(), "retry") {
+		t.Errorf("stderr = %q, want the retry to be reported to the operator", stderr.String())
+	}
+}
+
 func TestRunServerErrorStatus(t *testing.T) {
 	// this fake never recovers, so cap the attempts and shorten the backoff or
 	// the suite would pay the full default retry schedule
