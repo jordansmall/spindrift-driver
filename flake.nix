@@ -43,5 +43,13 @@
           # PATH and runs in a writable build dir, never the store.
           nativeCheckInputs = with pkgs; [ bash coreutils ];
         });
+
+        # nixpkgs has no top-level goimports attribute; the binary ships in
+        # gotools. `go` here is the same pinned nixpkgs go that builds the
+        # package, so the shell clears go.mod's `go 1.26.8` floor under
+        # GOTOOLCHAIN=local, and gopls speaks the same toolchain's protocol.
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [ go gopls gotools ];
+        };
       });
 }
