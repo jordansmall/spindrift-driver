@@ -753,6 +753,60 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 	}
 }
 
+// Retry scope is narrow: a transport error plus 5xx only. The injected budget
+// is generous, so these permanent answers must still cost exactly one POST --
+// any retry at all shows up as an extra POST, not as a different exit code.
+func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 4, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantStderr string
+	}{
+		{"4xx", http.StatusBadRequest, "bad request", "server returned 400"},
+		{"unparseable 200", http.StatusOK, "this is not json", "unparseable"},
+		{"empty choices", http.StatusOK, `{"choices":[]}`, "choices"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			posts := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				mu.Lock()
+				posts++
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+			if code == 0 {
+				t.Fatalf("exit code = 0, want non-zero; stderr = %q", stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing on stdout", stdout.String())
+			}
+			mu.Lock()
+			n := posts
+			mu.Unlock()
+			if n != 1 {
+				t.Errorf("POSTs = %d, want exactly 1 (no retry for a permanent failure)", n)
+			}
+			if !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Errorf("stderr = %q, want it to mention %q", stderr.String(), tc.wantStderr)
+			}
+		})
+	}
+}
+
 func TestRunEmptyResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[]}`)
