@@ -370,6 +370,19 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
+// wrapTimeout rewords a deadline failure for the operator: the runtime says
+// only "context deadline exceeded (...)", which names neither the endpoint nor
+// the bound that fired; stage names the leg that expired ("" for the round
+// trip). Any other transport error (connection-refused most of all) already
+// identifies itself, so it is returned untouched. %w preserves errors.Is on
+// the original cause.
+func wrapTimeout(target string, timeout time.Duration, stage string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("POST %s timed out after %s%s: %w", target, timeout, stage, err)
+	}
+	return err
+}
+
 // sendChat performs one chat completion round trip against an
 // OpenAI-compatible server and returns the full assistant message
 // (content and tool calls).
@@ -426,13 +439,21 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 
 		resp, err := client.Do(req)
 		if err != nil {
-			lastErr = err
+			lastErr = wrapTimeout(target, timeout, "", err)
 			continue
 		}
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			lastErr = fmt.Errorf("read response: %w", err)
+			// a server that sends headers then stops mid-body trips the same
+			// Client.Timeout, just further into the round trip. Only the
+			// non-deadline cause gets the read-response prefix: wrapTimeout
+			// already names that leg, so wrapping first would say it twice.
+			readErr := err
+			if !errors.Is(readErr, context.DeadlineExceeded) {
+				readErr = fmt.Errorf("read response: %w", readErr)
+			}
+			lastErr = wrapTimeout(target, timeout, " while reading the response", readErr)
 			continue
 		}
 		if resp.StatusCode >= http.StatusInternalServerError {
