@@ -228,6 +228,10 @@ var chatRetryAttempts = 3
 // further attempt; tests inject a shorter value.
 var chatRetryBackoff = 100 * time.Millisecond
 
+// chatAttemptTimeout bounds a single attempt: dial, response headers and
+// response body read; tests inject a shorter value.
+var chatAttemptTimeout = 30 * time.Second
+
 // truncatedOutputMarker precedes the kept tail when output exceeded the cap,
 // naming the real kept byte count (may fall a few bytes under the cap after
 // the UTF-8 guard drops a partial rune).
@@ -379,11 +383,15 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 	if attempts < 1 {
 		attempts = 1
 	}
+	// Bounded per attempt: http.DefaultClient is process-global and has no
+	// timeout, so a server that accepts the connection and never answers would
+	// hang the run forever. Client.Timeout covers dial, headers and body read.
+	client := &http.Client{Timeout: chatAttemptTimeout}
+	var lastErr error
+	delay := chatRetryBackoff
 	// Only a 5xx or a transport failure is retried, and only inside this one
 	// request: a 4xx, an unparseable 200 and an empty-choices 200 are answers,
 	// not flakiness, so they return immediately.
-	var lastErr error
-	delay := chatRetryBackoff
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
 			fmt.Fprintf(stderr, "spindrift-driver: retry %d/%d in %s (%s)\n", attempt, attempts, delay, lastErr)
@@ -403,7 +411,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 		}
 		fmt.Fprintf(stderr, "spindrift-driver: POST %s\n", target)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue

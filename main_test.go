@@ -807,6 +807,52 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 	}
 }
 
+// A stalled endpoint is the black hole this test pins: the connection is
+// accepted and nothing ever answers, so only a bounded per-attempt timeout can
+// turn it into a non-zero exit. The elapsed bound is the load-bearing
+// assertion -- without a timeout the run simply waits for the stall to end and
+// exits 0, which no other assertion here can distinguish from success.
+func TestRunStalledRequestTimesOut(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	const stall = 2 * time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		// the ctx branch fires as soon as the client hangs up, so a handler that
+		// outlived its request cannot make the deferred Close() stall the suite
+		select {
+		case <-time.After(stall):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("run took %s, want well under the handler's %s stall (no per-attempt timeout)", elapsed, stall)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on stdout when the request times out", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Client.Timeout exceeded") && !strings.Contains(strings.ToLower(stderr.String()), "timeout") {
+		t.Errorf("stderr = %q, want the attempt timeout reported to the operator", stderr.String())
+	}
+}
+
 func TestRunEmptyResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[]}`)
