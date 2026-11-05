@@ -807,6 +807,38 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 	}
 }
 
+// driverErrorLine returns the terminal diagnostic run() prints when sendChat
+// gives up: the per-attempt "POST" note and the "retry" notes are separate
+// lines, so an operator reading only this line must learn which endpoint hit
+// which bound.
+func driverErrorLine(stderr, target string) string {
+	postNote := "spindrift-driver: POST " + target
+	lines := strings.Split(stderr, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		if !strings.HasPrefix(line, "spindrift-driver:") {
+			continue
+		}
+		if line == postNote || strings.HasPrefix(line, "spindrift-driver: retry ") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+// assertTimeoutErrorLine pins the terminal diagnostic of a timed-out run to the
+// endpoint and the per-attempt bound that fired: the raw Go error ("context
+// deadline exceeded (Client.Timeout exceeded while awaiting headers)") names
+// neither, so both must be added. The caller passes the bound it injected, so
+// each is checked against the timeout it actually configured.
+func assertTimeoutErrorLine(t *testing.T, stderr, target string, bound time.Duration) {
+	t.Helper()
+	if got := driverErrorLine(stderr, target); !strings.Contains(got, target) || !strings.Contains(got, fmt.Sprint(bound)) {
+		t.Errorf("error line = %q, want it to name the endpoint %s and the %s bound that fired", got, target, bound)
+	}
+}
+
 // A stalled endpoint is the black hole this test pins: the connection is
 // accepted and nothing ever answers, so only a bounded per-attempt timeout can
 // turn it into a non-zero exit. The elapsed bound is the load-bearing
@@ -850,6 +882,97 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "Client.Timeout exceeded") && !strings.Contains(strings.ToLower(stderr.String()), "timeout") {
 		t.Errorf("stderr = %q, want the attempt timeout reported to the operator", stderr.String())
+	}
+	assertTimeoutErrorLine(t, stderr.String(), srv.URL+"/chat/completions", 50*time.Millisecond)
+}
+
+// A server that answers with headers and then dies mid-body is the same failure
+// mode as never answering at all: the deadline fires inside the body read, so
+// that diagnostic has to name the endpoint and the bound too.
+func TestRunStalledResponseBodyTimesOut(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	const stall = 2 * time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// headers plus a prefix of the body reach the client, then the stream
+		// stops: the read, not the round trip, is what has to expire
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`)
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(stall):
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("run took %s, want well under the handler's %s stall (no per-attempt timeout on the body read)", elapsed, stall)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on stdout when the response body stalls", stdout.String())
+	}
+	assertTimeoutErrorLine(t, stderr.String(), srv.URL+"/chat/completions", 50*time.Millisecond)
+	// the deadline fired in the body read, so the diagnostic must name that leg
+	// exactly once instead of nesting a second clause inside the reworded one
+	if got := driverErrorLine(stderr.String(), srv.URL+"/chat/completions"); !strings.Contains(got, "while reading the response") || strings.Contains(got, "read response:") {
+		t.Errorf("error line = %q, want it to name the response-reading leg once without nesting %q", got, "read response:")
+	}
+}
+
+// A connection torn down mid-body is flakiness rather than a deadline, and the
+// pre-timeout diagnostic named the failing leg ("read response:"); losing that
+// would leave the operator with a bare "unexpected EOF".
+func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 2*time.Second, 1, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "200")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"choices":[`)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero when the response body is cut short; stderr = %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on stdout when the response body is cut short", stdout.String())
+	}
+	got := driverErrorLine(stderr.String(), srv.URL+"/chat/completions")
+	if !strings.Contains(got, "read response:") {
+		t.Errorf("error line = %q, want the read-response leg named", got)
+	}
+	if strings.Contains(got, "timed out") {
+		t.Errorf("error line = %q, want the transport cause reported, not a timeout this failure is not", got)
 	}
 }
 
