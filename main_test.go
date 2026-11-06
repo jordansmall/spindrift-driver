@@ -1036,11 +1036,11 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	// means no bound at all rather than no wait — the attempt must still land
 	// on the finite package default.
 	start := time.Now()
-	msg, err := sendChat(config{baseURL: srv.URL, model: "m"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(config{baseURL: srv.URL, model: "m"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	elapsed := time.Since(start)
 
 	if err == nil {
-		t.Fatalf("sendChat = (%+v, nil), want the attempt to time out", msg)
+		t.Fatalf("sendChat = (%+v, nil), want the attempt to time out", reply)
 	}
 	if elapsed > time.Second {
 		t.Errorf("sendChat took %s, want it bounded by the %s package default, well under the %s stall", elapsed, chatAttemptTimeout, stall)
@@ -1050,6 +1050,93 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
 		t.Errorf("error = %q, want it to name the bound %s", err, chatAttemptTimeout)
+	}
+}
+
+// One Model call's usage event needs its data source to survive the round
+// trip: the response's model and its OpenAI-shaped usage.
+func TestSendChatReturnsModelAndTokens(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"id":"chatcmpl-9","model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":120,"completion_tokens":34}}`)
+
+	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("sendChat: %v", err)
+	}
+	if reply.Message.Content != "ok" {
+		t.Errorf("Message = %+v, want the assistant content to survive", reply.Message)
+	}
+	if reply.Model != "llama-3.1-8b" {
+		t.Errorf("Model = %q, want the response model %q", reply.Model, "llama-3.1-8b")
+	}
+	want := tokenTotals{Input: 120, Output: 34}
+	if reply.Tokens != want {
+		t.Errorf("Tokens = %+v, want %+v", reply.Tokens, want)
+	}
+}
+
+// A server that sends no usage object at all still owes the call its usage
+// event, so sendChat answers zero tokens — never an error, because a plain
+// llama.cpp endpoint would otherwise fail every run (contract rule 10).
+func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+
+	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("sendChat: %v", err)
+	}
+	if reply.Message.Content != "ok" {
+		t.Errorf("Message = %+v, want the assistant content despite the missing usage object", reply.Message)
+	}
+	if reply.Tokens != (tokenTotals{}) {
+		t.Errorf("Tokens = %+v, want all zeros", reply.Tokens)
+	}
+}
+
+// Cache read has two spellings on the wire; llama.cpp and vLLM report it flat
+// on the usage object.
+func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_cache_hit_tokens":80}}`)
+
+	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("sendChat: %v", err)
+	}
+	want := tokenTotals{Input: 200, Output: 9, CacheRead: 80}
+	if reply.Tokens != want {
+		t.Errorf("Tokens = %+v, want %+v", reply.Tokens, want)
+	}
+}
+
+// OpenAI spells the same number inside prompt_tokens_details instead.
+func TestSendChatMapsOpenAIStyleCachedTokensToCacheRead(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}}`)
+
+	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("sendChat: %v", err)
+	}
+	want := tokenTotals{Input: 200, Output: 9, CacheRead: 64}
+	if reply.Tokens != want {
+		t.Errorf("Tokens = %+v, want %+v", reply.Tokens, want)
+	}
+}
+
+// The response model wins when present; when the server omits it or sends it
+// empty, the configured --model stands in so no usage event goes out
+// model-less.
+func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
+	for _, body := range []string{
+		`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		`{"model":"","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+	} {
+		srv := newScriptedChatServer(t, body)
+		reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("sendChat(%s): %v", body, err)
+		}
+		if reply.Model != "configured-model" {
+			t.Errorf("Model = %q for body %s, want the configured model %q", reply.Model, body, "configured-model")
+		}
 	}
 }
 
