@@ -96,6 +96,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			return errorExit(events, 1, err)
 		}
 		assistant := reply.Message
+		// Reasoning goes out ahead of the prose it produced, as one event per
+		// completed message like text is, and rides Text because the contract has no
+		// second prose field — a reader tells the two apart by kind alone.
+		if reply.Reasoning != "" {
+			_ = events.emit(event{Kind: "reasoning", MessageID: messageID, Text: reply.Reasoning})
+		}
 		if assistant.Content != "" {
 			// Verbatim: no trimming and no newline normalisation — the trailing
 			// newline JSONL needs is the emitter's, never part of the text.
@@ -528,8 +534,12 @@ type chatChunk struct {
 		// that readChatStream folds in.
 		Index int `json:"index"`
 		Delta struct {
-			Content   string           `json:"content"`
-			ToolCalls []streamToolCall `json:"tool_calls"`
+			Content string `json:"content"`
+			// ReasoningContent is the llama.cpp/vLLM-family spelling of a thinking
+			// delta: reasoning servers send the answer in Content and the thought
+			// that produced it here.
+			ReasoningContent string           `json:"reasoning_content"`
+			ToolCalls        []streamToolCall `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *chatUsage `json:"usage"`
@@ -621,14 +631,19 @@ type chatPromptTokenDetails struct {
 }
 
 // chatReply is one Model call's answer: the assistant message to replay into
-// the conversation, plus the two things a usage event needs that the message
+// the conversation, plus the things a usage event needs that the message
 // itself does not carry — the model that answered and the token tally.
 // CacheWrite5m, CacheWrite1h and CostUSD stay zero: this server family
 // reports none of them.
+//
+// Reasoning is the thinking the server streamed alongside the answer. It lives
+// off Message so it can never be replayed to the server as part of the
+// assistant turn or surface in a text event.
 type chatReply struct {
-	Message chatMessage
-	Model   string
-	Tokens  tokenTotals
+	Message   chatMessage
+	Reasoning string
+	Model     string
+	Tokens    tokenTotals
 }
 
 // totals flattens the usage object to a call's tally, taking cache read from
@@ -692,14 +707,17 @@ func (e streamReadError) Unwrap() error { return e.err }
 // comment, and every other line is a "field: value" pair — so only data: carries
 // a chunk and event:/id:/retry: lines are skipped rather than parsed. status is
 // the response's own status line, which the unparseable-payload wording names.
+// delta.reasoning_content accumulates on its own into chatReply.Reasoning, so a
+// reasoning model's thinking never enters the message the loop replays.
 func readChatStream(body io.Reader, status string) (chatReply, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
 	var (
-		reply   chatReply
-		content strings.Builder
-		chunks  int
-		calls   toolCallStream
+		reply     chatReply
+		content   strings.Builder
+		reasoning strings.Builder
+		chunks    int
+		calls     toolCallStream
 	)
 	var parseErr error
 	for scanner.Scan() {
@@ -738,6 +756,7 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 				continue
 			}
 			content.WriteString(choice.Delta.Content)
+			reasoning.WriteString(choice.Delta.ReasoningContent)
 			// a tool call delivered whole in one delta is one fragment of itself:
 			// merging it needs no special case
 			calls.merge(choice.Delta.ToolCalls)
@@ -761,6 +780,7 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 	// turn
 	reply.Message.Role = "assistant"
 	reply.Message.Content = content.String()
+	reply.Reasoning = reasoning.String()
 	reply.Message.ToolCalls = calls.calls
 	return reply, nil
 }

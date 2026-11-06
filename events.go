@@ -16,9 +16,9 @@ import (
 var nowMS = func() int64 { return time.Now().UnixMilli() }
 
 // event is one JSONL line of the Driver's stdout: the canonical event of
-// issue #19, carrying only the fields the six non-result kinds this Driver
-// emits (start, text, tool_call, tool_result, usage, error) can fill — the
-// result kind rides resultPayload below. A kind leaves the fields it does not
+// issue #19, carrying only the fields the seven non-result kinds this Driver
+// emits (start, reasoning, text, tool_call, tool_result, usage, error) can fill
+// — the result kind rides resultPayload below. A kind leaves the fields it does not
 // fill unset, and omitempty keeps them off the wire; kind and timestamp are
 // always present.
 //
@@ -50,7 +50,7 @@ type event struct {
 // never leaves a field unreported: a duration of 0 — a loopback stub answering
 // inside one millisecond — is a measurement, not an absence, so no field here
 // carries omitempty. The shared event struct keeps omitempty for the fields the
-// other six kinds genuinely do not fill. Field declaration order is the golden
+// other seven kinds genuinely do not fill. Field declaration order is the golden
 // log's byte order.
 type resultPayload struct {
 	Kind          string      `json:"kind"`
