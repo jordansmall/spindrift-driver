@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -22,7 +23,7 @@ const envAPIKey = "SPINDRIFT_API_KEY"
 
 // systemPrompt is deliberately minimal and hardcoded: slice 2 has no tool
 // loop, so the Model just gets repo context via the user prompt.
-const systemPrompt = "You are a coding agent working in this repository. Answer with the final response only; it is printed to stdout."
+const systemPrompt = "You are a coding agent working in this repository. Answer with the final response only; it is the Driver's final result event."
 
 type config struct {
 	model    string
@@ -66,20 +67,54 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: cfg.prompt},
 	}
+	// Run bookkeeping for the result event, all of it local: the Model-call
+	// index (which is the msg-<n> id every event of that call shares), the
+	// instant the run began, the accumulated round-trip milliseconds, the summed
+	// token tally and the set of model ids that answered.
+	call := 0
+	runStart := nowMS()
+	var apiMS int64
+	var totals tokenTotals
+	seenModels := map[string]struct{}{}
 	for turn := 0; turn < cfg.maxTurns; turn++ {
+		call++
+		messageID := fmt.Sprintf("msg-%d", call)
+		// start goes out before the request exists, so its timestamp precedes the
+		// first byte and its message id can only be Driver-assigned (#20).
+		_ = events.emit(event{Kind: "start", MessageID: messageID})
+		apiStart := nowMS()
 		reply, err := sendChat(cfg, messages, stderr)
+		apiMS += nowMS() - apiStart
 		if err != nil {
+			// A call that failed has no usage to report, so the stream stops at
+			// start here; errorExit adds the error event.
 			fmt.Fprintf(stderr, "spindrift-driver: %v\n", err)
 			return errorExit(events, 1, err)
 		}
 		assistant := reply.Message
+		if assistant.Content != "" {
+			// Verbatim: no trimming and no newline normalisation — the trailing
+			// newline JSONL needs is the emitter's, never part of the text.
+			_ = events.emit(event{Kind: "text", MessageID: messageID, Text: assistant.Content})
+		}
+		callTokens := reply.Tokens
+		totals = totals.add(callTokens)
+		seenModels[reply.Model] = struct{}{}
+		// Exactly one usage per Model call and never a running total: the reader
+		// sums these, and a message id is what lets it dedup.
+		_ = events.emit(event{Kind: "usage", MessageID: messageID, Model: reply.Model, Tokens: &callTokens})
 		if len(assistant.ToolCalls) == 0 {
-			// No tool calls: the content is the final answer.
-			final := assistant.Content
-			if !strings.HasSuffix(final, "\n") {
-				final += "\n"
-			}
-			fmt.Fprint(stdout, final)
+			// No tool calls: the content is the final answer, reported both as the
+			// prose event above and as the authoritative result event.
+			_ = events.emitResult(resultPayload{
+				Kind:          "result",
+				Text:          assistant.Content,
+				NumTurns:      call,
+				DurationMs:    nowMS() - runStart,
+				DurationAPIMs: apiMS,
+				Tokens:        totals,
+				Models:        sortedModelIDs(seenModels),
+			})
 			return 0
 		}
 		// OpenAI convention: replay the assistant message verbatim (with its
@@ -93,6 +128,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	turnLimit := fmt.Errorf("reached the turn limit of %d without a final answer", cfg.maxTurns)
 	fmt.Fprintf(stderr, "spindrift-driver: %v\n", turnLimit)
 	return errorExit(events, 1, turnLimit)
+}
+
+// sortedModelIDs returns the run's distinct model ids in sorted order: the
+// result event names them as a set, and a sorted slice keeps the stream
+// byte-stable for a decoder (and for a golden log) instead of following
+// map iteration order.
+func sortedModelIDs(seen map[string]struct{}) []string {
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // errorExit is the one funnel every non-zero exit passes through, so no failure

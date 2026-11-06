@@ -75,6 +75,20 @@ type tokenTotals struct {
 	CostUSD      float64 `json:"cost_usd"`
 }
 
+// add sums two tallies field by field. The result event's tokens are the
+// per-call usages added up, and every field has to participate: a cost a future
+// server starts reporting would otherwise vanish from the session total.
+func (t tokenTotals) add(o tokenTotals) tokenTotals {
+	return tokenTotals{
+		Input:        t.Input + o.Input,
+		Output:       t.Output + o.Output,
+		CacheRead:    t.CacheRead + o.CacheRead,
+		CacheWrite5m: t.CacheWrite5m + o.CacheWrite5m,
+		CacheWrite1h: t.CacheWrite1h + o.CacheWrite1h,
+		CostUSD:      t.CostUSD + o.CostUSD,
+	}
+}
+
 // eventWriter writes canonical events to w as JSONL: exactly one JSON object
 // per emit, terminated by a single '\n' and nothing else — no prefix, no
 // wrapping. stdout carries only these lines, so any stray byte would be a
