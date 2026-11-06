@@ -33,10 +33,11 @@ const goldenRegenerateCmd = "go test -run TestGoldenPassLog -update"
 // jq, no git, no network), so regeneration cannot shell out.
 //
 // The run is shaped to put every interesting event form in one Pass: a Model
-// call with assistant prose plus a succeeding bash tool call, a second call with
-// no prose at all (which is why it carries no text event) and a failing bash
-// tool call, then a final answer. That yields start, text, usage, tool_call,
-// tool_result in both its success and is_error shapes, and result.
+// call that streams thinking ahead of its prose and then a succeeding bash tool
+// call, a second call with no prose at all (which is why it carries no text
+// event) and a failing bash tool call, then a final answer. That yields start,
+// reasoning, text, usage, tool_call, tool_result in both its success and
+// is_error shapes, and result.
 //
 // The error kind is deliberately absent from this artifact: a single Pass cannot
 // both succeed and fail, and issue #27 owns the conformance-shaped log that
@@ -72,6 +73,12 @@ func TestGoldenPassLog(t *testing.T) {
 // goldenPassStream drives one Pass and returns its raw stdout. The scripted
 // server supplies three responses; the two bash commands are printf-only and one
 // exits non-zero, so nothing here reads the repo, the clock, or the environment.
+//
+// Only the first response is framed by hand: its thinking has to arrive as the
+// delta.reasoning_content chunks a real reasoning endpoint sends, which a whole
+// completion body cannot express. The answers themselves stay whole bodies run
+// through sseChatCompletion, so the frames behind every other event are the ones
+// this artifact has always pinned.
 func goldenPassStream(t *testing.T) []byte {
 	t.Helper()
 	// A stepping clock, not a frozen one: the result event's durations have to be
@@ -80,15 +87,20 @@ func goldenPassStream(t *testing.T) []byte {
 	// second between events, a quarter second per round trip, a several-second run.
 	pinSteppingClock(t, 1700000000000, 250)
 
-	srv := newScriptedChatServer(t,
-		// Call 1: prose (with real newlines, which the emitter must escape rather
-		// than trim) plus a bash call that succeeds.
-		`{"model":"llama-3.1-8b","usage":{"prompt_tokens":104,"completion_tokens":21,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"I will look at the repo first,\nthen report.\n","tool_calls":[{"id":"call_alpha","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'hello world'\"}"}}]}}]}`,
-		// Call 2: no content at all (so no text event) and a command that exits 3.
-		`{"model":"llama-3.1-8b","usage":{"prompt_tokens":148,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`,
+	srv := newScriptedSSERawServer(t,
+		// Call 1: thinking in two fragments (so the event proves accumulation, not
+		// one frame relabelled) ahead of prose with real newlines, which the emitter
+		// must escape rather than trim, plus a bash call that succeeds.
+		sseReasoningFrames("llama-3.1-8b",
+			"reading the tree before saying anything about it; ",
+			"one safe command first, then one allowed to fail")+
+			sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":104,"completion_tokens":21,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"I will look at the repo first,\nthen report.\n","tool_calls":[{"id":"call_alpha","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'hello world'\"}"}}]}}]}`),
+		// Call 2: no content at all (so no text event, and no thinking either) and a
+		// command that exits 3.
+		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":148,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
 		// Call 3: the final answer, from a different model id, reporting cache read
 		// in the OpenAI spelling.
-		`{"model":"qwen2.5-coder","usage":{"prompt_tokens":177,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Ran both commands; the second failed with exit code 3."}}]}`,
+		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":177,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Ran both commands; the second failed with exit code 3."}}]}`),
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -100,6 +112,18 @@ func goldenPassStream(t *testing.T) []byte {
 		t.Fatalf("golden Pass made %d Model call(s), want 3", len(got))
 	}
 	return stdout.Bytes()
+}
+
+// sseReasoningFrames scripts thinking as the delta.reasoning_content chunks a
+// reasoning endpoint streams before any content. Fragments are prose written
+// through %q, so a fragment containing a quote or a backslash would need
+// escaping this helper does not attempt.
+func sseReasoningFrames(model string, fragments ...string) string {
+	var b strings.Builder
+	for _, f := range fragments {
+		b.WriteString(sseFrame(fmt.Sprintf(`{"model":%q,"choices":[{"index":0,"delta":{"reasoning_content":%q}}]}`, model, f)))
+	}
+	return b.String()
 }
 
 // assertStreamContract checks what a byte compare cannot: that the file is a
@@ -133,7 +157,7 @@ func assertStreamContract(t *testing.T, raw []byte) {
 	}
 
 	wantKinds := []string{
-		"start", "text", "usage", "tool_call", "tool_result",
+		"start", "reasoning", "text", "usage", "tool_call", "tool_result",
 		"start", "usage", "tool_call", "tool_result",
 		"start", "text", "usage", "result",
 	}
@@ -181,6 +205,41 @@ func assertStreamContract(t *testing.T, raw []byte) {
 	models, _ := result["models"].([]any)
 	if len(models) != 2 || models[0] != "llama-3.1-8b" || models[1] != "qwen2.5-coder" {
 		t.Errorf("result models = %v, want the two responding ids sorted", result["models"])
+	}
+
+	// The thinking the golden exists to pin: exactly one event, on the call that
+	// streamed it, riding ahead of the text event it produced.
+	thinkingAt := -1
+	var thinking string
+	for i, ev := range events {
+		if ev["kind"] != "reasoning" {
+			continue
+		}
+		if thinkingAt >= 0 {
+			t.Errorf("second reasoning event %d: one message's fragments belong in one event", i+1)
+			continue
+		}
+		thinkingAt = i
+		thinking, _ = ev["text"].(string)
+		if ev["message_id"] != "msg-1" {
+			t.Errorf("reasoning event message_id = %v, want msg-1, the one call that thinks", ev["message_id"])
+		}
+	}
+	if thinking == "" {
+		t.Fatalf("no reasoning event carrying thinking: the first scripted call must stream it")
+	}
+	if next := thinkingAt + 1; next >= len(events) || events[next]["kind"] != "text" {
+		t.Errorf("reasoning event %d does not ride ahead of a text event", thinkingAt+1)
+	}
+	// Thinking is its own channel: neither the prose event nor the result event may
+	// carry any of it, or a decoder that reads only the answer gets it twice.
+	for _, ev := range events {
+		if ev["kind"] != "text" && ev["kind"] != "result" {
+			continue
+		}
+		if prose, _ := ev["text"].(string); prose != "" && strings.Contains(prose, thinking) {
+			t.Errorf("%s text %q carries the thinking, which stays out of the answer", ev["kind"], prose)
+		}
 	}
 }
 
