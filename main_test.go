@@ -2718,6 +2718,60 @@ func TestParseArgsTimeout(t *testing.T) {
 	}
 }
 
+func TestParseArgsTimeoutIncludesDriverConfig(t *testing.T) {
+	configPath := writeDriverConfig(t, `{"timeout":"2m"}`)
+
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		envConfig string
+		want      time.Duration
+	}{
+		{
+			name: "flag alone",
+			args: []string{"--timeout", "30s"},
+			want: 30 * time.Second,
+		},
+		{
+			name:      "config alone",
+			envConfig: configPath,
+			want:      2 * time.Minute,
+		},
+		{
+			name:      "flag beats config",
+			args:      []string{"--timeout", "30s"},
+			envConfig: configPath,
+			want:      30 * time.Second,
+		},
+		{
+			name: "nothing set",
+			want: chatAttemptTimeout,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// keyed by name: anything this case does not name (HOME included)
+			// reads as unset
+			lookup := func(name string) (string, bool) {
+				switch name {
+				case envConfigPath:
+					return tc.envConfig, tc.envConfig != ""
+				default:
+					return "", false
+				}
+			}
+			args := append([]string{"--model", "m"}, tc.args...)
+			args = append(args, "p")
+			cfg, err := parseArgs(args, nil, lookup)
+			if err != nil {
+				t.Fatalf("parseArgs returned error: %v", err)
+			}
+			if cfg.timeout != tc.want {
+				t.Errorf("timeout = %v, want %v", cfg.timeout, tc.want)
+			}
+		})
+	}
+}
+
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	// --help output is the only place an operator learns the knob exists, so it
 	// must name the flag and the default actually in effect. The default is read
