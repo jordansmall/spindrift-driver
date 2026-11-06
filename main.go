@@ -45,13 +45,17 @@ type config struct {
 var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>]
 
 The prompt may be given positionally or on stdin. --model is required.
+Precedence for every setting: flag, then environment, then the Driver Config, then the built-in default.
+The Driver Config is JSON at the path $` + envConfigPath + ` names, else $HOME/` + defaultDriverConfigPath + `; it carries base_url, api_key and timeout.
+An absent file at the default path is not an error; a missing file that $` + envConfigPath + ` names, or any file that cannot be
+parsed, is a startup error, never a fallback.
+The API key comes from $` + envAPIKey + ` or that file, never from argv.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
 --timeout is an idle bound on one chat attempt: the dial, the response headers and the
 gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
 arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a
 long time before its first token, or when a proxy buffers the response.
-The API key is read from $` + envAPIKey + ` or the Driver Config, never from argv.
 `
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
