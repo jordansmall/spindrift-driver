@@ -149,3 +149,120 @@ func TestReadmeDocumentsChatTimeout(t *testing.T) {
 		t.Error("the smoke-test failure modes must name an attempt that times out alongside the unreachable server, rejected request and --max-turns cap")
 	}
 }
+
+// sentencesContaining returns the sentences of sec that mention needle, so a claim
+// is pinned to one statement rather than to the file: two facts in two unrelated
+// paragraphs of one section do not make the claim.
+func sentencesContaining(sec, needle string) []string {
+	var out []string
+	for _, s := range strings.Split(sec, ". ") {
+		if strings.Contains(s, needle) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// indexOrder reports whether needles appear in hay in the given order.
+func indexOrder(hay string, needles ...string) bool {
+	at := -1
+	for _, n := range needles {
+		i := strings.Index(hay, n)
+		if i <= at {
+			return false
+		}
+		at = i
+	}
+	return true
+}
+
+// TestReadmeDocumentsEventStreamOnStdout pins the rewritten output contract. stdout
+// is no longer prose, so the README is the only place a caller learns what to parse
+// and how to pull the answer out of it; every token asserted here is one they would
+// type or grep for.
+func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
+	const file = "README.md"
+	norm := normalizeMarkdown(t, file)
+
+	for _, want := range []string{
+		"jsonl", "kind", "epoch millisecond", "start", "text", "usage", "tool_call",
+		"tool_result", "result", "error", "tool_id", "jq", "stderr", "testdata/pass.jsonl",
+	} {
+		if !strings.Contains(norm, want) {
+			t.Errorf("%s does not document the stdout event stream (%s)", file, want)
+		}
+	}
+	// The text-only contract is retired; a README that still promises the bare
+	// answer on stdout sends a reader to parse something no longer emitted.
+	if regexp.MustCompile(`final answer on stdout|answer is the stdout|stdout is the final answer`).MatchString(norm) {
+		t.Error("README still promises the final answer itself on stdout; it is the result event's text")
+	}
+
+	out := markdownSectionAround(norm, "jsonl")
+	if out == "" {
+		t.Fatal("no section documents the JSONL event stream on stdout")
+	}
+
+	// One JSON object per line, named by kind, timestamped in epoch milliseconds —
+	// the shape a decoder is written against.
+	for _, want := range []string{"one json object per line", "kind", "epoch millisecond"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the event-stream section does not state the wire shape (%s)", want)
+		}
+	}
+	// Emission order is part of the contract: a host stream-parsing the log needs
+	// to know tool_result follows its tool_call and result closes a successful run.
+	if !indexOrder(out, "start", "text", "usage", "tool_call", "tool_result") && !indexOrder(out, "`start`", "`text`", "`usage`", "`tool_call`", "`tool_result`") {
+		t.Error("the event-stream section does not give the order the kinds appear in (start, text, usage, tool_call, tool_result, then result or error)")
+	}
+	if !strings.Contains(out, "pair by") || !strings.Contains(out, "tool_id") {
+		t.Error("the event-stream section does not say tool_call and tool_result pair by tool_id")
+	}
+	if !regexp.MustCompile(`exactly one .* per model call|one usage event per model call`).MatchString(out) {
+		t.Error("the event-stream section does not state that usage is emitted exactly once per Model call")
+	}
+	if !strings.Contains(out, "num_turns") || !strings.Contains(out, "duration_ms") || !strings.Contains(out, "models") {
+		t.Error("the result event's fields (num_turns, duration_ms, token totals, models) are not documented")
+	}
+	if !strings.Contains(out, "tokens") {
+		t.Error("the result event's token totals are not documented")
+	}
+	// Every non-zero exit is preceded by an error event — the reason a host can
+	// trust exit codes and stdout together.
+	if !strings.Contains(out, "non-zero exit") || !strings.Contains(out, "raw") {
+		t.Error("the event-stream section does not state that every non-zero exit is preceded by an error event carrying the raw error text")
+	}
+	// The answer and the failure text are both pulled with jq, the same way.
+	if !strings.Contains(out, "jq") || !strings.Contains(out, ".text") {
+		t.Error("the event-stream section shows no jq recipe reading .text out of an event")
+	}
+	for _, kind := range []string{"result", "error"} {
+		if !regexp.MustCompile(`select\(\.kind\s*==\s*"` + kind + `"\)`).MatchString(out) {
+			t.Errorf("the event-stream section shows no jq recipe for the %s event's text", kind)
+		}
+	}
+	if !strings.Contains(out, "jq -r") {
+		t.Error("the jq recipe is not given in the runnable `jq -r 'select(...)' | .text` form")
+	}
+	// Progress never moves to stdout, and -h is an exit path like any other.
+	if !strings.Contains(out, "progress") || !strings.Contains(out, "stderr") {
+		t.Error("the event-stream section does not state that progress stays on stderr")
+	}
+	var helpLines []string
+	for _, s := range sentencesContaining(out, "-h") {
+		if strings.Contains(s, "stderr") && strings.Contains(s, "usage") {
+			helpLines = append(helpLines, s)
+		}
+	}
+	if len(helpLines) == 0 {
+		t.Error("no statement says -h/--help writes its usage to stderr")
+	}
+
+	// The golden artifact is the hand-off, and it only moves under an explicit flag.
+	if !strings.Contains(norm, "go test -run testgoldenpasslog -update") {
+		t.Error("README does not give the regeneration command `go test -run TestGoldenPassLog -update`")
+	}
+	if !near(norm, "testdata/pass.jsonl", "drift", 240) {
+		t.Error("README does not state that the golden Pass log test fails on drift")
+	}
+}

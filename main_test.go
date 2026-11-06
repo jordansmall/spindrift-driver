@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,11 @@ func TestMain(m *testing.M) {
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	}
+	// Registered here, before m.Run() parses the command line: the Driver takes a
+	// built argv rather than os.Args, so the test binary has no other flag set, and
+	// the escape-helper branch above must stay first — a re-invoked helper would
+	// otherwise trip over the test flags it is handed.
+	goldenUpdate = flag.Bool("update", false, "rewrite the committed golden artifacts ("+goldenPassPath+") instead of comparing them")
 	os.Exit(m.Run())
 }
 
