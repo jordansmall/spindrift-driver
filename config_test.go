@@ -425,3 +425,103 @@ func TestDriverConfigPathDefaultFileFeedsTheLoader(t *testing.T) {
 		}
 	})
 }
+
+// writeDefaultDriverConfig plants contents at the default path under a fresh
+// HOME and hands back HOME, so readDriverConfig resolves the file the way the
+// real binary does instead of being handed its path.
+func writeDefaultDriverConfig(t *testing.T, contents string) string {
+	t.Helper()
+	home := t.TempDir()
+	path := filepath.Join(home, defaultDriverConfigPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir default config dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write default config: %v", err)
+	}
+	return home
+}
+
+func TestReadDriverConfig(t *testing.T) {
+	// stubs are keyed by name: an unnamed HOME stays unset in named(), an
+	// unnamed override stays unset in homeOnly()
+	named := func(path string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			if name == envConfigPath {
+				return path, true
+			}
+			return "", false
+		}
+	}
+	homeOnly := func(home string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			if name == "HOME" {
+				return home, true
+			}
+			return "", false
+		}
+	}
+
+	t.Run("no home and no override says nothing", func(t *testing.T) {
+		cfg, err := readDriverConfig(func(string) (string, bool) { return "", false })
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if cfg != (driverConfig{}) {
+			t.Errorf("cfg = %+v, want zero value", cfg)
+		}
+	})
+
+	t.Run("absent default file says nothing", func(t *testing.T) {
+		cfg, err := readDriverConfig(homeOnly(t.TempDir()))
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if cfg != (driverConfig{}) {
+			t.Errorf("cfg = %+v, want zero value", cfg)
+		}
+	})
+
+	t.Run("default file is loaded", func(t *testing.T) {
+		home := writeDefaultDriverConfig(t, `{"base_url":"http://from-home:7/v1"}`)
+		cfg, err := readDriverConfig(homeOnly(home))
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if cfg.baseURL != "http://from-home:7/v1" {
+			t.Errorf("baseURL = %q, want %q", cfg.baseURL, "http://from-home:7/v1")
+		}
+	})
+
+	t.Run("malformed default file is still an error", func(t *testing.T) {
+		home := writeDefaultDriverConfig(t, "nope")
+		path := filepath.Join(home, defaultDriverConfigPath)
+		cfg, err := readDriverConfig(homeOnly(home))
+		// the operator never named this file, but a file that is there and
+		// broken must not be quietly ignored
+		assertErrMessage(t, err, path, "malformed JSON")
+		if cfg != (driverConfig{}) {
+			t.Errorf("cfg = %+v, want zero value on error", cfg)
+		}
+	})
+
+	t.Run("named missing file is an error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "gone.json")
+		_, err := readDriverConfig(named(path))
+		assertErrMessage(t, err, path, "file not found")
+		if !errors.Is(err, errNoDriverConfig) {
+			t.Errorf("errors.Is(err, errNoDriverConfig) = false, want true; err = %v", err)
+		}
+	})
+
+	t.Run("named file is loaded", func(t *testing.T) {
+		path := writeDriverConfig(t, `{"base_url":"http://named:6/v1","timeout":"30s"}`)
+		cfg, err := readDriverConfig(named(path))
+		if err != nil {
+			t.Fatalf("error = %v, want nil", err)
+		}
+		if cfg.baseURL != "http://named:6/v1" || cfg.timeout != 30*time.Second {
+			t.Errorf("cfg = %+v, want the values the file carries", cfg)
+		}
+	})
+}

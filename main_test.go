@@ -2533,7 +2533,15 @@ func TestParseArgsStdinFallback(t *testing.T) {
 }
 
 func TestParseArgsBaseURLPrecedence(t *testing.T) {
-	env := func(string) (string, bool) { return "http://env:9/v1", true }
+	// keyed by name: the value answers only for SPINDRIFT_BASE_URL, so it does
+	// not double as a nonsense SPINDRIFT_CONFIG
+	env := func(name string) (string, bool) {
+		switch name {
+		case envBaseURL:
+			return "http://env:9/v1", true
+		}
+		return "", false
+	}
 
 	// flag beats env var
 	cfg, err := parseArgs([]string{"--model", "m", "--base-url", "http://flag:1/v1", "p"}, nil, env)
@@ -2551,6 +2559,74 @@ func TestParseArgsBaseURLPrecedence(t *testing.T) {
 	cfg, err = parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
 	if err != nil || cfg.baseURL != "http://localhost:8080/v1" {
 		t.Errorf("default: cfg = %+v, err = %v", cfg, err)
+	}
+}
+
+func TestParseArgsBaseURLPrecedenceIncludesDriverConfig(t *testing.T) {
+	configPath := writeDriverConfig(t, `{"base_url":"http://from-config:8/v1"}`)
+
+	for _, tc := range []struct {
+		name        string
+		args        []string
+		envBaseURL  string
+		envConfig   string
+		wantBaseURL string
+	}{
+		{
+			name:        "flag alone",
+			args:        []string{"--base-url", "http://flag:1/v1"},
+			wantBaseURL: "http://flag:1/v1",
+		},
+		{
+			name:        "env alone",
+			envBaseURL:  "http://env:9/v1",
+			wantBaseURL: "http://env:9/v1",
+		},
+		{
+			name:        "config alone",
+			envConfig:   configPath,
+			wantBaseURL: "http://from-config:8/v1",
+		},
+		{
+			name:        "flag beats env and config",
+			args:        []string{"--base-url", "http://flag:1/v1"},
+			envBaseURL:  "http://env:9/v1",
+			envConfig:   configPath,
+			wantBaseURL: "http://flag:1/v1",
+		},
+		{
+			name:        "env beats config",
+			envBaseURL:  "http://env:9/v1",
+			envConfig:   configPath,
+			wantBaseURL: "http://env:9/v1",
+		},
+		{
+			name:        "nothing set",
+			wantBaseURL: "http://localhost:8080/v1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// keyed by name: anything this case does not name (HOME included)
+			// reads as unset
+			lookup := func(name string) (string, bool) {
+				switch name {
+				case envBaseURL:
+					return tc.envBaseURL, tc.envBaseURL != ""
+				case envConfigPath:
+					return tc.envConfig, tc.envConfig != ""
+				}
+				return "", false
+			}
+			args := append([]string{"--model", "m"}, tc.args...)
+			args = append(args, "p")
+			cfg, err := parseArgs(args, nil, lookup)
+			if err != nil {
+				t.Fatalf("parseArgs returned error: %v", err)
+			}
+			if cfg.baseURL != tc.wantBaseURL {
+				t.Errorf("baseURL = %q, want %q", cfg.baseURL, tc.wantBaseURL)
+			}
+		})
 	}
 }
 
@@ -3107,5 +3183,28 @@ func TestParseArgsExtraPositional(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "p2") {
 		t.Errorf("err = %v, want it to name the extra argument", err)
+	}
+}
+
+// TestParseArgsBrokenDriverConfigOutranksFlagValidation pins the order: a file
+// the operator must fix is reported before any complaint about argv, because
+// fixing the arguments would not make the run possible anyway.
+func TestParseArgsBrokenDriverConfigOutranksFlagValidation(t *testing.T) {
+	path := writeDriverConfig(t, "nope")
+	lookup := func(name string) (string, bool) {
+		if name == envConfigPath {
+			return path, true
+		}
+		return "", false
+	}
+	_, err := parseArgs([]string{"--model", "m", "--max-turns", "0", "p"}, nil, lookup)
+	if err == nil {
+		t.Fatal("parseArgs returned nil, want the config error")
+	}
+	if !strings.Contains(err.Error(), "driver config") || !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %v, want it to name the driver config file %q", err, path)
+	}
+	if strings.Contains(err.Error(), "--max-turns") {
+		t.Errorf("err = %v, want the config error, not the flag complaint", err)
 	}
 }

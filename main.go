@@ -278,6 +278,13 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		return config{}, fmt.Errorf("unexpected argument %q: only one prompt is accepted", positional[1])
 	}
 
+	// read before any validation: a Driver Config the operator cannot fix makes
+	// the rest of the arguments moot
+	file, err := readDriverConfig(lookupEnv)
+	if err != nil {
+		return config{}, err
+	}
+
 	if *maxTurns < 1 {
 		return config{}, fmt.Errorf("--max-turns must be at least 1, got %d", *maxTurns)
 	}
@@ -294,9 +301,13 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
 	}
+	// flag > env > Driver Config > built-in default; a set-but-empty env value
+	// reads as unset, so it never blanks out a value the file supplied
 	if cfg.baseURL == "" {
-		if v, ok := lookupEnv(envBaseURL); ok {
+		if v, ok := lookupEnv(envBaseURL); ok && v != "" {
 			cfg.baseURL = v
+		} else if file.baseURL != "" {
+			cfg.baseURL = file.baseURL
 		} else {
 			cfg.baseURL = defaultBaseURL
 		}

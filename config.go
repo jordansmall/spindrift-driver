@@ -69,6 +69,24 @@ func driverConfigPath(lookupEnv func(string) (string, bool)) (path string, expli
 	return "", false
 }
 
+// readDriverConfig resolves and loads the Driver Config. An unresolved default
+// path and an absent default file both read as "the file said nothing": only a
+// file the operator named is mandatory.
+func readDriverConfig(lookupEnv func(string) (string, bool)) (driverConfig, error) {
+	path, explicit := driverConfigPath(lookupEnv)
+	if path == "" {
+		return driverConfig{}, nil
+	}
+	file, err := loadDriverConfig(path)
+	if err != nil {
+		if !explicit && errors.Is(err, errNoDriverConfig) {
+			return driverConfig{}, nil
+		}
+		return driverConfig{}, err
+	}
+	return file, nil
+}
+
 // loadDriverConfig reads exactly one path and never falls back. It writes
 // nothing anywhere: stdout is the event stream, exclusively.
 func loadDriverConfig(path string) (driverConfig, error) {
