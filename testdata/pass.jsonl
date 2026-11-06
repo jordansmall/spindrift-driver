@@ -1,13 +1,14 @@
 {"kind":"start","message_id":"msg-1","timestamp":1700000000250}
-{"kind":"text","message_id":"msg-1","timestamp":1700000001000,"text":"I will look at the repo first,\nthen report.\n"}
-{"kind":"usage","message_id":"msg-1","timestamp":1700000001250,"model":"llama-3.1-8b","tokens":{"input":104,"output":21,"cache_read":64,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"tool_call","message_id":"msg-1","timestamp":1700000001500,"tool_id":"call_alpha","tool_name":"bash","tool_input":{"command":"printf 'hello world'"},"tool_target":"printf 'hello world'"}
-{"kind":"tool_result","message_id":"msg-1","timestamp":1700000001750,"tool_id":"call_alpha","tool_name":"bash","tool_target":"printf 'hello world'","tool_output":"hello world\nexit code: 0"}
-{"kind":"start","message_id":"msg-2","timestamp":1700000002000}
-{"kind":"usage","message_id":"msg-2","timestamp":1700000002750,"model":"llama-3.1-8b","tokens":{"input":148,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"tool_call","message_id":"msg-2","timestamp":1700000003000,"tool_id":"call_beta","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
-{"kind":"tool_result","message_id":"msg-2","timestamp":1700000003250,"tool_id":"call_beta","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
-{"kind":"start","message_id":"msg-3","timestamp":1700000003500}
-{"kind":"text","message_id":"msg-3","timestamp":1700000004250,"text":"Ran both commands; the second failed with exit code 3."}
-{"kind":"usage","message_id":"msg-3","timestamp":1700000004500,"model":"qwen2.5-coder","tokens":{"input":177,"output":12,"cache_read":25,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"result","timestamp":1700000005000,"text":"Ran both commands; the second failed with exit code 3.","tokens":{"input":429,"output":51,"cache_read":89,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0},"duration_ms":4750,"duration_api_ms":750,"num_turns":3,"models":["llama-3.1-8b","qwen2.5-coder"]}
+{"kind":"reasoning","message_id":"msg-1","timestamp":1700000001000,"text":"reading the tree before saying anything about it; one safe command first, then one allowed to fail"}
+{"kind":"text","message_id":"msg-1","timestamp":1700000001250,"text":"I will look at the repo first,\nthen report.\n"}
+{"kind":"usage","message_id":"msg-1","timestamp":1700000001500,"model":"llama-3.1-8b","tokens":{"input":104,"output":21,"cache_read":64,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-1","timestamp":1700000001750,"tool_id":"call_alpha","tool_name":"bash","tool_input":{"command":"printf 'hello world'"},"tool_target":"printf 'hello world'"}
+{"kind":"tool_result","message_id":"msg-1","timestamp":1700000002000,"tool_id":"call_alpha","tool_name":"bash","tool_target":"printf 'hello world'","tool_output":"hello world\nexit code: 0"}
+{"kind":"start","message_id":"msg-2","timestamp":1700000002250}
+{"kind":"usage","message_id":"msg-2","timestamp":1700000003000,"model":"llama-3.1-8b","tokens":{"input":148,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-2","timestamp":1700000003250,"tool_id":"call_beta","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
+{"kind":"tool_result","message_id":"msg-2","timestamp":1700000003500,"tool_id":"call_beta","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
+{"kind":"start","message_id":"msg-3","timestamp":1700000003750}
+{"kind":"text","message_id":"msg-3","timestamp":1700000004500,"text":"Ran both commands; the second failed with exit code 3."}
+{"kind":"usage","message_id":"msg-3","timestamp":1700000004750,"model":"qwen2.5-coder","tokens":{"input":177,"output":12,"cache_read":25,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"result","timestamp":1700000005250,"text":"Ran both commands; the second failed with exit code 3.","tokens":{"input":429,"output":51,"cache_read":89,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0},"duration_ms":5000,"duration_api_ms":750,"num_turns":3,"models":["llama-3.1-8b","qwen2.5-coder"]}
