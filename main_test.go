@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -3345,5 +3346,172 @@ func TestParseArgsBrokenDriverConfigOutranksFlagValidation(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "--max-turns") {
 		t.Errorf("err = %v, want the config error, not the flag complaint", err)
+	}
+}
+
+// driverConfigEnv is the env stub for a run whose Driver Config is named by
+// hand: SPINDRIFT_CONFIG points at path, every other variable reads as unset --
+// including HOME, so no default file can stand in for the one that is broken.
+func driverConfigEnv(path string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		switch name {
+		case envConfigPath:
+			return path, true
+		default:
+			return "", false
+		}
+	}
+}
+
+// assertNoStartEvent checks the stream never opened a Model call: a startup
+// failure must be the only thing stdout carries.
+func assertNoStartEvent(t *testing.T, raw string) {
+	t.Helper()
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "start" {
+			t.Errorf("stdout carries a start event before the config error: %q", raw)
+		}
+	}
+}
+
+// A Driver Config the operator named by hand has to exist. Startup fails in the
+// existing exit-2 class, and the one error event names the file and the problem
+// so a reader of stdout alone learns both; stderr carries the same news for the
+// human at the terminal.
+func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "absent.json")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, path) || !strings.Contains(got, "file not found") {
+		t.Errorf("error event text = %q, want it to name %q and report the file missing", got, path)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), path) {
+		t.Errorf("stderr = %q, want the operator copy of the failure naming %q", stderr.String(), path)
+	}
+}
+
+// A truncated file is not "a file that said nothing": parsing it fails, the run
+// exits 2 with exactly one error event and no start event, so a reader knows no
+// Model call was ever attempted with half-read settings.
+func TestRunDriverConfigMalformedJSONFailsStartup(t *testing.T) {
+	path := writeDriverConfig(t, `{"base_url": `)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, path) || !strings.Contains(got, "malformed JSON") {
+		t.Errorf("error event text = %q, want it to name %q and say malformed JSON", got, path)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), path) {
+		t.Errorf("stderr = %q, want the operator copy naming %q", stderr.String(), path)
+	}
+}
+
+// An unrecognised key is refused rather than ignored: the nearest known field is
+// not guessed at, so a typo cannot quietly leave the run on defaults -- and a
+// key that names a runtime knob cannot smuggle it in either.
+func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
+	path := writeDriverConfig(t, `{"apiKEy":"sk-x"}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	got := oneErrorEvent(t, stdout.String())
+	if !strings.Contains(got, path) || !strings.Contains(got, "apiKEy") {
+		t.Errorf("error event text = %q, want it to name %q and the offending key apiKEy", got, path)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), "apiKEy") {
+		t.Errorf("stderr = %q, want the operator copy to name the offending key", stderr.String())
+	}
+
+	// model is deliberately outside the file schema: a config that sets it must
+	// be refused outright, never honoured in place of the required --model.
+	smuggle := writeDriverConfig(t, `{"model":"sneaky"}`)
+	var stdout2, stderr2 bytes.Buffer
+	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle))
+	if code == 0 {
+		t.Fatal("run exited 0, want a refusal: a config field must not supply the model")
+	}
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr2.String())
+	}
+	if got := oneErrorEvent(t, stdout2.String()); !strings.Contains(got, "model") {
+		t.Errorf("error event text = %q, want it to name the offending model key", got)
+	}
+	assertNoStartEvent(t, stdout2.String())
+}
+
+// A field of the wrong JSON type is reported with the type that was found, not
+// with the type the reader wished for: "got number" is what tells the operator
+// to quote the value.
+func TestRunDriverConfigWrongTypeFailsStartup(t *testing.T) {
+	path := writeDriverConfig(t, `{"base_url": 8080}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	got := oneErrorEvent(t, stdout.String())
+	if !strings.Contains(got, path) || !strings.Contains(got, "base_url") || !strings.Contains(got, "number") {
+		t.Errorf("error event text = %q, want it to name %q, the field base_url and the kind found (number)", got, path)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), "base_url") {
+		t.Errorf("stderr = %q, want the operator copy to name the offending field", stderr.String())
+	}
+}
+
+// The default file is allowed to be absent: a home directory without
+// ~/.config/spindrift-driver/config.json is "the file said nothing", so the run
+// proceeds on flags exactly as it would with no config feature at all.
+func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
+	home := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, sseChatCompletion(`{"model":"m","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(name string) (string, bool) {
+		switch name {
+		case "HOME":
+			return home, true
+		default:
+			return "", false
+		}
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 with no default config file; stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "ok") {
+		t.Errorf("stdout = %q, want the answer from the fake server", stdout.String())
+	}
+	resultEvent(t, stdout.String())
+}
+
+// --help is how an operator recovers from a file they just broke, so it must not
+// touch the config: the usage still comes out on stderr at exit 0.
+func TestRunHelpIgnoresBrokenDriverConfig(t *testing.T) {
+	path := writeDriverConfig(t, `{"base_url": `)
+	for _, arg := range []string{"--help", "-h"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+		if code != 0 {
+			t.Errorf("%s with a broken config: exit code = %d, want 0; stderr = %q", arg, code, stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("%s: stdout = %q, want nothing: stdout carries only JSONL events", arg, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "usage:") {
+			t.Errorf("%s: stderr = %q, want usage text", arg, stderr.String())
+		}
 	}
 }
