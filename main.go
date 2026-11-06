@@ -21,8 +21,8 @@ const defaultBaseURL = "http://localhost:8080/v1"
 const envBaseURL = "SPINDRIFT_BASE_URL"
 const envAPIKey = "SPINDRIFT_API_KEY"
 
-// systemPrompt is deliberately minimal and hardcoded: slice 2 has no tool
-// loop, so the Model just gets repo context via the user prompt.
+// systemPrompt is deliberately minimal and hardcoded: the Model gets repo context
+// via the user prompt.
 const systemPrompt = "You are a coding agent working in this repository. Answer with the final response only; it is the Driver's final result event."
 
 type config struct {

@@ -1,6 +1,7 @@
 # spindrift-driver
 
-A **Driver** for the spindrift coordinator: one prompt in, one final answer out.
+A **Driver** for the spindrift coordinator: one prompt in, one final answer out — and
+the answer arrives as a `result` event on stdout's event stream, not as loose text.
 It talks to an OpenAI-compatible **Model** server, offers that Model a single Bash
 **Tool**, runs the Tool Calls the Model asks for, and loops until the Model answers.
 
@@ -12,6 +13,52 @@ The prompt is positional or on stdin; `--model` is required; `--max-turns` caps 
 agent loop (default 50). `--timeout` bounds each chat attempt — dial, response headers
 and body read — and defaults to 5m0s; raise it (`--timeout 15m`) when the server
 generates slowly, which a local model often does.
+
+## Output: stdout is a JSONL event stream
+
+stdout is a JSONL event stream — one JSON object per line, and nothing else, on every
+exit path, a failed run and `-h` included. There is no output-mode flag: these events
+are the whole stdout contract ([ADR-0004](docs/adr/0004-events-are-the-only-stdout-contract.md)).
+`kind` names the event, `timestamp` is epoch milliseconds, field names are snake_case,
+and an event omits the fields its kind does not fill.
+
+The kinds this Driver emits, in the order they appear: per Model call, `start`, then
+`text` when that call produced assistant prose, then `usage`, then for each Tool Call a
+`tool_call` followed by its `tool_result`; after the last call, `result` on success or
+`error` before a non-zero exit.
+
+- `start` — one Model call (turn) beginning. Every event of a call carries that call's
+  `message_id`.
+- `text` — assistant prose, verbatim and untrimmed.
+- `usage` — exactly one usage event per Model call, holding that call's `tokens` and
+  never a running total. A server that reports no usage still gets one, with zeroes.
+- `tool_call` — the Model invoking a Tool: `tool_name`, `tool_input` (the arguments
+  decoded as JSON) and `tool_target` (the command, for the Bash Tool).
+- `tool_result` — that call's output on its way back to the Model, `is_error` set when
+  the command failed. `tool_call` and `tool_result` pair by `tool_id`.
+- `result` — the final answer, in `text`, plus `num_turns`, `duration_ms`,
+  `duration_api_ms`, the session token totals in `tokens` and the `models` that
+  answered. The answer is this event's `text`; it is also emitted as a `text` event,
+  because it is assistant prose.
+- `error` — every non-zero exit is preceded by one `error` event carrying the raw error
+  text, verbatim and unbounded. Exit codes stay authoritative beside it: 0 for a
+  `result` (and for `-h`), 1 for a failed run, 2 for a usage error.
+
+Pull the answer out with `jq`, and the failure text the same way:
+
+```
+spindrift-driver "…" --model <model> | jq -r 'select(.kind=="result") | .text'
+spindrift-driver "…" --model <model> | jq -r 'select(.kind=="error") | .text'
+```
+
+Progress stays on stderr and never moves to stdout: each `POST`, each retry, the
+one-line driver error. `-h`/`--help` writes its usage to stderr for the same reason, so
+stdout parses as events even there.
+
+`testdata/pass.jsonl` is the committed golden Pass log: one scripted run's whole event
+stream, byte for byte. `go test -run TestGoldenPassLog -update` regenerates it, and
+without `-update` that test fails on any drift — the artifact a host-side decoder is
+written against never moves silently.
 
 ## Build
 
@@ -82,11 +129,13 @@ hand and is not part of `nix flake check` or CI.
    ./result/bin/spindrift-driver "List the Go files here, then say what main.go does." --model <model>
    ```
 
-Expected: the Model's final answer on stdout, exit status 0. Progress — each
-`POST`, each retry — goes to stderr, so stdout stays clean enough to pipe. A failure
-prints one line to stderr and exits non-zero: unreachable server, rejected request, an
-attempt that exceeds `--timeout` (default 5m0s — raise it for slow generation), or the
-`--max-turns` cap reached without an answer.
+Expected: exit status 0 and a Pass log on stdout, with the Model's final answer in the
+`result` event's `text` — `jq -r 'select(.kind=="result") | .text'` is how you read it.
+Progress — each `POST`, each retry — goes to stderr, so stdout stays parseable end to
+end. A failure prints one line to stderr, emits an `error` event on stdout, and exits
+non-zero: unreachable server, rejected request, an attempt that exceeds `--timeout`
+(default 5m0s — raise it for slow generation), or the `--max-turns` cap reached without
+an answer.
 
 ## Not packaged
 

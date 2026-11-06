@@ -26,3 +26,11 @@ _Avoid_: observation, output
 
 **Bash Tool**:
 The one Tool in scope: runs a shell command and returns its output as the tool result.
+
+**Event**:
+One canonical driverkit fact the Driver reports on stdout: one JSON object on one line, named by its `kind` and timestamped in epoch milliseconds. These events are the whole stdout contract — a host decodes a run event by event, it does not scrape text.
+_Avoid_: log line, record, frame, printout
+
+**Pass log**:
+The whole JSONL stream one run writes to stdout — its events in emission order, with the run's stderr interleaved by the recorder — decoded line by line into the session record. `testdata/pass.jsonl` is the committed golden Pass log of one scripted run.
+_Avoid_: transcript, log file, stdout dump
