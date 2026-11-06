@@ -65,11 +65,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		{Role: "user", Content: cfg.prompt},
 	}
 	for turn := 0; turn < cfg.maxTurns; turn++ {
-		assistant, err := sendChat(cfg, messages, stderr)
+		reply, err := sendChat(cfg, messages, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "spindrift-driver: %v\n", err)
 			return 1
 		}
+		assistant := reply.Message
 		if len(assistant.ToolCalls) == 0 {
 			// No tool calls: the content is the final answer.
 			final := assistant.Content
@@ -369,9 +370,55 @@ type chatRequest struct {
 }
 
 type chatResponse struct {
+	Model string `json:"model"`
+	// Usage is a pointer so "the server sent no usage object" stays
+	// distinguishable from "it sent zeros"; both map to zero tokens.
+	Usage   *chatUsage `json:"usage"`
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+}
+
+// chatUsage mirrors the OpenAI-shaped usage object. Fields are float64 so a
+// server reporting a fractional count cannot make the whole response
+// unparseable, and they match tokenTotals without conversion.
+type chatUsage struct {
+	PromptTokens     float64 `json:"prompt_tokens"`
+	CompletionTokens float64 `json:"completion_tokens"`
+	// PromptCacheHitTokens is the llama.cpp/vLLM spelling of cache read;
+	// OpenAI spells the same number prompt_tokens_details.cached_tokens.
+	PromptCacheHitTokens float64                 `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails  *chatPromptTokenDetails `json:"prompt_tokens_details"`
+}
+
+type chatPromptTokenDetails struct {
+	CachedTokens float64 `json:"cached_tokens"`
+}
+
+// chatReply is one Model call's answer: the assistant message to replay into
+// the conversation, plus the two things a usage event needs that the message
+// itself does not carry — the model that answered and the token tally.
+// CacheWrite5m, CacheWrite1h and CostUSD stay zero: this server family
+// reports none of them.
+type chatReply struct {
+	Message chatMessage
+	Model   string
+	Tokens  tokenTotals
+}
+
+// totals flattens the usage object to a call's tally, taking cache read from
+// whichever spelling the server used (the non-zero one). A nil usage
+// object — the common case for a plain llama.cpp endpoint — answers zeros with
+// no error, because the call still owes exactly one usage event.
+func (u *chatUsage) totals() tokenTotals {
+	if u == nil {
+		return tokenTotals{}
+	}
+	cacheRead := u.PromptCacheHitTokens
+	if cacheRead == 0 && u.PromptTokensDetails != nil {
+		cacheRead = u.PromptTokensDetails.CachedTokens
+	}
+	return tokenTotals{Input: u.PromptTokens, Output: u.CompletionTokens, CacheRead: cacheRead}
 }
 
 // wrapTimeout rewords a deadline failure for the operator: the runtime says
@@ -388,9 +435,11 @@ func wrapTimeout(target string, timeout time.Duration, stage string, err error) 
 }
 
 // sendChat performs one chat completion round trip against an
-// OpenAI-compatible server and returns the full assistant message
-// (content and tool calls).
-func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage, error) {
+// OpenAI-compatible server and returns the assistant message alongside the
+// response model and token tally. The response's own model wins; a server
+// that omits it falls back to the configured --model, because a usage event
+// with no model id would drop the call from the per-model breakdown.
+func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
 	reqBody, err := json.Marshal(chatRequest{
@@ -399,7 +448,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 		Tools:    []toolSpec{bashTool},
 	})
 	if err != nil {
-		return chatMessage{}, err
+		return chatReply{}, err
 	}
 	// clamped so an injected knob of 0 (or less) still makes one attempt
 	// instead of reporting an empty answer with a nil error.
@@ -432,7 +481,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 		// one-shot, so every attempt needs a freshly built request.
 		req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(reqBody))
 		if err != nil {
-			return chatMessage{}, err
+			return chatReply{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		if cfg.apiKey != "" {
@@ -465,18 +514,22 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatMessage
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return chatMessage{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			return chatReply{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 		}
 		var parsed chatResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return chatMessage{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
+			return chatReply{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
 		}
 		if len(parsed.Choices) == 0 {
-			return chatMessage{}, errors.New("server returned no choices")
+			return chatReply{}, errors.New("server returned no choices")
 		}
-		return parsed.Choices[0].Message, nil
+		model := parsed.Model
+		if model == "" {
+			model = cfg.model
+		}
+		return chatReply{Message: parsed.Choices[0].Message, Model: model, Tokens: parsed.Usage.totals()}, nil
 	}
-	return chatMessage{}, lastErr
+	return chatReply{}, lastErr
 }
 
 // boundBody flattens and caps a server-supplied body: the retry note is one
