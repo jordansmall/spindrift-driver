@@ -148,6 +148,30 @@ func TestReadmeDocumentsChatTimeout(t *testing.T) {
 	if !regexp.MustCompile(`timed[- ]out|times out|timeout`).MatchString(smoke) {
 		t.Error("the smoke-test failure modes must name an attempt that times out alongside the unreachable server, rejected request and --max-turns cap")
 	}
+
+	// Responses stream, so what trips --timeout is silence, not a turn that took
+	// too long overall. Prose that still describes a whole-attempt cap points an
+	// operator at the wrong diagnosis when a live run stalls.
+	if !regexp.MustCompile(`stall|silent|silence|goes silent`).MatchString(smoke) {
+		t.Error("the smoke-test failure modes describe a stalled stream (silence past the bound), not an attempt that merely exceeds --timeout")
+	}
+
+	prose := markdownSectionAround(norm, "usage: spindrift-driver")
+	if prose == "" {
+		t.Fatal("no usage block in " + file)
+	}
+	for _, want := range []string{"idle", "gap between received bytes", "response headers"} {
+		if !strings.Contains(prose, want) {
+			t.Errorf("the README does not describe --timeout as an idle bound (%s)", want)
+		}
+	}
+	// When to raise it, stated as the case that actually needs it.
+	if !regexp.MustCompile(`raise it[^.]*first token`).MatchString(prose) {
+		t.Error("the README does not say to raise --timeout when the server is slow to emit its first token (or a proxy buffers)")
+	}
+	if regexp.MustCompile(`raise it[^.]*generat`).MatchString(prose) {
+		t.Error("the README still tells the operator to raise --timeout for slow generation; a streaming turn no longer needs a raise")
+	}
 }
 
 // sentencesContaining returns the sentences of sec that mention needle, so a claim
@@ -185,7 +209,7 @@ func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
 	norm := normalizeMarkdown(t, file)
 
 	for _, want := range []string{
-		"jsonl", "kind", "epoch millisecond", "start", "text", "usage", "tool_call",
+		"jsonl", "kind", "epoch millisecond", "start", "reasoning", "text", "usage", "tool_call",
 		"tool_result", "result", "error", "tool_id", "jq", "stderr", "testdata/pass.jsonl",
 	} {
 		if !strings.Contains(norm, want) {
@@ -212,6 +236,11 @@ func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
 	}
 	// Emission order is part of the contract: a host stream-parsing the log needs
 	// to know tool_result follows its tool_call and result closes a successful run.
+	// reasoning rides ahead of the prose it produced, so a decoder that assumes
+	// text is the first prose of a call mistakes thinking for the answer.
+	if !indexOrder(out, "`start`", "`reasoning`", "`text`") {
+		t.Error("the event-stream section does not list reasoning between start and text, the order it is emitted in")
+	}
 	if !indexOrder(out, "start", "text", "usage", "tool_call", "tool_result") && !indexOrder(out, "`start`", "`text`", "`usage`", "`tool_call`", "`tool_result`") {
 		t.Error("the event-stream section does not give the order the kinds appear in (start, text, usage, tool_call, tool_result, then result or error)")
 	}

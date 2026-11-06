@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -2652,6 +2653,28 @@ func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	}
 	if want := chatAttemptTimeout.String(); !strings.Contains(usage, want) {
 		t.Errorf("usage does not state the default timeout %s:\n%s", want, usage)
+	}
+
+	// The bound is idle, not wall-clock: responses stream, so what trips it is
+	// silence, and a healthy stream may run far past the value. Text that still
+	// describes a whole-attempt cap sends an operator to raise a knob that was
+	// never the problem.
+	if !strings.Contains(usage, "idle") {
+		t.Errorf("usage does not describe --timeout as an idle bound:\n%s", usage)
+	}
+	if !regexp.MustCompile(`gap between [^.]*bytes`).MatchString(usage) {
+		t.Errorf("usage does not say --timeout caps the gap between received bytes:\n%s", usage)
+	}
+	if !strings.Contains(usage, "response headers") {
+		t.Errorf("usage does not name the response headers as a leg --timeout caps:\n%s", usage)
+	}
+	// The one case that really needs a raise: a server silent before its first
+	// token, or a proxy that buffers. Ordinary long generations no longer do.
+	if !regexp.MustCompile(`(?s)raise it[^.]*first token`).MatchString(usage) {
+		t.Errorf("usage does not say to raise --timeout when the server is slow to emit its first token:\n%s", usage)
+	}
+	if regexp.MustCompile(`(?s)raise it[^.]*generat`).MatchString(usage) {
+		t.Errorf("usage still tells the operator to raise --timeout for slow generation; a streaming turn no longer needs a raise:\n%s", usage)
 	}
 }
 

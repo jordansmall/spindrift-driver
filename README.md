@@ -10,9 +10,11 @@ usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns
 ```
 
 The prompt is positional or on stdin; `--model` is required; `--max-turns` caps the
-agent loop (default 50). `--timeout` bounds each chat attempt — dial, response headers
-and body read — and defaults to 5m0s; raise it (`--timeout 15m`) when the server
-generates slowly, which a local model often does.
+agent loop (default 50). `--timeout` is an idle bound on each chat attempt — the dial,
+the response headers and the gap between received bytes of the streamed response —
+and defaults to 5m0s, so a stream that keeps arriving may run far past it. Raise it
+(`--timeout 15m`) only when the server thinks for a long time before its first token, or
+when a proxy buffers the response.
 
 ## Output: stdout is a JSONL event stream
 
@@ -23,12 +25,16 @@ are the whole stdout contract ([ADR-0004](docs/adr/0004-events-are-the-only-stdo
 and an event omits the fields its kind does not fill.
 
 The kinds this Driver emits, in the order they appear: per Model call, `start`, then
-`text` when that call produced assistant prose, then `usage`, then for each Tool Call a
-`tool_call` followed by its `tool_result`; after the last call, `result` on success or
-`error` before a non-zero exit.
+`reasoning` when that call streamed thinking, then `text` when that call produced
+assistant prose, then `usage`, then for each Tool Call a `tool_call` followed by its
+`tool_result`; after the last call, `result` on success or `error` before a non-zero
+exit.
 
 - `start` — one Model call (turn) beginning. Every event of a call carries that call's
   `message_id`.
+- `reasoning` — the Model's streamed thinking, in `text`, emitted once per completed
+  message ahead of the `text` event it produced. It is never the answer: only `text` and
+  the `result` event carry that.
 - `text` — assistant prose, verbatim and untrimmed.
 - `usage` — exactly one usage event per Model call, holding that call's `tokens` and
   never a running total. A server that reports no usage still gets one, with zeroes.
@@ -133,9 +139,10 @@ Expected: exit status 0 and a Pass log on stdout, with the Model's final answer 
 `result` event's `text` — `jq -r 'select(.kind=="result") | .text'` is how you read it.
 Progress — each `POST`, each retry — goes to stderr, so stdout stays parseable end to
 end. A failure prints one line to stderr, emits an `error` event on stdout, and exits
-non-zero: unreachable server, rejected request, an attempt that exceeds `--timeout`
-(default 5m0s — raise it for slow generation), or the `--max-turns` cap reached without
-an answer.
+non-zero: unreachable server, rejected request, a stream that goes silent for longer than
+`--timeout` (default 5m0s — a stalled stream, not a long generation: raise it when the
+server thinks for a long time before its first token), or the `--max-turns` cap reached
+without an answer.
 
 ## Not packaged
 

@@ -46,8 +46,10 @@ var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>]
 The prompt may be given positionally or on stdin. --model is required.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
---timeout bounds one chat attempt (dial, response headers, body read), default ` + chatAttemptTimeout.String() + `;
-raise it when the server generates slowly — a local model can take minutes per turn.
+--timeout is an idle bound on one chat attempt: the dial, the response headers and the
+gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
+arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a
+long time before its first token, or when a proxy buffers the response.
 The API key is read from $` + envAPIKey + ` only, never from argv.
 `
 
@@ -266,7 +268,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	baseURL := fs.String("base-url", "", "OpenAI-compatible API base URL (default: $SPINDRIFT_BASE_URL or "+defaultBaseURL+")")
 	model := fs.String("model", "", "model name (required)")
 	maxTurns := fs.Int("max-turns", 50, "maximum agent turns")
-	timeout := fs.Duration("timeout", chatAttemptTimeout, "per-attempt timeout for one chat request (dial, headers, body read); accepts Go durations such as 90s or 2m")
+	timeout := fs.Duration("timeout", chatAttemptTimeout, "idle timeout for one chat request: caps the dial, the response headers and the gap between received bytes, not the whole generation; accepts Go durations such as 90s or 2m")
 	pre, post := splitAtEndOfFlags(args)
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
 		return config{}, err
@@ -387,9 +389,11 @@ var chatRetryAttempts = 3
 // further attempt; tests inject a shorter value.
 var chatRetryBackoff = 100 * time.Millisecond
 
-// chatAttemptTimeout bounds a single attempt: dial, response headers and
-// response body read. It is the fallback default for hand-built configs and
-// the --timeout flag default; tests inject a shorter value.
+// chatAttemptTimeout is an idle bound on one attempt: the dial, the response
+// headers, and the gap between received bytes of the streamed body — a stream
+// that keeps arriving may run far past it. It is the fallback default
+// for hand-built configs and the --timeout flag default; tests inject a
+// shorter value.
 var chatAttemptTimeout = 5 * time.Minute
 
 // truncatedOutputMarker precedes the kept tail when output exceeded the cap,
