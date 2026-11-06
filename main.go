@@ -502,10 +502,19 @@ var bashTool = toolSpec{
 	},
 }
 
+// streamOptions is the OpenAI knob that asks a streaming completion for a
+// final usage-bearing chunk; without it a streaming reply reports no tokens.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	Tools    []toolSpec    `json:"tools,omitempty"`
+	// Unconditional: #20 rules out a non-streaming fallback, so no flag gates these.
+	Stream        bool          `json:"stream"`
+	StreamOptions streamOptions `json:"stream_options"`
 }
 
 type chatResponse struct {
@@ -582,9 +591,11 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
 	reqBody, err := json.Marshal(chatRequest{
-		Model:    cfg.model,
-		Messages: messages,
-		Tools:    []toolSpec{bashTool},
+		Model:         cfg.model,
+		Messages:      messages,
+		Tools:         []toolSpec{bashTool},
+		Stream:        true,
+		StreamOptions: streamOptions{IncludeUsage: true},
 	})
 	if err != nil {
 		return chatReply{}, err
