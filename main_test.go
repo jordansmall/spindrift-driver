@@ -1943,9 +1943,8 @@ func driverErrorLine(stderr, target string) string {
 }
 
 // assertTimeoutErrorLine pins the terminal diagnostic of a timed-out run to the
-// endpoint and the per-attempt bound that fired: the raw Go error ("context
-// deadline exceeded (Client.Timeout exceeded while awaiting headers)") names
-// neither, so both must be added. The caller passes the bound it injected, so
+// endpoint and the idle bound that fired: the raw Go error (a bare "context
+// deadline exceeded", or a net-poller timeout) names neither, so both must be added. The caller passes the bound it injected, so
 // each is checked against the timeout it actually configured.
 func assertTimeoutErrorLine(t *testing.T, stderr, target string, bound time.Duration) {
 	t.Helper()
@@ -1955,8 +1954,8 @@ func assertTimeoutErrorLine(t *testing.T, stderr, target string, bound time.Dura
 }
 
 // A stalled endpoint is the black hole this test pins: the connection is
-// accepted and nothing ever answers, so only a bounded per-attempt timeout can
-// turn it into a non-zero exit. The elapsed bound is the load-bearing
+// accepted and nothing ever answers, so only the idle bound can turn it into a
+// non-zero exit. The elapsed bound is the load-bearing
 // assertion -- without a timeout the run simply waits for the stall to end and
 // exits 0, which no other assertion here can distinguish from success.
 func TestRunStalledRequestTimesOut(t *testing.T) {
@@ -1986,7 +1985,7 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
-		t.Errorf("run took %s, want well under the handler's %s stall (no per-attempt timeout)", elapsed, stall)
+		t.Errorf("run took %s, want well under the handler's %s stall (no idle bound fired)", elapsed, stall)
 	}
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
@@ -2034,7 +2033,7 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
-		t.Errorf("run took %s, want well under the handler's %s stall (no per-attempt timeout on the body read)", elapsed, stall)
+		t.Errorf("run took %s, want well under the handler's %s stall (no idle bound fired on the body read)", elapsed, stall)
 	}
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
@@ -2145,9 +2144,9 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// A hand-built config leaves cfg.timeout zero, and http.Client{Timeout: 0}
-	// means no bound at all rather than no wait — the attempt must still land
-	// on the finite package default.
+	// A hand-built config leaves cfg.timeout zero, and a zero bound means no wait
+	// at all rather than no limit — the attempt must still land on the finite
+	// package default.
 	start := time.Now()
 	reply, err := sendChat(config{baseURL: srv.URL, model: "m"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	elapsed := time.Since(start)
