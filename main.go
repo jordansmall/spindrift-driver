@@ -273,6 +273,12 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
 		return config{}, err
 	}
+	// fs.Visit sees only the flags actually given: --timeout defaults to
+	// chatAttemptTimeout rather than the zero value, so *timeout alone cannot
+	// tell an unset flag from one the operator typed -- and the Driver Config
+	// must lose to a value that was typed.
+	timeoutSet := false
+	fs.Visit(func(f *flag.Flag) { timeoutSet = timeoutSet || f.Name == "timeout" })
 	positional := append(fs.Args(), post...)
 	if len(positional) > 1 {
 		return config{}, fmt.Errorf("unexpected argument %q: only one prompt is accepted", positional[1])
@@ -288,7 +294,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if *maxTurns < 1 {
 		return config{}, fmt.Errorf("--max-turns must be at least 1, got %d", *maxTurns)
 	}
-	if *timeout <= 0 {
+	if timeoutSet && *timeout <= 0 {
 		return config{}, fmt.Errorf("--timeout must be positive, got %v", *timeout)
 	}
 
@@ -297,6 +303,11 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		baseURL:  *baseURL,
 		maxTurns: *maxTurns,
 		timeout:  *timeout,
+	}
+	// the file never carries a non-positive duration (readDriverConfig rejects
+	// those), so the unset-flag case still lands on chatAttemptTimeout
+	if !timeoutSet && file.timeout != 0 {
+		cfg.timeout = file.timeout
 	}
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
