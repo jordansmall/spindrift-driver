@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -517,14 +518,21 @@ type chatRequest struct {
 	StreamOptions streamOptions `json:"stream_options"`
 }
 
-type chatResponse struct {
-	Model string `json:"model"`
-	// Usage is a pointer so "the server sent no usage object" stays
-	// distinguishable from "it sent zeros"; both map to zero tokens.
-	Usage   *chatUsage `json:"usage"`
+// chatChunk is one SSE data payload of a streamed chat completion. The answer
+// rides under delta rather than message, and usage may arrive on a final chunk
+// that carries no choices at all.
+type chatChunk struct {
+	Model   string `json:"model"`
 	Choices []struct {
-		Message chatMessage `json:"message"`
+		// Absent from a single-choice stream, where JSON leaves it 0 — the value
+		// that readChatStream folds in.
+		Index int `json:"index"`
+		Delta struct {
+			Content   string     `json:"content"`
+			ToolCalls []toolCall `json:"tool_calls"`
+		} `json:"delta"`
 	} `json:"choices"`
+	Usage *chatUsage `json:"usage"`
 }
 
 // chatUsage mirrors the OpenAI-shaped usage object. Fields are float64 so a
@@ -582,11 +590,115 @@ func wrapTimeout(target string, timeout time.Duration, stage string, err error) 
 	return err
 }
 
-// sendChat performs one chat completion round trip against an
-// OpenAI-compatible server and returns the assistant message alongside the
-// response model and token tally. The response's own model wins; a server
-// that omits it falls back to the configured --model, because a usage event
-// with no model id would drop the call from the per-model breakdown.
+// readFailure rewords a body-read failure the way the round trip's own deadline is
+// reworded. Only the non-deadline cause gets the read-response prefix:
+// wrapTimeout already names that leg, so wrapping first would say it twice.
+func readFailure(target string, timeout time.Duration, err error) error {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("read response: %w", err)
+	}
+	return wrapTimeout(target, timeout, " while reading the response", err)
+}
+
+// sseDoneMarker is the payload that closes a stream: it names no chunk, so
+// parsing it as one would be the same mistake as parsing a heartbeat.
+const sseDoneMarker = "[DONE]"
+
+// sseMaxLineBytes caps one scanned line. bufio's 64KB default is shorter than
+// the frame a server sends when it answers in a single chunk — a long tool
+// call's arguments included — so a healthy stream would fail as too long.
+const sseMaxLineBytes = 16 << 20
+
+// streamReadError marks a connection failure while the response body was in
+// flight, which is flakiness the retry loop owns. A stream that read cleanly but
+// carried nothing parseable is an answer, so it is deliberately not one.
+type streamReadError struct{ err error }
+
+func (e streamReadError) Error() string { return e.err.Error() }
+func (e streamReadError) Unwrap() error { return e.err }
+
+// readChatStream folds a text/event-stream chat completion into the single
+// assistant message the caller replays, using the standard library alone
+// (ADR-0001). In SSE a blank line separates events, a leading ':' is a keep-alive
+// comment, and every other line is a "field: value" pair — so only data: carries
+// a chunk and event:/id:/retry: lines are skipped rather than parsed. status is
+// the response's own status line, which the unparseable-payload wording names.
+func readChatStream(body io.Reader, status string) (chatReply, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
+	var (
+		reply   chatReply
+		content strings.Builder
+		chunks  int
+	)
+	var parseErr error
+	for scanner.Scan() {
+		field, payload, ok := strings.Cut(scanner.Text(), ":")
+		if !ok || field != "data" {
+			continue
+		}
+		// the spec allows exactly one optional space after the colon
+		payload = strings.TrimPrefix(payload, " ")
+		if payload == sseDoneMarker {
+			break
+		}
+		if payload == "" {
+			// an empty data field is an event with nothing in it, not a chunk
+			continue
+		}
+		var chunk chatChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			if parseErr == nil {
+				parseErr = fmt.Errorf("unparseable response (status %s): %w", status, err)
+			}
+			continue
+		}
+		chunks++
+		if chunk.Model != "" && reply.Model == "" {
+			reply.Model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			reply.Tokens = chunk.Usage.totals()
+		}
+		for _, choice := range chunk.Choices {
+			// Only choice 0 is an answer this Driver could have asked for: it never
+			// sends n>1 and the loop replays exactly one assistant message, so a
+			// second choice is an alternative answer, not a continuation to append.
+			if choice.Index != 0 {
+				continue
+			}
+			content.WriteString(choice.Delta.Content)
+			// a tool call delivered whole in one delta needs no reassembly
+			reply.Message.ToolCalls = append(reply.Message.ToolCalls, choice.Delta.ToolCalls...)
+		}
+	}
+	// The read leg outranks everything else: a stream that broke mid-frame leaves
+	// a partial line the scanner hands over as a final token, and reporting that
+	// as unparseable would bury the transport failure the caller has to retry.
+	if err := scanner.Err(); err != nil {
+		return chatReply{}, streamReadError{err: err}
+	}
+	if parseErr != nil {
+		return chatReply{}, parseErr
+	}
+	if chunks == 0 {
+		// the streaming analogue of the old empty-choices 200: a permanent answer,
+		// not flakiness, so it must not be retried into silence
+		return chatReply{}, errors.New("server returned a stream with no chunks")
+	}
+	// deltas carry no role, but the replayed message has to read as an assistant
+	// turn
+	reply.Message.Role = "assistant"
+	reply.Message.Content = content.String()
+	return reply, nil
+}
+
+// sendChat performs one streaming chat completion round trip against an
+// OpenAI-compatible server and returns the assistant message the chunks assemble
+// into, alongside the response model and token tally. The response's own model
+// wins; a server that omits it falls back to the configured --model, because a
+// usage event with no model id would drop the call from the per-model
+// breakdown.
 func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
@@ -619,8 +731,8 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 	var lastErr error
 	delay := chatRetryBackoff
 	// Only a 5xx or a transport failure is retried, and only inside this one
-	// request: a 4xx, an unparseable 200 and an empty-choices 200 are answers,
-	// not flakiness, so they return immediately.
+	// request: a 4xx, an unparseable chunk and an empty stream are answers, not
+	// flakiness, so they return immediately.
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
 			fmt.Fprintf(stderr, "spindrift-driver: retry %d/%d in %s (%s)\n", attempt, attempts, delay, lastErr)
@@ -645,39 +757,38 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 			lastErr = wrapTimeout(target, timeout, "", err)
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			// a server that sends headers then stops mid-body trips the same
-			// Client.Timeout, just further into the round trip. Only the
-			// non-deadline cause gets the read-response prefix: wrapTimeout
-			// already names that leg, so wrapping first would say it twice.
-			readErr := err
-			if !errors.Is(readErr, context.DeadlineExceeded) {
-				readErr = fmt.Errorf("read response: %w", readErr)
-			}
-			lastErr = wrapTimeout(target, timeout, " while reading the response", readErr)
-			continue
-		}
-		if resp.StatusCode >= http.StatusInternalServerError {
-			lastErr = fmt.Errorf("server returned %s: %s", resp.Status, boundBody(body))
-			continue
-		}
+		// Only a 200 is the event stream. An error status answers with a plain
+		// body, which the retry note and the 4xx return still need whole.
 		if resp.StatusCode != http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				lastErr = readFailure(target, timeout, err)
+				continue
+			}
+			if resp.StatusCode >= http.StatusInternalServerError {
+				lastErr = fmt.Errorf("server returned %s: %s", resp.Status, boundBody(body))
+				continue
+			}
 			return chatReply{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 		}
-		var parsed chatResponse
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			return chatReply{}, fmt.Errorf("unparseable response (status %s): %w", resp.Status, err)
+		reply, err := readChatStream(resp.Body, resp.Status)
+		resp.Body.Close()
+		if err != nil {
+			var read streamReadError
+			if errors.As(err, &read) {
+				// a stream that dies mid-body trips the same Client.Timeout as a
+				// round trip that never completes, so it reads the same to the
+				// operator and is retried the same way
+				lastErr = readFailure(target, timeout, read.err)
+				continue
+			}
+			return chatReply{}, err
 		}
-		if len(parsed.Choices) == 0 {
-			return chatReply{}, errors.New("server returned no choices")
+		if reply.Model == "" {
+			reply.Model = cfg.model
 		}
-		model := parsed.Model
-		if model == "" {
-			model = cfg.model
-		}
-		return chatReply{Message: parsed.Choices[0].Message, Model: model, Tokens: parsed.Usage.totals()}, nil
+		return reply, nil
 	}
 	return chatReply{}, lastErr
 }

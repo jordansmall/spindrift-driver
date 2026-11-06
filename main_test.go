@@ -46,8 +46,7 @@ func TestRunChatRoundTrip(t *testing.T) {
 		mu.Lock()
 		gotReq, gotRaw = r, body
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -117,7 +116,7 @@ func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
 	pinSteppingClock(t, 1700000000000, 1000)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -182,7 +181,7 @@ func TestRunSubMillisecondAnswerStillStatesDurationFields(t *testing.T) {
 	pinClock(t, 1700000000000)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -297,7 +296,7 @@ func TestRunEmitsExactlyOneUsageEventPerModelCall(t *testing.T) {
 // the quiet ones would understate every run.
 func TestRunUsageEventCarriesZeroTokensWhenServerReportsNone(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"no usage here"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"no usage here"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -346,8 +345,7 @@ func TestRunSendsNoAuthorizationWithoutAPIKey(t *testing.T) {
 		mu.Lock()
 		gotReq = r
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -378,8 +376,7 @@ func TestRunSendsAuthorizationBearerWithAPIKey(t *testing.T) {
 		mu.Lock()
 		gotReq = r
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -411,17 +408,146 @@ func TestRunSendsAuthorizationBearerWithAPIKey(t *testing.T) {
 	}
 }
 
+// sseFrame wraps one payload in the data: frame a chat completion chunk travels
+// in.
+func sseFrame(payload string) string { return "data: " + payload + "\n\n" }
+
+// sseDone is the marker a streaming endpoint closes with. It ends the stream and
+// is not itself a chunk.
+const sseDone = "data: [DONE]\n\n"
+
+// sseStream assembles raw chunk payloads into one SSE body, each in its own
+// frame and closed with the done marker.
+func sseStream(chunks ...string) string {
+	var b strings.Builder
+	for _, chunk := range chunks {
+		b.WriteString(sseFrame(chunk))
+	}
+	return b.String() + sseDone
+}
+
+// writeSSE answers with SSE frames the way a streaming endpoint does: event
+// stream content type, then a flush, so the client sees the body without
+// waiting for the handler to return.
+func writeSSE(w http.ResponseWriter, frames string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	io.WriteString(w, frames)
+	w.(http.Flusher).Flush()
+}
+
+// sseChunk mirrors a streamed chunk: the answer under delta rather than message,
+// and usage carried on its own final chunk.
+type sseChunk struct {
+	Model   string          `json:"model,omitempty"`
+	Choices []sseChoice     `json:"choices,omitempty"`
+	Usage   json.RawMessage `json:"usage,omitempty"`
+}
+
+type sseChoice struct {
+	Index        int         `json:"index"`
+	Delta        chatMessage `json:"delta"`
+	FinishReason *string     `json:"finish_reason,omitempty"`
+}
+
+// sseChatCompletion rewrites one non-streaming completion body into the frames a
+// streaming endpoint sends for the same answer: a chunk carrying the message as
+// its delta (plus the model), a usage chunk when the body had a usage object,
+// then the done marker.
+func sseChatCompletion(whole string) string {
+	var body struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message      chatMessage `json:"message"`
+			FinishReason *string     `json:"finish_reason"`
+		} `json:"choices"`
+		Usage json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(whole), &body); err != nil {
+		// Not a completion body at all — the unparseable-response cases. It still
+		// has to reach the client as one data payload, so it goes out verbatim
+		// (newlines flattened, or the frame would not be one line).
+		return sseFrame(strings.ReplaceAll(whole, "\n", " ")) + sseDone
+	}
+	var b strings.Builder
+	for i, choice := range body.Choices {
+		b.WriteString(sseChunkFrame(sseChunk{Model: body.Model, Choices: []sseChoice{{Index: i, Delta: choice.Message, FinishReason: choice.FinishReason}}}))
+	}
+	if len(body.Usage) > 0 {
+		b.WriteString(sseChunkFrame(sseChunk{Model: body.Model, Usage: body.Usage}))
+	}
+	b.WriteString(sseDone)
+	return b.String()
+}
+
+func sseChunkFrame(chunk sseChunk) string {
+	encoded, err := json.Marshal(chunk)
+	if err != nil {
+		// unreachable: every field was decoded out of a valid JSON document
+		panic("sse frame: " + err.Error())
+	}
+	return sseFrame(string(encoded))
+}
+
 // scriptedChatServer returns the i-th scripted JSON response for the i-th
 // POST and records every request body for later inspection.
 type scriptedChatServer struct {
 	mu        sync.Mutex
 	responses []string
+	// frame turns a scripted entry into the response body. The completion fake
+	// rewrites whole JSON bodies; the raw-chunk fake pre-frames them itself and
+	// leaves this nil.
+	frame     func(string) string
 	rawBodies [][]byte
 	srv       *httptest.Server
 }
 
 func newScriptedChatServer(t *testing.T, responses ...string) *scriptedChatServer {
-	s := &scriptedChatServer{responses: responses}
+	s := &scriptedChatServer{responses: responses, frame: sseChatCompletion}
+	return s.serve(t)
+}
+
+// newScriptedSSEServer scripts one raw SSE stream per POST: every entry of the
+// i-th list goes out as its own data: frame, so a test owns the chunk
+// boundaries — split answers, split tool-call arguments, a lone usage chunk.
+func newScriptedSSEServer(t *testing.T, streams ...[]string) *scriptedChatServer {
+	bodies := make([]string, len(streams))
+	for i, chunks := range streams {
+		bodies[i] = sseStream(chunks...)
+	}
+	return newScriptedSSERawServer(t, bodies...)
+}
+
+// newScriptedSSERawServer scripts one SSE response body per POST, verbatim, for
+// the streams a chunk list cannot express: keep-alive comments, event: lines, a
+// frame left unterminated.
+func newScriptedSSERawServer(t *testing.T, bodies ...string) *scriptedChatServer {
+	return (&scriptedChatServer{responses: bodies}).serve(t)
+}
+
+// SSE carries more than chunks: a ':' line is a keep-alive comment, an event:
+// line names the frame that follows, and the done marker closes the stream. None
+// of them is a delta, so the answer stays exactly what the data frames said.
+func TestRunStreamIgnoresHeartbeatsEventLinesAndDoneMarker(t *testing.T) {
+	srv := newScriptedSSERawServer(t, ": keep-alive\n\n"+
+		"event: message\n\n"+
+		sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"only this"}}]}`)+
+		sseDone+
+		sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":" after the marker"}}]}`))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if got := resultText(t, stdout.String()); got != "only this" {
+		t.Errorf("result text = %q, want only the chunk before the done marker", got)
+	}
+	if n := strings.Count(stderr.String(), "POST "); n != 1 {
+		t.Errorf("stderr carries %d POST line(s), want the one progress line: %q", n, stderr.String())
+	}
+}
+
+func (s *scriptedChatServer) serve(t *testing.T) *scriptedChatServer {
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
@@ -432,16 +558,106 @@ func newScriptedChatServer(t *testing.T, responses ...string) *scriptedChatServe
 		if !exhausted {
 			resp = s.responses[n]
 		}
+		if s.frame != nil {
+			resp = s.frame(resp)
+		}
 		s.mu.Unlock()
 		if exhausted {
 			http.Error(w, "no scripted response left", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, resp)
+		writeSSE(w, resp)
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
+}
+
+// A streamed answer is still exactly one text event and exactly one usage event:
+// the Driver assembles the chunks below the sendChat seam and emits nothing per
+// frame, so stdout does not grow with the number of chunks the server used.
+func TestRunStreamedChunksAssembleOneTextAndOneUsageEvent(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"hello "}}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	var textEvents, usageEvents []map[string]any
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		switch ev["kind"] {
+		case "text":
+			textEvents = append(textEvents, ev)
+		case "usage":
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(textEvents) != 1 {
+		t.Fatalf("stdout carries %d text event(s), want the chunks joined into one: %q", len(textEvents), stdout.String())
+	}
+	if textEvents[0]["text"] != "hello world" {
+		t.Errorf("text event = %v, want both chunks concatenated in order", textEvents[0]["text"])
+	}
+	if len(usageEvents) != 1 {
+		t.Fatalf("stdout carries %d usage event(s), want one for the call: %q", len(usageEvents), stdout.String())
+	}
+	tokens, _ := usageEvents[0]["tokens"].(map[string]any)
+	if tokens["input"] != float64(12) || tokens["output"] != float64(3) {
+		t.Errorf("usage tokens = %v, want the usage chunk's tally input 12 output 3", tokens)
+	}
+	if got := resultText(t, stdout.String()); got != "hello world" {
+		t.Errorf("result text = %q, want the assembled answer", got)
+	}
+}
+
+// A second choice on a stream is an alternative completion, not a continuation
+// of the first: this Driver never asks for n>1, and the agent loop replays
+// exactly one assistant message. Deltas beyond index 0 are dropped rather than
+// spliced into the one text event, while a delta naming no index at all still
+// belongs to choice 0.
+func TestRunStreamIgnoresDeltasBeyondTheFirstChoice(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"hello "}}]}`,
+			`{"model":"m-a","choices":[{"index":1,"delta":{"content":"ALTERNATIVE"}}]}`,
+			`{"model":"m-a","choices":[{"delta":{"content":"again "}}]}`,
+			`{"model":"m-a","choices":[{"index":1,"delta":{"content":" ATIVE"},"finish_reason":"stop"}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	var textEvents []map[string]any
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] == "text" {
+			textEvents = append(textEvents, ev)
+		}
+	}
+	if len(textEvents) != 1 {
+		t.Fatalf("stdout carries %d text event(s), want choice 0 only: %q", len(textEvents), stdout.String())
+	}
+	if textEvents[0]["text"] != "hello again world" {
+		t.Errorf("text event = %v, want choice 0's deltas with the index-less delta folded in", textEvents[0]["text"])
+	}
+	if got := resultText(t, stdout.String()); got != "hello again world" {
+		t.Errorf("result text = %q, want choice 0's answer alone", got)
+	}
+	if strings.Contains(stdout.String(), "ALTERNATIVE") {
+		t.Errorf("stdout carries an alternative choice's prose: %q", stdout.String())
+	}
 }
 
 type recordedMessage struct {
@@ -504,8 +720,7 @@ func newStatusSequenceServer(t *testing.T, final string, statuses ...int) *statu
 			http.Error(w, "scripted failure", code)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`))
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
@@ -1169,8 +1384,7 @@ func newDroppedConnServer(t *testing.T, final string) *droppedConnServer {
 			conn.Close()
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`))
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
@@ -1368,8 +1582,8 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 		wantStderr string
 	}{
 		{"4xx", http.StatusBadRequest, "bad request", "server returned 400"},
-		{"unparseable 200", http.StatusOK, "this is not json", "unparseable"},
-		{"empty choices", http.StatusOK, `{"choices":[]}`, "choices"},
+		{"unparseable chunk", http.StatusOK, sseFrame("this is not json") + sseDone, "unparseable"},
+		{"empty stream", http.StatusOK, sseDone, "stream"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1380,7 +1594,12 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 				mu.Lock()
 				posts++
 				mu.Unlock()
-				w.Header().Set("Content-Type", "application/json")
+				// only a 200 is the event stream; a rejection body stays plain
+				if tc.status == http.StatusOK {
+					w.Header().Set("Content-Type", "text/event-stream")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+				}
 				w.WriteHeader(tc.status)
 				io.WriteString(w, tc.body)
 			}))
@@ -1462,8 +1681,7 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -1500,11 +1718,12 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 	const stall = 2 * time.Second
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		// headers plus a prefix of the body reach the client, then the stream
-		// stops: the read, not the round trip, is what has to expire
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"`)
+		// headers plus the start of one frame reach the client, then the stream
+		// stops: the read, not the round trip, is what has to expire. The frame is
+		// left unterminated so no chunk can be assembled out of it.
+		io.WriteString(w, `data: {"choices":[{"index":0,"delta":{"content":"`)
 		w.(http.Flusher).Flush()
 		select {
 		case <-time.After(stall):
@@ -1595,8 +1814,7 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -1628,8 +1846,7 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -1743,20 +1960,23 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 
 func TestRunEmptyResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"choices":[]}`)
+		// the streaming analogue of the old {"choices":[]}: a stream that closes
+		// without ever carrying a chunk
+		writeSSE(w, sseDone)
 	}))
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--model", "m", "--base-url", srv.URL, "p"}, nil, &stdout, &stderr, func(string) (string, bool) { return "", false })
 	if code == 0 {
-		t.Fatal("empty choices should exit non-zero")
+		t.Fatal("a stream with no chunks should exit non-zero")
 	}
-	if got := oneErrorEvent(t, stdout.String()); got != "server returned no choices" {
-		t.Errorf("error event text = %q, want %q", got, "server returned no choices")
+	const wantErr = "server returned a stream with no chunks"
+	if got := oneErrorEvent(t, stdout.String()); got != wantErr {
+		t.Errorf("error event text = %q, want %q", got, wantErr)
 	}
-	if !strings.Contains(stderr.String(), "choices") {
-		t.Errorf("stderr = %q, want a message about the empty response", stderr.String())
+	if !strings.Contains(stderr.String(), "stream") {
+		t.Errorf("stderr = %q, want a message about the empty stream", stderr.String())
 	}
 }
 
@@ -2117,7 +2337,7 @@ func (failingReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
 // only newline stdout still guarantees belongs to each event line.
 func TestRunResponseEndingInNewline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ends with newline\n"}}]}`)
+		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ends with newline\n"}}]}`))
 	}))
 	defer srv.Close()
 
