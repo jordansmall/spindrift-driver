@@ -38,6 +38,130 @@ func writeDriverConfig(t *testing.T, contents string) string {
 	return path
 }
 
+func TestDriverConfigPath(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lookupEnv func(string) (string, bool)
+		wantPath  string
+		wantFound bool
+	}{
+		{
+			name:      "no env at all",
+			lookupEnv: func(string) (string, bool) { return "", false },
+			wantPath:  "",
+			wantFound: false,
+		},
+		{
+			// The default path is spelled out instead of built from
+			// defaultDriverConfigPath, so renaming the default fails here.
+			name: "HOME only",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "HOME" {
+					return "/home/dev", true
+				}
+				return "", false
+			},
+			wantPath:  filepath.Join("/home/dev", ".config/spindrift-driver/config.json"),
+			wantFound: false,
+		},
+		{
+			name: "override without HOME",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "SPINDRIFT_CONFIG" {
+					return "chosen.json", true
+				}
+				return "", false
+			},
+			wantPath:  "chosen.json",
+			wantFound: true,
+		},
+		{
+			name: "override beats HOME",
+			lookupEnv: func(name string) (string, bool) {
+				switch name {
+				case "SPINDRIFT_CONFIG":
+					return "/etc/spindrift/config.json", true
+				case "HOME":
+					return "/home/dev", true
+				}
+				return "", false
+			},
+			wantPath:  "/etc/spindrift/config.json",
+			wantFound: true,
+		},
+		{
+			name: "set-but-empty override reads as unset",
+			lookupEnv: func(name string) (string, bool) {
+				switch name {
+				case "SPINDRIFT_CONFIG":
+					return "", true
+				case "HOME":
+					return "/home/dev", true
+				}
+				return "", false
+			},
+			wantPath:  filepath.Join("/home/dev", ".config/spindrift-driver/config.json"),
+			wantFound: false,
+		},
+		{
+			name: "set-but-empty HOME is no default file",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "HOME" {
+					return "", true
+				}
+				return "", false
+			},
+			wantPath:  "",
+			wantFound: false,
+		},
+		{
+			// Neither segment nor tilde is touched: the operator's string is the
+			// path, so a mistake in it stays visible in the error message.
+			name: "absolute override is verbatim",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "SPINDRIFT_CONFIG" {
+					return "/opt/spindrift/./cfg.json", true
+				}
+				return "", false
+			},
+			wantPath:  "/opt/spindrift/./cfg.json",
+			wantFound: true,
+		},
+		{
+			name: "relative override is verbatim",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "SPINDRIFT_CONFIG" {
+					return "./cfg.json", true
+				}
+				return "", false
+			},
+			wantPath:  "./cfg.json",
+			wantFound: true,
+		},
+		{
+			name: "tilde in override is not expanded",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "SPINDRIFT_CONFIG" {
+					return "~/cfg.json", true
+				}
+				return "", false
+			},
+			wantPath:  "~/cfg.json",
+			wantFound: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, explicit := driverConfigPath(tc.lookupEnv)
+			if path != tc.wantPath {
+				t.Errorf("path = %q, want %q", path, tc.wantPath)
+			}
+			if explicit != tc.wantFound {
+				t.Errorf("explicit = %v, want %v", explicit, tc.wantFound)
+			}
+		})
+	}
+}
+
 func TestLoadDriverConfigWellFormed(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url":"http://model.test:9/v1","api_key":"sk-test","timeout":"90s"}`)
 
@@ -242,4 +366,62 @@ func TestLoadDriverConfigPrettyPrinted(t *testing.T) {
 	if cfg.baseURL != "http://model.test/v1" || cfg.timeout != 45*time.Second {
 		t.Errorf("cfg = %+v, want the values the file carries", cfg)
 	}
+}
+
+// TestDriverConfigPathDefaultFileFeedsTheLoader: the resolved default is not
+// decoration, and its absence is a loader result rather than a resolution
+// error — which is what lets the caller treat a missing default file as
+// nothing at all and a named one as fatal.
+func TestDriverConfigPathDefaultFileFeedsTheLoader(t *testing.T) {
+	homeLookup := func(home string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			if name == "HOME" {
+				return home, true
+			}
+			return "", false
+		}
+	}
+
+	t.Run("default file is read", func(t *testing.T) {
+		home := t.TempDir()
+		path := filepath.Join(home, ".config", "spindrift-driver", "config.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir default config dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`{"base_url":"http://from-file:1/v1"}`), 0o600); err != nil {
+			t.Fatalf("write default config: %v", err)
+		}
+
+		got, explicit := driverConfigPath(homeLookup(home))
+		if explicit {
+			t.Errorf("explicit = true, want false for the default path")
+		}
+		cfg, err := loadDriverConfig(got)
+		if err != nil {
+			t.Fatalf("loadDriverConfig(%q) error = %v, want nil", got, err)
+		}
+		if cfg.baseURL != "http://from-file:1/v1" {
+			t.Errorf("baseURL = %q, want %q", cfg.baseURL, "http://from-file:1/v1")
+		}
+	})
+
+	t.Run("default file absent is the loader's complaint only", func(t *testing.T) {
+		home := t.TempDir()
+
+		got, explicit := driverConfigPath(homeLookup(home))
+		if explicit {
+			t.Errorf("explicit = true, want false for the default path")
+		}
+		if want := filepath.Join(home, ".config", "spindrift-driver", "config.json"); got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		cfg, err := loadDriverConfig(got)
+		assertErrMessage(t, err, got, "file not found")
+		if !errors.Is(err, errNoDriverConfig) {
+			t.Errorf("errors.Is(err, errNoDriverConfig) = false, want true; err = %v", err)
+		}
+		if cfg != (driverConfig{}) {
+			t.Errorf("cfg = %+v, want zero value on error", cfg)
+		}
+	})
 }
