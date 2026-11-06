@@ -295,3 +295,109 @@ func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
 		t.Error("README does not state that the golden Pass log test fails on drift")
 	}
 }
+
+// markdownSectionBody returns the normalized body under a "Heading" line of the
+// raw markdown, up to the next heading line — the existing helper anchors on a
+// phrase inside a section, which cannot prove a section of its own exists.
+// Headings are read at line start over the raw file and fenced blocks are
+// skipped: normalization alone cannot tell a heading from the "# " that opens a
+// shell comment, and clipping there silently drops every claim after it.
+func markdownSectionBody(raw, heading string) string {
+	var body []string
+	inSection, inFence := false, false
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && strings.HasPrefix(trimmed, "#") {
+			if inSection {
+				break
+			}
+			if strings.EqualFold(strings.TrimLeft(trimmed, "# "), heading) {
+				inSection = true
+			}
+			continue
+		}
+		if inSection {
+			body = append(body, trimmed)
+		}
+	}
+	if !inSection {
+		return ""
+	}
+	return collapseMarkdown(strings.Join(body, " "))
+}
+
+// The helper the Driver Config claims are pinned with has to bound the section by
+// real headings only: "# " is also what a fenced shell example starts a comment
+// with, and a body clipped there loses every later claim while still looking like
+// a section that was checked.
+func TestMarkdownSectionBodyBoundsOnHeadingLines(t *testing.T) {
+	raw := "# Title\n\n## Widget\n\nalpha\n\n```\n# a comment inside an example\n```\n\nomega\n\n## Other\n\nbeta\n"
+
+	sec := markdownSectionBody(raw, "widget")
+	if !strings.Contains(sec, "omega") {
+		t.Errorf("section body stopped at the commented line inside the fence:\n%q", sec)
+	}
+	if strings.Contains(sec, "beta") {
+		t.Errorf("section body ran past the next heading:\n%q", sec)
+	}
+}
+
+// TestReadmeDocumentsDriverConfig pins the operator-facing half of the Driver
+// Config: which file gets read, what may appear in it, which of the three places
+// a setting can live wins, and what happens to a file with a typo in it. A reader
+// who aims a Box at the wrong endpoint because a field name was misread has no
+// signal on stdout to tell them, so the rules have to be on the page first.
+func TestReadmeDocumentsDriverConfig(t *testing.T) {
+	const file = "README.md"
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+
+	sec := markdownSectionBody(string(raw), "driver config")
+	if sec == "" {
+		t.Fatal("README.md has no ## Driver Config section")
+	}
+	for _, want := range []string{"spindrift_config", ".config/spindrift-driver/config.json", "base_url", "api_key", "timeout"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Driver Config section does not name %s", want)
+		}
+	}
+	// One ladder for every field, stated in the order it is applied and inside
+	// the sentence that states it — elsewhere in the file these words appear in
+	// another order, and a section-wide scan would pass by accident.
+	if !satisfiesOrder(sec, "precedence", "flag", "environment", "driver config", "default") {
+		t.Error("the Driver Config section has no one-sentence statement of precedence in order: flag, then environment, then Driver Config, then built-in default")
+	}
+	// The one lenient case, so an operator does not hunt for a file that was
+	// never meant to exist.
+	if !near(sec, "absent", "not an error", 240) {
+		t.Error("the Driver Config section does not say an absent default file is not an error")
+	}
+	for _, want := range []string{"malformed", "unknown field", "wrong type", "exit 2"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Driver Config section does not make %s a startup error that exits 2 naming the file and the problem", want)
+		}
+	}
+	// Where the key may and may not travel.
+	if !near(sec, "api key", "process listing", 240) {
+		t.Error("the Driver Config section does not say the api key never appears in a process listing")
+	}
+	if strings.Contains(sec, "--api-key") {
+		t.Error("the Driver Config section documents an --api-key flag; the key is env-or-file only by design")
+	}
+	// The repository under repair gets no vote.
+	if !near(sec, "working directory", "target repo", 240) {
+		t.Error("the Driver Config section does not say nothing is read from the working directory or the Target repo")
+	}
+	// Why the file exists at all, and the record of that decision.
+	for _, want := range []string{"envfiles", "adr/0005"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Driver Config section does not tie the file to %s", want)
+		}
+	}
+}
