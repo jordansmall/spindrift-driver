@@ -43,10 +43,11 @@ func stdoutEvents(t *testing.T, raw string) []map[string]any {
 	return events
 }
 
-// oneErrorEvent asserts a non-zero exit wrote exactly one stdout line, an error
-// event whose text is non-empty, and no result event alongside it — a failed
-// run must never also report success. It returns the event's text so the
-// caller can compare it against the raw error.
+// oneErrorEvent asserts a non-zero exit closed its stdout stream with an error
+// event whose text is non-empty and never reported success: a failed run must
+// not also carry a result event. Events emitted before the failing call — the
+// start of the Model call that failed — are allowed ahead of it. It returns the
+// error event's text so the caller can compare it against the raw error.
 func oneErrorEvent(t *testing.T, raw string) string {
 	t.Helper()
 	events := stdoutEvents(t, raw)
@@ -55,15 +56,53 @@ func oneErrorEvent(t *testing.T, raw string) string {
 			t.Fatalf("stdout carries a result event on a non-zero exit: %q", raw)
 		}
 	}
-	if len(events) != 1 {
-		t.Fatalf("stdout carries %d event(s), want exactly 1 error event: %q", len(events), raw)
+	if len(events) == 0 {
+		t.Fatalf("stdout is empty, want a final error event: %q", raw)
 	}
-	if got := events[0]["kind"]; got != "error" {
-		t.Fatalf("kind = %v, want %q: %q", got, "error", raw)
+	last := events[len(events)-1]
+	if got := last["kind"]; got != "error" {
+		t.Fatalf("last event kind = %v, want %q: %q", got, "error", raw)
 	}
-	text, ok := events[0]["text"].(string)
+	text, ok := last["text"].(string)
 	if !ok || text == "" {
-		t.Fatalf("error event text = %v, want the non-empty raw error text: %q", events[0]["text"], raw)
+		t.Fatalf("error event text = %v, want the non-empty raw error text: %q", last["text"], raw)
+	}
+	return text
+}
+
+// resultEvent returns the run's result event, failing unless stdout carries
+// exactly one and it is the last line — the final answer is reported once.
+func resultEvent(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	events := stdoutEvents(t, raw)
+	var found map[string]any
+	for _, ev := range events {
+		if ev["kind"] == "result" {
+			if found != nil {
+				t.Fatalf("stdout carries more than one result event: %q", raw)
+			}
+			found = ev
+		}
+	}
+	if found == nil {
+		t.Fatalf("stdout carries no result event: %q", raw)
+	}
+	if events[len(events)-1]["kind"] != "result" {
+		t.Fatalf("result event is not the last stdout line: %q", raw)
+	}
+	return found
+}
+
+// resultText asserts the run reported its answer in one result event and
+// returns that event's text — the migrated form of the old exact-answer stdout
+// pins, which compared raw stdout and therefore could not tell the answer
+// apart from the newline the Driver used to append.
+func resultText(t *testing.T, raw string) string {
+	t.Helper()
+	ev := resultEvent(t, raw)
+	text, ok := ev["text"].(string)
+	if !ok {
+		t.Fatalf("result event text = %v, want a string: %q", ev["text"], raw)
 	}
 	return text
 }
@@ -74,6 +113,21 @@ func pinClock(t *testing.T, ms int64) {
 	real := nowMS
 	t.Cleanup(func() { nowMS = real })
 	nowMS = func() int64 { return ms }
+}
+
+// pinSteppingClock fixes the event clock to one that advances step milliseconds
+// on every read. A frozen clock cannot yield a duration, and the result event's
+// duration fields are only pinable when the clock moves — while still staying
+// deterministic enough for a golden log later.
+func pinSteppingClock(t *testing.T, start, step int64) {
+	t.Helper()
+	real := nowMS
+	t.Cleanup(func() { nowMS = real })
+	nowMS = func() int64 {
+		v := start
+		start += step
+		return v
+	}
 }
 
 func TestEventEmitterStampsInjectedClock(t *testing.T) {

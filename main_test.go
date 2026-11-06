@@ -91,8 +91,8 @@ func TestRunChatRoundTrip(t *testing.T) {
 		t.Errorf("user message = %+v, want prompt %q", reqBody.Messages[1], "fix the flaky test")
 	}
 
-	if stdout.String() != "here is the fix\n" {
-		t.Errorf("stdout = %q, want exactly the response text", stdout.String())
+	if got := resultText(t, stdout.String()); got != "here is the fix" {
+		t.Errorf("result event text = %q, want exactly the response text with no added newline", got)
 	}
 	stderrLines := strings.Count(strings.TrimSuffix(stderr.String(), "\n"), "\n") + 1
 	if stderrLines != 1 {
@@ -100,6 +100,233 @@ func TestRunChatRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "/chat/completions") {
 		t.Errorf("stderr = %q, want a progress line naming the request target", stderr.String())
+	}
+}
+
+// The whole shape of a single-Model-call run on the answer path: exactly four
+// JSONL lines in contract order sharing one message id, closed by a result that
+// reports the run's totals. A usage reader sums every usage event it sees, so a
+// duplicated or missing line here breaks the run totals a reader computes.
+func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
+	pinSteppingClock(t, 1700000000000, 1000)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"fix the flaky test", "--model", "gpt-4o-mini", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	if len(events) != 4 {
+		t.Fatalf("stdout carries %d event(s), want exactly 4: %q", len(events), stdout.String())
+	}
+	for i, want := range []string{"start", "text", "usage", "result"} {
+		if got := events[i]["kind"]; got != want {
+			t.Fatalf("event %d kind = %v, want %q: %q", i+1, got, want, stdout.String())
+		}
+	}
+	// start names the call before the first byte is read, so the Driver assigns
+	// the id itself and text and usage have to carry the same one.
+	if got := events[0]["message_id"]; got != "msg-1" {
+		t.Errorf("start message_id = %v, want %q", got, "msg-1")
+	}
+	for _, ev := range events[1:3] {
+		if ev["message_id"] != events[0]["message_id"] {
+			t.Errorf("%v event message_id = %v, want the call's %v", ev["kind"], ev["message_id"], events[0]["message_id"])
+		}
+	}
+	for _, name := range []string{"text", "model", "tokens", "num_turns"} {
+		if _, ok := events[0][name]; ok {
+			t.Errorf("start event carries %q, which a start does not fill: %v", name, events[0])
+		}
+	}
+	if events[1]["text"] != "here is the fix" {
+		t.Errorf("text event text = %v, want the assistant content verbatim", events[1]["text"])
+	}
+	result := events[3]
+	if result["text"] != "here is the fix" {
+		t.Errorf("result text = %v, want the answer verbatim", result["text"])
+	}
+	if turns, _ := result["num_turns"].(float64); int(turns) != 1 {
+		t.Errorf("result num_turns = %v, want 1", result["num_turns"])
+	}
+	if dur, _ := result["duration_ms"].(float64); dur <= 0 {
+		t.Errorf("result duration_ms = %v, want a non-zero run duration", result["duration_ms"])
+	}
+	for _, ev := range events {
+		if _, ok := ev["role"]; ok {
+			t.Errorf("event %v carries role: role attribution belongs to subagents (#25)", ev)
+		}
+	}
+	if _, ok := result["model_output"]; ok {
+		t.Errorf("result event carries model_output, which stays unset: %v", result)
+	}
+}
+
+// A loopback OpenAI-compatible stub answers well inside one millisecond, so a
+// frozen clock makes every derived duration 0 — and 0 is a measurement, not an
+// absence. The result event must still state both duration fields (#19), the
+// way a usage event states its zero token fields.
+func TestRunSubMillisecondAnswerStillStatesDurationFields(t *testing.T) {
+	pinClock(t, 1700000000000)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "gpt-4o-mini", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	result := resultEvent(t, stdout.String())
+	for _, name := range []string{"duration_ms", "duration_api_ms"} {
+		v, ok := result[name]
+		if !ok {
+			t.Errorf("result event omits %q on a zero-duration run, want the key present with value 0: %v", name, result)
+			continue
+		}
+		if n, _ := v.(float64); n != 0 {
+			t.Errorf("result %s = %v, want 0 for a frozen clock", name, v)
+		}
+	}
+}
+
+// A Model that answers with no prose still owes an answer in the stream: the
+// result event states text as the empty string rather than dropping the key, so
+// a reader never mistakes "answered nothing" for "field not reported" — the
+// same rule that keeps the duration fields on the wire at 0ms.
+func TestRunEmptyFinalAnswerStatesEmptyResultText(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"model":"m-a","choices":[{"message":{"role":"assistant","content":""}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	text, ok := resultEvent(t, stdout.String())["text"]
+	if !ok {
+		t.Fatalf("result event omits %q on an empty answer, want it stated as %q: %q", "text", "", stdout.String())
+	}
+	if s, _ := text.(string); s != "" {
+		t.Errorf("result text = %v, want the empty string", text)
+	}
+}
+
+// A usage reader builds the run totals by summing every usage event, so a
+// scripted run owes exactly one per Model call — not one per attempt, not a
+// running total — and the result event carries their sum plus the models that
+// answered.
+func TestRunEmitsExactlyOneUsageEventPerModelCall(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"model":"m-a","usage":{"prompt_tokens":10,"completion_tokens":2},"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`,
+		`{"model":"m-b","usage":{"prompt_tokens":20,"completion_tokens":5},"choices":[{"message":{"role":"assistant","content":"done"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	var usageEvents []map[string]any
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] == "usage" {
+			usageEvents = append(usageEvents, ev)
+		}
+	}
+	if len(usageEvents) != 2 {
+		t.Fatalf("stdout carries %d usage event(s), want one per Model call: %q", len(usageEvents), stdout.String())
+	}
+	wantCall := []struct {
+		messageID string
+		model     string
+		input     float64
+		output    float64
+	}{
+		{"msg-1", "m-a", 10, 2},
+		{"msg-2", "m-b", 20, 5},
+	}
+	for i, want := range wantCall {
+		ev := usageEvents[i]
+		if ev["message_id"] != want.messageID {
+			t.Errorf("usage %d message_id = %v, want %q", i+1, ev["message_id"], want.messageID)
+		}
+		if ev["model"] != want.model {
+			t.Errorf("usage %d model = %v, want the responding model %q", i+1, ev["model"], want.model)
+		}
+		tokens, _ := ev["tokens"].(map[string]any)
+		if tokens["input"] != want.input || tokens["output"] != want.output {
+			t.Errorf("usage %d tokens = %v, want this call's own tally input %v output %v", i+1, tokens, want.input, want.output)
+		}
+	}
+
+	result := resultEvent(t, stdout.String())
+	if turns, _ := result["num_turns"].(float64); int(turns) != 2 {
+		t.Errorf("result num_turns = %v, want 2 Model calls", result["num_turns"])
+	}
+	resultTokens, _ := result["tokens"].(map[string]any)
+	if resultTokens == nil || resultTokens["input"] != float64(30) || resultTokens["output"] != float64(7) {
+		t.Errorf("result tokens = %v, want the calls summed (input 30, output 7)", result["tokens"])
+	}
+	models, _ := result["models"].([]any)
+	if len(models) != 2 || models[0] != "m-a" || models[1] != "m-b" {
+		t.Errorf("result models = %v, want the sorted unique ids [m-a m-b]", result["models"])
+	}
+}
+
+// A plain llama.cpp endpoint answers with no usage object at all, and no model
+// id either. The call still owes exactly one usage event stating all six token
+// fields as zero — a reader counts Model calls from usage events, so skipping
+// the quiet ones would understate every run.
+func TestRunUsageEventCarriesZeroTokensWhenServerReportsNone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"no usage here"}}]}`)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	var usage map[string]any
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] == "usage" {
+			if usage != nil {
+				t.Fatalf("stdout carries more than one usage event: %q", stdout.String())
+			}
+			usage = ev
+		}
+	}
+	if usage == nil {
+		t.Fatalf("a call whose response has no usage object emitted no usage event: %q", stdout.String())
+	}
+	if usage["model"] != "m" {
+		t.Errorf("usage model = %v, want the configured --model as fallback", usage["model"])
+	}
+	tokens, ok := usage["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage tokens = %#v, want a JSON object of zeros", usage["tokens"])
+	}
+	if len(tokens) != 6 {
+		t.Fatalf("usage tokens states %d field(s) (%v), want all six", len(tokens), tokens)
+	}
+	for _, name := range []string{"input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "cost_usd"} {
+		if v, ok := tokens[name].(float64); !ok || v != 0 {
+			t.Errorf("usage tokens[%s] = %v (present=%v), want a stated zero", name, tokens[name], ok)
+		}
 	}
 }
 
@@ -308,8 +535,8 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "all done\n" {
-		t.Errorf("stdout = %q, want final answer with trailing newline", stdout.String())
+	if got := resultText(t, stdout.String()); got != "all done" {
+		t.Errorf("result event text = %q, want the final answer with no added newline", got)
 	}
 
 	bodies := srv.requestBodies(t)
@@ -370,8 +597,8 @@ func TestRunFailingToolCommandIsOrdinaryResult(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (failing command must not crash); stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "gave up gracefully\n" {
-		t.Errorf("stdout = %q, want the final answer", stdout.String())
+	if got := resultText(t, stdout.String()); got != "gave up gracefully" {
+		t.Errorf("result event text = %q, want the final answer", got)
 	}
 	msgs := srv.messageBodies(t)
 	if len(msgs) != 2 {
@@ -405,8 +632,8 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (truncation must not crash the loop); stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "truncation acknowledged\n" {
-		t.Errorf("stdout = %q, want the final answer after the flooded turn", stdout.String())
+	if got := resultText(t, stdout.String()); got != "truncation acknowledged" {
+		t.Errorf("result event text = %q, want the final answer after the flooded turn", got)
 	}
 	msgs := srv.messageBodies(t)
 	if len(msgs) != 2 {
@@ -449,8 +676,8 @@ func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (timeout must not crash the loop); stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "recovered from timeout\n" {
-		t.Errorf("stdout = %q, want the final answer after the timed-out turn", stdout.String())
+	if got := resultText(t, stdout.String()); got != "recovered from timeout" {
+		t.Errorf("result event text = %q, want the final answer after the timed-out turn", got)
 	}
 	msgs := srv.messageBodies(t)
 	if len(msgs) != 2 {
@@ -518,8 +745,8 @@ func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 after the transient 5xxs; stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "recovered after retries\n" {
-		t.Errorf("stdout = %q, want exactly the final answer", stdout.String())
+	if got := resultText(t, stdout.String()); got != "recovered after retries" {
+		t.Errorf("result event text = %q, want exactly the final answer", got)
 	}
 	if n := srv.postCount(); n != 3 {
 		t.Errorf("POSTs = %d, want 3 (two retried 500s plus the success)", n)
@@ -579,7 +806,7 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 	if code == 0 {
 		t.Errorf("exit code = 0, want non-zero when every attempt 500s")
 	}
-	// The body does reach stdout now, but only as the text of the one error
+	// The body does reach stdout now, but only as the text of the closing error
 	// event: oneErrorEvent fails unless every stdout line is a JSON object, so a
 	// forged second line here would be caught.
 	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "server returned 500") {
@@ -670,8 +897,8 @@ func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 after the dropped connection; stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "recovered after dropped conn\n" {
-		t.Errorf("stdout = %q, want exactly the final answer", stdout.String())
+	if got := resultText(t, stdout.String()); got != "recovered after dropped conn" {
+		t.Errorf("result event text = %q, want exactly the final answer", got)
 	}
 	// One POST per attempt: the dropped request never reached a response, and
 	// Go's own transparent rewind-retry only applies to reused connections.
@@ -1540,6 +1767,10 @@ type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
+// The old rule "stdout ends in exactly one trailing newline" died with text
+// mode: the answer travels verbatim inside the result event, so a server
+// content that already ends in one keeps exactly one and gains nothing, and the
+// only newline stdout still guarantees belongs to each event line.
 func TestRunResponseEndingInNewline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ends with newline\n"}}]}`)
@@ -1551,8 +1782,14 @@ func TestRunResponseEndingInNewline(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "ends with newline\n" {
-		t.Errorf("stdout = %q, want single trailing newline (no doubling)", stdout.String())
+	if got := resultText(t, stdout.String()); got != "ends with newline\n" {
+		t.Errorf("result event text = %q, want the server content verbatim: one trailing newline, never doubled or appended", got)
+	}
+	// stdout itself still ends in exactly one newline per event line, so the
+	// answer's own newline cannot leak a blank line into the stream.
+	raw := stdout.String()
+	if n := strings.Count(raw, "\n"); n != len(stdoutEvents(t, raw)) {
+		t.Errorf("stdout has %d newline(s) for %d event line(s), want one per line: %q", n, len(stdoutEvents(t, raw)), raw)
 	}
 }
 
