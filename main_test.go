@@ -519,10 +519,19 @@ func newScriptedSSEServer(t *testing.T, streams ...[]string) *scriptedChatServer
 
 // newScriptedSSERawServer scripts one SSE response body per POST, verbatim, for
 // the streams a chunk list cannot express: keep-alive comments, event: lines, a
-// frame left unterminated.
+// frame left unterminated, and the stalls sseStall describes.
 func newScriptedSSERawServer(t *testing.T, bodies ...string) *scriptedChatServer {
 	return (&scriptedChatServer{responses: bodies}).serve(t)
 }
+
+// sseStallPrefix marks a scripted response that never finishes.
+const sseStallPrefix = "\x00stall:"
+
+// sseStall scripts a stalled endpoint: everything given as frames reaches the
+// client and is flushed, then the stream says nothing more until the client
+// hangs up. sseStall("") is the stall before the first byte — not even a status
+// line is written, so the round trip itself must expire.
+func sseStall(frames string) string { return sseStallPrefix + frames }
 
 // SSE carries more than chunks: a ':' line is a keep-alive comment, an event:
 // line names the frame that follows, and the done marker closes the stream. None
@@ -564,6 +573,19 @@ func (s *scriptedChatServer) serve(t *testing.T) *scriptedChatServer {
 		s.mu.Unlock()
 		if exhausted {
 			http.Error(w, "no scripted response left", http.StatusInternalServerError)
+			return
+		}
+		if frames, stalled := strings.CutPrefix(resp, sseStallPrefix); stalled {
+			// The handler lets go the moment the client does, so a stalled stream
+			// cannot wedge the deferred server close if the bound ever stops
+			// firing: only an endpoint still being waited on keeps stalling.
+			if frames != "" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				io.WriteString(w, frames)
+				w.(http.Flusher).Flush()
+			}
+			<-r.Context().Done()
 			return
 		}
 		writeSSE(w, resp)
@@ -2070,7 +2092,7 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 
 // The config value, not the package default, must bound the client: the package
 // var here is far longer than the stall, so a run that finishes early can only
-// be explained by --timeout reaching the http.Client.
+// be explained by --timeout reaching the client's transport.
 func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
 	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 30*time.Second, 2, time.Millisecond
@@ -2140,6 +2162,157 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
 		t.Errorf("error = %q, want it to name the bound %s", err, chatAttemptTimeout)
+	}
+}
+
+// --timeout bounds the silence between bytes, not the length of the answer:
+// a server that trickles one chunk every 10ms for 400ms is a healthy stream
+// under a 50ms bound, because every gap stays under it. A whole-attempt cap
+// cannot tell the two apart and kills the run at 50ms.
+func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 1, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	const chunks, gap = 40, 10 * time.Millisecond
+	var want strings.Builder
+	stream := make([]string, 0, chunks+1)
+	for i := 0; i < chunks; i++ {
+		fmt.Fprintf(&want, "%d ", i)
+		stream = append(stream, fmt.Sprintf(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"%d "}}]}`, i))
+	}
+	stream = append(stream, `{"model":"m-a","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":4}}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, chunk := range stream {
+			// one flush per chunk, so the client watches a live stream rather
+			// than receiving one write when the handler returns
+			io.WriteString(w, sseFrame(chunk))
+			w.(http.Flusher).Flush()
+			select {
+			case <-time.After(gap):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		io.WriteString(w, sseDone)
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed < time.Duration(chunks)*gap {
+		t.Fatalf("run finished in %s, before the scripted stream could even finish trickling (%s): %q", elapsed, time.Duration(chunks)*gap, stderr.String())
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: a stream that keeps sending bytes has not idled; elapsed = %s stderr = %q", code, elapsed, stderr.String())
+	}
+	if got := resultText(t, stdout.String()); got != want.String() {
+		t.Errorf("result text = %q, want every chunk joined in order %q", got, want.String())
+	}
+	usageEvents := 0
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] != "usage" {
+			continue
+		}
+		usageEvents++
+		tokens, _ := ev["tokens"].(map[string]any)
+		if tokens["input"] != float64(7) || tokens["output"] != float64(4) {
+			t.Errorf("usage tokens = %v, want the final usage chunk's tally input 7 output 4", tokens)
+		}
+	}
+	if usageEvents != 1 {
+		t.Errorf("stdout carries %d usage event(s), want exactly one for the call: %q", usageEvents, stdout.String())
+	}
+	// the per-attempt note only: the retry note and the terminal error line
+	// mention the endpoint too
+	if n := strings.Count(stderr.String(), "spindrift-driver: POST "+srv.URL+"/chat/completions\n"); n != 1 {
+		t.Errorf("stderr carries %d POST lines, want the one attempt (a live stream is not retried): %q", n, stderr.String())
+	}
+}
+
+// A stream that says one thing and then stops talking is stalled: the idle bound
+// fires inside the body read, so the diagnostic has to name that leg exactly
+// once, without nesting the non-deadline "read response:" wording.
+func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	// one completed chunk, then silence: the answer is half an answer and the
+	// attempt has to expire rather than wait for the rest
+	first := sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"half an answer"}}]}`)
+	srv := newScriptedSSERawServer(t, sseStall(first), sseStall(first))
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("run took %s, want each attempt bounded by the 50ms idle bound, not by the scripted stall", elapsed)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once every attempt stalls on a half answer; stderr = %q", stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "while reading the response") {
+		t.Errorf("error event text = %q, want the response-reading leg named", got)
+	}
+	target := srv.srv.URL + "/chat/completions"
+	assertTimeoutErrorLine(t, stderr.String(), target, 50*time.Millisecond)
+	if got := driverErrorLine(stderr.String(), target); !strings.Contains(got, "while reading the response") || strings.Contains(got, "read response:") {
+		t.Errorf("error line = %q, want it to name the response-reading leg once without nesting %q", got, "read response:")
+	}
+	// the stall is flakiness, so the retry budget is spent on it and only the
+	// last attempt's error reaches the operator; count the per-attempt notes,
+	// which are the only lines that are exactly "POST <target>"
+	if n := strings.Count(stderr.String(), "spindrift-driver: POST "+target+"\n"); n != 2 {
+		t.Errorf("stderr carries %d POST lines, want 2 (a stalled stream is retried): %q", n, stderr.String())
+	}
+}
+
+// The same bound covers the silence before the first byte: an endpoint that
+// accepts the POST and answers with nothing at all expires on the round trip,
+// so the wording stays the plain one that names the endpoint and the bound and
+// says nothing about a read that never started.
+func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
+	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
+	defer func() {
+		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
+	}()
+
+	srv := newScriptedSSERawServer(t, sseStall(""), sseStall(""))
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("run took %s, want each attempt bounded by the 50ms idle bound, not by the scripted stall", elapsed)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once every attempt goes unanswered; stderr = %q", stderr.String())
+	}
+	target := srv.srv.URL + "/chat/completions"
+	assertTimeoutErrorLine(t, stderr.String(), target, 50*time.Millisecond)
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "timed out") {
+		t.Errorf("error event text = %q, want the attempt timeout", got)
+	}
+	if got := driverErrorLine(stderr.String(), target); strings.Contains(got, "while reading the response") {
+		t.Errorf("error line = %q, want the round-trip wording: no byte ever arrived, so no read leg began", got)
 	}
 }
 

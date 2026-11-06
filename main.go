@@ -9,11 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -668,20 +670,87 @@ func (u *chatUsage) totals() tokenTotals {
 // identifies itself, so it is returned untouched. %w preserves errors.Is on
 // the original cause.
 func wrapTimeout(target string, timeout time.Duration, stage string, err error) error {
-	if errors.Is(err, context.DeadlineExceeded) {
+	if isDeadline(err) {
 		return fmt.Errorf("POST %s timed out after %s%s: %w", target, timeout, stage, err)
 	}
 	return err
+}
+
+// isDeadline recognises every flavour of "the clock ran out", because the bound
+// is enforced in three places and no two report alike: a context deadline, the
+// transport's own response-header timeout (a net.Error), and a read deadline the
+// net poller fired on the body, which arrives as os.ErrDeadlineExceeded with no
+// context involved. Anything else is a broken connection rather than an expiry,
+// and keeps its own wording.
+func isDeadline(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // readFailure rewords a body-read failure the way the round trip's own deadline is
 // reworded. Only the non-deadline cause gets the read-response prefix:
 // wrapTimeout already names that leg, so wrapping first would say it twice.
 func readFailure(target string, timeout time.Duration, err error) error {
-	if !errors.Is(err, context.DeadlineExceeded) {
+	if !isDeadline(err) {
 		err = fmt.Errorf("read response: %w", err)
 	}
 	return wrapTimeout(target, timeout, " while reading the response", err)
+}
+
+// errIdleExpiry stands in for whatever the transport reports once idleBody cuts
+// a stalled stream off: it claims a net-poller deadline, which is exactly the
+// kind of expiry a gap between bytes is.
+var errIdleExpiry = fmt.Errorf("no bytes received: %w", os.ErrDeadlineExceeded)
+
+// idleBody bounds the silence between bytes on a response body instead of its
+// total length: Read re-arms the timer, so a stream that keeps talking may run
+// far longer than timeout while one that falls silent is cut off after it.
+// Expiry closes the source — the only way to interrupt the blocked read without
+// owning the connection — and the error that read then returns is reported as
+// errIdleExpiry so the caller can tell a stall from a torn connection.
+type idleBody struct {
+	src     io.ReadCloser
+	timeout time.Duration
+
+	timer   *time.Timer
+	expired atomic.Bool
+}
+
+func newIdleBody(src io.ReadCloser, timeout time.Duration) *idleBody {
+	return &idleBody{src: src, timeout: timeout}
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	if b.expired.Load() {
+		return 0, errIdleExpiry
+	}
+	if b.timer == nil {
+		b.timer = time.AfterFunc(b.timeout, b.expire)
+	} else {
+		b.timer.Reset(b.timeout)
+	}
+	n, err := b.src.Read(p)
+	// Bytes that arrived before the timer fired, and an EOF that beat it, are
+	// part of the answer; only a failed read can be the stall.
+	if err != nil && !errors.Is(err, io.EOF) && b.expired.Load() {
+		return n, errIdleExpiry
+	}
+	return n, err
+}
+
+func (b *idleBody) expire() {
+	b.expired.Store(true)
+	b.src.Close()
+}
+
+func (b *idleBody) Close() error {
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	return b.src.Close()
 }
 
 // sseDoneMarker is the payload that closes a stream: it names no chunk, so
@@ -810,16 +879,28 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 	if attempts < 1 {
 		attempts = 1
 	}
-	// A hand-built config carries no --timeout, and Client.Timeout 0 means no
-	// bound at all rather than no wait, so fall back to the package default.
+	// A hand-built config carries no --timeout, and a zero timeout means no bound
+	// at all rather than no wait, so fall back to the package default.
 	timeout := cfg.timeout
 	if timeout <= 0 {
 		timeout = chatAttemptTimeout
 	}
-	// Bounded per attempt: http.DefaultClient is process-global and has no
-	// timeout, so a server that accepts the connection and never answers would
-	// hang the run forever. Client.Timeout covers dial, headers and body read.
-	client := &http.Client{Timeout: timeout}
+	// The bound is an idle one, so it cannot be http.Client.Timeout: that expires
+	// the whole round trip and would cut off a stream still delivering bytes. Each
+	// leg gets its own instead — the transport bounds the dial and the wait for
+	// response headers, idleBody bounds each gap between received bytes. The two
+	// legs run in sequence, so a first byte can land up to two bounds after the
+	// request: the bound is per leg, not one deadline over the round trip plus
+	// the first read. Cloned so only these two settings differ from the defaults,
+	// since mutating DefaultTransport would change every other client in the
+	// process.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: timeout}).DialContext
+	transport.ResponseHeaderTimeout = timeout
+	// nothing reuses this per-call transport once sendChat returns, and its idle
+	// connections park a read loop each until IdleConnTimeout
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
 	var lastErr error
 	delay := chatRetryBackoff
 	// Only a 5xx or a transport failure is retried, and only inside this one
@@ -852,8 +933,11 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 		// Only a 200 is the event stream. An error status answers with a plain
 		// body, which the retry note and the 4xx return still need whole.
 		if resp.StatusCode != http.StatusOK {
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			// an error answer is not an event stream, but it is still a body the
+			// server may stop writing halfway through, so the same idle bound applies
+			src := newIdleBody(resp.Body, timeout)
+			body, err := io.ReadAll(src)
+			src.Close()
 			if err != nil {
 				lastErr = readFailure(target, timeout, err)
 				continue
@@ -864,14 +948,16 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 			}
 			return chatReply{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 		}
-		reply, err := readChatStream(resp.Body, resp.Status)
-		resp.Body.Close()
+
+		src := newIdleBody(resp.Body, timeout)
+		reply, err := readChatStream(src, resp.Status)
+		src.Close()
 		if err != nil {
 			var read streamReadError
 			if errors.As(err, &read) {
-				// a stream that dies mid-body trips the same Client.Timeout as a
-				// round trip that never completes, so it reads the same to the
-				// operator and is retried the same way
+				// a stream that dies mid-body is the same kind of trouble as a round
+				// trip that never completes, so it reads the same to the operator and
+				// is retried the same way
 				lastErr = readFailure(target, timeout, read.err)
 				continue
 			}
