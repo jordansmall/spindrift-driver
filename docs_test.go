@@ -48,6 +48,19 @@ func glossarySection(norm, term string) string {
 	return rest
 }
 
+// satisfiesOrder reports whether some sentence of norm that mentions needle also
+// lists needles in order. An ordering claim belongs to the sentence that makes
+// it: elsewhere in the same document these words appear in another order, and a
+// whole-document scan would be satisfied by accident.
+func satisfiesOrder(norm, needle string, needles ...string) bool {
+	for _, s := range sentencesContaining(norm, needle) {
+		if indexOrder(s, needles...) {
+			return true
+		}
+	}
+	return false
+}
+
 // countAny returns how many of needles appear in hay.
 func countAny(hay string, needles ...string) int {
 	n := 0
@@ -276,5 +289,78 @@ func TestADRMarkSuperseded0002(t *testing.T) {
 	pointer := strings.ToLower(lines[markedAt])
 	if !strings.Contains(pointer, "0003") && !strings.Contains(pointer, "spindrift-first") {
 		t.Errorf("%s is marked superseded without naming ADR-0003 as its successor: %q", name, lines[markedAt])
+	}
+}
+
+// TestADRRecordsDriverConfig pins ADR-0005: the Driver Config is the only channel
+// that carries host-side settings into a running Box, so the record has to name
+// what it reverses (spec #1's "no config files"), what it leaves alone (ADR-0001),
+// and every rule that keeps a mistyped file from quietly changing where a Box's
+// traffic goes.
+func TestADRRecordsDriverConfig(t *testing.T) {
+	ads := readADRs(t)
+
+	const name = "0005-driver-config.md"
+	if found := findADR(t, ads, "driver config", "envfiles"); found != name {
+		t.Fatalf("the driver config / envFiles claim is recorded in %q, want %s", found, name)
+	}
+	raw, ok := ads[name]
+	if !ok {
+		t.Fatalf("docs/adr/%s is missing", name)
+	}
+	text := collapseMarkdown(raw)
+
+	// The reversal is stated as a reversal, and attributed to the spec it reverses.
+	if !strings.Contains(text, "no config files") {
+		t.Errorf("%s never names the rule it reverses (spec #1's \"no config files\")", name)
+	}
+	if !near(text, "no config files", "spec #1", 240) {
+		t.Errorf("%s reverses \"no config files\" without saying, in the same breath, that the rule is spec #1's", name)
+	}
+	// The field set is closed, and the settings that stay outside it are named.
+	for _, want := range []string{"base_url", "api_key", "timeout"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s does not name the config field %s", name, want)
+		}
+	}
+	if !near(text, "base_url", "timeout", 240) {
+		t.Errorf("%s does not present base_url, api_key and timeout as one closed field set", name)
+	}
+	if !near(text, "model", "flag", 200) {
+		t.Errorf("%s must state that the model name stays a flag and out of the file", name)
+	}
+	// Location plus its one override, and the default is home-relative.
+	if !near(text, "home", "spindrift_config", 240) {
+		t.Errorf("%s does not give the home-relative default and the SPINDRIFT_CONFIG override together", name)
+	}
+	if !strings.Contains(text, ".config/spindrift-driver/config.json") {
+		t.Errorf("%s does not name the default path .config/spindrift-driver/config.json", name)
+	}
+	// One ladder, stated in the order it is applied — pinned inside the sentence
+	// that states it, because the title and the earlier prose use these same words
+	// out of that order.
+	if !satisfiesOrder(text, "ladder", "flag", "environment", "driver config", "default") {
+		t.Errorf("%s has no one-sentence statement of precedence in order: flag, then environment, then Driver Config, then built-in default", name)
+	}
+	// Strictness: a bad file stops the run instead of being quietly half-read.
+	if !near(text, "unknown field", "startup error", 240) {
+		t.Errorf("%s does not make an unknown field a startup error naming the file and the problem", name)
+	}
+	if !near(text, "fall back", "typo", 240) {
+		t.Errorf("%s must state that a typo never falls back to a default in silence", name)
+	}
+	// The key never travels by a route that makes it readable in ps output.
+	if !near(text, "api key", "process listing", 240) {
+		t.Errorf("%s does not say the api key never appears in a process listing", name)
+	}
+	// The repository under repair gets no vote in the run that repairs it.
+	if !near(text, "target repo", "working directory", 240) {
+		t.Errorf("%s does not say the Driver reads no config from the Target repo's working directory", name)
+	}
+	if !strings.Contains(raw, "## Considered Options") {
+		t.Errorf("%s has no ## Considered Options section", name)
+	}
+	if n := strings.Count(raw, "— rejected:"); n < 4 {
+		t.Errorf("%s rejects %d options in the `- **Option** — rejected: reason` form; want at least 4", name, n)
 	}
 }
