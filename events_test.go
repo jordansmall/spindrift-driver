@@ -20,6 +20,54 @@ func decodeLine(t *testing.T, line string) map[string]any {
 	return ev
 }
 
+// stdoutEvents reads a run()'s stdout buffer back as the JSONL stream the
+// contract promises: every line a JSON object, no blank lines, one trailing
+// newline per event. A run that wrote nothing yields no events rather than one
+// empty object.
+func stdoutEvents(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	if raw == "" {
+		return nil
+	}
+	if !strings.HasSuffix(raw, "\n") {
+		t.Fatalf("stdout does not end with a newline: %q", raw)
+	}
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
+	events := make([]map[string]any, 0, len(lines))
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			t.Fatalf("stdout line %d is blank: %q", i+1, raw)
+		}
+		events = append(events, decodeLine(t, line))
+	}
+	return events
+}
+
+// oneErrorEvent asserts a non-zero exit wrote exactly one stdout line, an error
+// event whose text is non-empty, and no result event alongside it — a failed
+// run must never also report success. It returns the event's text so the
+// caller can compare it against the raw error.
+func oneErrorEvent(t *testing.T, raw string) string {
+	t.Helper()
+	events := stdoutEvents(t, raw)
+	for _, ev := range events {
+		if ev["kind"] == "result" {
+			t.Fatalf("stdout carries a result event on a non-zero exit: %q", raw)
+		}
+	}
+	if len(events) != 1 {
+		t.Fatalf("stdout carries %d event(s), want exactly 1 error event: %q", len(events), raw)
+	}
+	if got := events[0]["kind"]; got != "error" {
+		t.Fatalf("kind = %v, want %q: %q", got, "error", raw)
+	}
+	text, ok := events[0]["text"].(string)
+	if !ok || text == "" {
+		t.Fatalf("error event text = %v, want the non-empty raw error text: %q", events[0]["text"], raw)
+	}
+	return text
+}
+
 // pinClock fixes the event clock for a test and restores the real one after.
 func pinClock(t *testing.T, ms int64) {
 	t.Helper()

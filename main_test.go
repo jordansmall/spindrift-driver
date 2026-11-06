@@ -475,14 +475,34 @@ func TestRunTurnCap(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", code, stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty (no final answer was produced)", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "turn limit") {
+		t.Errorf("error event text = %q, want the turn-limit sentence", got)
 	}
 	if bodies := srv.requestBodies(t); len(bodies) != 3 {
 		t.Errorf("POSTs = %d, want exactly max-turns 3", len(bodies))
 	}
 	if !strings.Contains(stderr.String(), "turn") {
 		t.Errorf("stderr = %q, want a message about exhausting the turns", stderr.String())
+	}
+}
+
+// The turn cap is a non-zero exit like any other, so it owes an error event
+// that states the limit and its number rather than just the count of POSTs.
+func TestRunTurnCapEmitsErrorEventNamingTheLimit(t *testing.T) {
+	srv := newScriptedChatServer(t)
+	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+	srv.responses = []string{forever, forever, forever}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--max-turns", "2", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); got != "reached the turn limit of 2 without a final answer" {
+		t.Errorf("error event text = %q, want the turn-limit sentence naming the limit 2", got)
+	}
+	if !strings.Contains(stderr.String(), "reached the turn limit of 2 without a final answer") {
+		t.Errorf("stderr = %q, want the turn-limit line as today", stderr.String())
 	}
 }
 
@@ -559,8 +579,11 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 	if code == 0 {
 		t.Errorf("exit code = 0, want non-zero when every attempt 500s")
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty: a 5xx body must never reach stdout", stdout.String())
+	// The body does reach stdout now, but only as the text of the one error
+	// event: oneErrorEvent fails unless every stdout line is a JSON object, so a
+	// forged second line here would be caught.
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "server returned 500") {
+		t.Errorf("error event text = %q, want the 5xx status the run failed on", got)
 	}
 	for _, line := range strings.Split(stderr.String(), "\n") {
 		if line == "" {
@@ -677,11 +700,37 @@ func TestRunServerErrorStatus(t *testing.T) {
 	if code == 0 {
 		t.Fatal("non-200 response should exit non-zero")
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty on server error", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "500") {
+		t.Errorf("error event text = %q, want the failing status", got)
 	}
 	if !strings.Contains(stderr.String(), "500") {
 		t.Errorf("stderr = %q, want the failing status", stderr.String())
+	}
+}
+
+// A transport failure is the same error on both surfaces: the operator's
+// stderr line and the machine-readable event must carry the identical raw text,
+// not a summarised version of it.
+func TestRunUnreachableEmitsRawDialErrorEvent(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
+	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := srv.URL
+	srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 when the endpoint refuses connections; stderr = %q", code, stderr.String())
+	}
+	got := oneErrorEvent(t, stdout.String())
+	if !strings.Contains(got, "dial tcp") {
+		t.Errorf("error event text = %q, want the raw dial failure", got)
+	}
+	if !strings.Contains(stderr.String(), got) {
+		t.Errorf("stderr = %q does not contain the event text %q, want one error on both surfaces", stderr.String(), got)
 	}
 }
 
@@ -705,8 +754,8 @@ func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the endpoint refuses connections; stderr = %q", stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want nothing on stdout when the API is unreachable", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "connection refused") {
+		t.Errorf("error event text = %q, want the connection failure", got)
 	}
 	if !strings.Contains(stderr.String(), "spindrift-driver:") || !strings.Contains(strings.ToLower(stderr.String()), "connection refused") {
 		t.Errorf("stderr = %q, want the connection failure reported to the operator", stderr.String())
@@ -739,8 +788,8 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once the retry budget is spent; stderr = %q", stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want nothing on stdout, especially not a 5xx body", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "server returned 502") {
+		t.Errorf("error event text = %q, want the last failing status", got)
 	}
 	if posts != 4 {
 		t.Errorf("POSTs = %d, want exactly 4 (the full injected budget, no more)", posts)
@@ -750,6 +799,29 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "retry 4/4") {
 		t.Errorf("stderr = %q, want the final attempt announced as retry 4/4", stderr.String())
+	}
+}
+
+// A non-retryable rejection's body is the answer, so the error event carries it
+// verbatim — newlines included. boundBody must never touch event text: JSON
+// escaping is what keeps the multi-line body inside one stdout line.
+func TestRunRejectionBodyStaysVerbatimInOneErrorEvent(t *testing.T) {
+	const body = "context length exceeded\n\tset --max-turns lower\nend of rejection"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", code, stderr.String())
+	}
+	want := "server returned 400 Bad Request: " + body
+	if got := oneErrorEvent(t, stdout.String()); got != want {
+		t.Errorf("error event text = %q, want the rejection verbatim %q", got, want)
 	}
 }
 
@@ -791,8 +863,9 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 			if code == 0 {
 				t.Fatalf("exit code = 0, want non-zero; stderr = %q", stderr.String())
 			}
-			if stdout.Len() != 0 {
-				t.Errorf("stdout = %q, want nothing on stdout", stdout.String())
+			eventText := oneErrorEvent(t, stdout.String())
+			if !strings.Contains(eventText, tc.wantStderr) {
+				t.Errorf("error event text = %q, want it to mention %q", eventText, tc.wantStderr)
 			}
 			mu.Lock()
 			n := posts
@@ -877,8 +950,8 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want nothing on stdout when the request times out", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "timed out") {
+		t.Errorf("error event text = %q, want the attempt timeout", got)
 	}
 	if !strings.Contains(stderr.String(), "Client.Timeout exceeded") && !strings.Contains(strings.ToLower(stderr.String()), "timeout") {
 		t.Errorf("stderr = %q, want the attempt timeout reported to the operator", stderr.String())
@@ -924,8 +997,8 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want nothing on stdout when the response body stalls", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "while reading the response") {
+		t.Errorf("error event text = %q, want the response-reading leg named", got)
 	}
 	assertTimeoutErrorLine(t, stderr.String(), srv.URL+"/chat/completions", 50*time.Millisecond)
 	// the deadline fired in the body read, so the diagnostic must name that leg
@@ -964,8 +1037,8 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the response body is cut short; stderr = %q", stderr.String())
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want nothing on stdout when the response body is cut short", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "read response:") {
+		t.Errorf("error event text = %q, want the read-response leg named", got)
 	}
 	got := driverErrorLine(stderr.String(), srv.URL+"/chat/completions")
 	if !strings.Contains(got, "read response:") {
@@ -1151,11 +1224,29 @@ func TestRunEmptyResponse(t *testing.T) {
 	if code == 0 {
 		t.Fatal("empty choices should exit non-zero")
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty on empty response", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); got != "server returned no choices" {
+		t.Errorf("error event text = %q, want %q", got, "server returned no choices")
 	}
 	if !strings.Contains(stderr.String(), "choices") {
 		t.Errorf("stderr = %q, want a message about the empty response", stderr.String())
+	}
+}
+
+// Every non-zero exit owes exactly one error event on stdout, usage errors
+// included: stdout is a machine surface, so a decoder must be able to learn the
+// reason without parsing the human usage block off stderr. The text is the raw
+// parse error — no driver prefix, no wrapping.
+func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a usage error; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); got != "--model is required" {
+		t.Errorf("error event text = %q, want the raw parse error %q", got, "--model is required")
+	}
+	if !strings.Contains(stderr.String(), "usage:") {
+		t.Errorf("stderr = %q, want the usage block as today", stderr.String())
 	}
 }
 
@@ -1165,8 +1256,8 @@ func TestRunMissingModel(t *testing.T) {
 	if code == 0 {
 		t.Fatal("run with missing --model should exit non-zero")
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty on usage error", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); got != "--model is required" {
+		t.Errorf("error event text = %q, want %q", got, "--model is required")
 	}
 	if !strings.Contains(stderr.String(), "usage") {
 		t.Errorf("stderr = %q, want usage text", stderr.String())
@@ -1179,8 +1270,8 @@ func TestRunEmptyPrompt(t *testing.T) {
 	if code == 0 {
 		t.Fatal("run with empty prompt should exit non-zero")
 	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty on usage error", stdout.String())
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "prompt is required") {
+		t.Errorf("error event text = %q, want the prompt requirement", got)
 	}
 	if !strings.Contains(stderr.String(), "usage") {
 		t.Errorf("stderr = %q, want usage text", stderr.String())
@@ -1465,17 +1556,19 @@ func TestRunResponseEndingInNewline(t *testing.T) {
 	}
 }
 
-func TestRunHelpExitsZeroOnStdout(t *testing.T) {
+// -h is not a failure, so it gets no error event; but stdout carries only
+// JSONL on every exit path, so the usage text itself belongs on stderr.
+func TestRunHelpExitsZeroWithUsageOnStderr(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 for -h", code)
 	}
-	if !strings.Contains(stdout.String(), "usage:") {
-		t.Errorf("stdout = %q, want usage text", stdout.String())
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing: stdout carries only JSONL events", stdout.String())
 	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want empty for -h", stderr.String())
+	if !strings.Contains(stderr.String(), "usage:") {
+		t.Errorf("stderr = %q, want usage text", stderr.String())
 	}
 }
 

@@ -49,14 +49,16 @@ The API key is read from $` + envAPIKey + ` only, never from argv.
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
+	events := eventWriter{w: stdout}
 	cfg, err := parseArgs(args, stdin, lookupEnv)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) { // -h/--help: usage is the output, not an error
-			fmt.Fprint(stdout, usage)
+			// It goes to stderr because stdout carries only JSONL events.
+			fmt.Fprint(stderr, usage)
 			return 0
 		}
 		fmt.Fprintf(stderr, "spindrift-driver: %v\n%s", err, usage)
-		return 2
+		return errorExit(events, 2, err)
 	}
 	// Autonomous tool loop: each turn posts the whole conversation with the
 	// tools parameter; the server decides tool calls (never parsed from text).
@@ -68,7 +70,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		reply, err := sendChat(cfg, messages, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "spindrift-driver: %v\n", err)
-			return 1
+			return errorExit(events, 1, err)
 		}
 		assistant := reply.Message
 		if len(assistant.ToolCalls) == 0 {
@@ -88,8 +90,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			messages = append(messages, chatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
 		}
 	}
-	fmt.Fprintf(stderr, "spindrift-driver: reached the turn limit of %d without a final answer\n", cfg.maxTurns)
-	return 1
+	turnLimit := fmt.Errorf("reached the turn limit of %d without a final answer", cfg.maxTurns)
+	fmt.Fprintf(stderr, "spindrift-driver: %v\n", turnLimit)
+	return errorExit(events, 1, turnLimit)
+}
+
+// errorExit is the one funnel every non-zero exit passes through, so no failure
+// path can return without the error event stdout owes. The event text is the
+// raw error verbatim, never flattened through boundBody: that cap exists so the
+// stderr progress line stays one line, and JSON escaping already keeps this
+// line whole however many newlines the error carries. A failed stdout write has
+// nowhere to be reported and changes nothing — stderr already carries the
+// operator's copy, and the exit code stays the authoritative signal.
+func errorExit(events eventWriter, code int, err error) int {
+	_ = events.emit(event{Kind: "error", Text: err.Error()})
+	return code
 }
 
 // executeToolCall runs one assistant tool call and returns its Tool Result
