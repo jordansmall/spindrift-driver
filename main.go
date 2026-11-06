@@ -528,11 +528,80 @@ type chatChunk struct {
 		// that readChatStream folds in.
 		Index int `json:"index"`
 		Delta struct {
-			Content   string     `json:"content"`
-			ToolCalls []toolCall `json:"tool_calls"`
+			Content   string           `json:"content"`
+			ToolCalls []streamToolCall `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *chatUsage `json:"usage"`
+}
+
+// streamToolCall is one fragment of a streamed tool call. Unlike the whole
+// toolCall it reassembles into, every field may be absent — only the first
+// fragment of a call names it, the rest append arguments — and Index is a
+// pointer because "no index field" is not the same statement as "index 0".
+type streamToolCall struct {
+	Index    *int                   `json:"index"`
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Function streamToolCallFunction `json:"function"`
+}
+
+type streamToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// toolCallStream reassembles tool-call fragments into whole calls, held in the
+// order each call first appeared so the loop runs them in the order the Model
+// asked.
+type toolCallStream struct {
+	keys  []int
+	calls []toolCall
+}
+
+// merge folds one delta's fragments into the calls gathered so far, keyed by the
+// fragment's index. A fragment with no index is keyed by its position within
+// that delta instead: servers that deliver a whole call in a single chunk often
+// omit it, and position is the only slot available — keying those on 0 would
+// merge two such calls into one. An index-less fragment naming an id the slot
+// does not already hold is a second such call, not a continuation: merging them
+// would splice two JSON argument objects into one unparseable call.
+func (s *toolCallStream) merge(fragments []streamToolCall) {
+	for pos, frag := range fragments {
+		key := pos
+		if frag.Index != nil {
+			key = *frag.Index
+		}
+		at := -1
+		for i, k := range s.keys {
+			if k == key {
+				at = i
+				break
+			}
+		}
+		// The replacement key is negative because a real index never is.
+		if at >= 0 && frag.Index == nil && frag.ID != "" && s.calls[at].ID != "" && s.calls[at].ID != frag.ID {
+			key, at = -(len(s.keys) + 1), -1
+		}
+		if at < 0 {
+			s.keys = append(s.keys, key)
+			s.calls = append(s.calls, toolCall{})
+			at = len(s.calls) - 1
+		}
+		call := &s.calls[at]
+		// A later fragment repeats a name or id without changing it; only an
+		// argument fragment adds to the call.
+		if frag.ID != "" {
+			call.ID = frag.ID
+		}
+		if frag.Type != "" {
+			call.Type = frag.Type
+		}
+		if frag.Function.Name != "" {
+			call.Function.Name = frag.Function.Name
+		}
+		call.Function.Arguments += frag.Function.Arguments
+	}
 }
 
 // chatUsage mirrors the OpenAI-shaped usage object. Fields are float64 so a
@@ -630,6 +699,7 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 		reply   chatReply
 		content strings.Builder
 		chunks  int
+		calls   toolCallStream
 	)
 	var parseErr error
 	for scanner.Scan() {
@@ -668,8 +738,9 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 				continue
 			}
 			content.WriteString(choice.Delta.Content)
-			// a tool call delivered whole in one delta needs no reassembly
-			reply.Message.ToolCalls = append(reply.Message.ToolCalls, choice.Delta.ToolCalls...)
+			// a tool call delivered whole in one delta is one fragment of itself:
+			// merging it needs no special case
+			calls.merge(choice.Delta.ToolCalls)
 		}
 	}
 	// The read leg outranks everything else: a stream that broke mid-frame leaves
@@ -690,6 +761,7 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 	// turn
 	reply.Message.Role = "assistant"
 	reply.Message.Content = content.String()
+	reply.Message.ToolCalls = calls.calls
 	return reply, nil
 }
 

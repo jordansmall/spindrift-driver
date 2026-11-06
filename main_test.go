@@ -660,6 +660,179 @@ func TestRunStreamIgnoresDeltasBeyondTheFirstChoice(t *testing.T) {
 	}
 }
 
+// A streamed Tool Call arrives in fragments: the first delta names the call and
+// the rest only append to its arguments, so the fragments are not calls. The
+// Driver has to hand the loop one whole call — the same shape a non-streamed
+// tool_calls entry always had — so exactly one tool_call event goes out with the
+// id, name and complete arguments, paired with its tool_result.
+func TestRunStreamReassemblesToolCallSplitAcrossChunks(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ec"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho hel"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9}}`,
+		},
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	callEv, resultEv := toolPair(t, events)
+	if callEv["tool_id"] != "call_1" || resultEv["tool_id"] != "call_1" {
+		t.Errorf("pair tool_id = %v / %v, want the first delta's id call_1 on both", callEv["tool_id"], resultEv["tool_id"])
+	}
+	if callEv["tool_name"] != "bash" {
+		t.Errorf("tool_call tool_name = %v, want the first delta's name bash", callEv["tool_name"])
+	}
+	input, ok := callEv["tool_input"].(map[string]any)
+	if !ok || input["command"] != "echo hello" {
+		t.Errorf("tool_call tool_input = %#v, want the argument fragments joined into {command: echo hello}", callEv["tool_input"])
+	}
+	if callEv["tool_target"] != "echo hello" {
+		t.Errorf("tool_call tool_target = %v, want the reassembled command", callEv["tool_target"])
+	}
+	if got := resultText(t, stdout.String()); got != "all done" {
+		t.Errorf("result text = %q, want the loop to continue past the reassembled call", got)
+	}
+}
+
+// A Model that asks for two things at once streams both calls' fragments into
+// the same deltas, alternating. index is what tells the fragments apart, so the
+// two calls stay separate and each still gets one whole pair, in the order the
+// Model listed them.
+func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho a\"}"}},{"index":1,"function":{"arguments":"ho b\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":14}}`,
+		},
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"both ran"},"finish_reason":"stop"}]}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	type pair struct {
+		id    string
+		name  string
+		input any
+	}
+	var calls []pair
+	// each call's tool_result has to be the very next event, carrying its id
+	var pending string
+	seen := 0
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		switch ev["kind"] {
+		case "tool_call":
+			if pending != "" {
+				t.Fatalf("tool_call %v follows %v without its tool_result: %v", ev["tool_id"], pending, calls)
+			}
+			calls = append(calls, pair{id: fmt.Sprint(ev["tool_id"]), name: fmt.Sprint(ev["tool_name"]), input: ev["tool_input"]})
+			pending = fmt.Sprint(ev["tool_id"])
+		case "tool_result":
+			seen++
+			if got := fmt.Sprint(ev["tool_id"]); pending == "" || got != pending {
+				t.Errorf("tool_result tool_id = %v, want the pending call %v", got, pending)
+			}
+			pending = ""
+		}
+	}
+	want := []pair{
+		{id: "call_a", name: "bash", input: map[string]any{"command": "echo a"}},
+		{id: "call_b", name: "bash", input: map[string]any{"command": "echo b"}},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("tool_call events = %+v, want %v", calls, want)
+	}
+	if seen != 2 {
+		t.Errorf("stdout carries %d tool_result event(s), want one per reassembled call", seen)
+	}
+	if got := resultText(t, stdout.String()); got != "both ran" {
+		t.Errorf("result text = %q, want the loop to continue past both calls", got)
+	}
+}
+
+// A server that omits index can still deliver each whole call in its own
+// delta, both landing at position 0 of their delta. Position alone would merge
+// them into one call whose arguments are two JSON objects spliced together, so
+// the differing ids have to keep them apart.
+func TestRunStreamSplitsIndexlessWholeCallsInSeparateDeltas(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":12}}`,
+		},
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	type pair struct {
+		id    string
+		name  string
+		input any
+	}
+	var calls []pair
+	// each call's tool_result has to be the very next event, carrying its id
+	var pending string
+	seen := 0
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		switch ev["kind"] {
+		case "tool_call":
+			if pending != "" {
+				t.Fatalf("tool_call %v follows %v without its tool_result: %v", ev["tool_id"], pending, calls)
+			}
+			calls = append(calls, pair{id: fmt.Sprint(ev["tool_id"]), name: fmt.Sprint(ev["tool_name"]), input: ev["tool_input"]})
+			pending = fmt.Sprint(ev["tool_id"])
+		case "tool_result":
+			seen++
+			if got := fmt.Sprint(ev["tool_id"]); pending == "" || got != pending {
+				t.Errorf("tool_result tool_id = %v, want the pending call %v", got, pending)
+			}
+			pending = ""
+		}
+	}
+	want := []pair{
+		{id: "call_1", name: "bash", input: map[string]any{"command": "echo one"}},
+		{id: "call_2", name: "bash", input: map[string]any{"command": "echo two"}},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("tool_call events = %+v, want %v", calls, want)
+	}
+	if seen != 2 {
+		t.Errorf("stdout carries %d tool_result event(s), want one per whole call", seen)
+	}
+	if got := resultText(t, stdout.String()); got != "all done" {
+		t.Errorf("result text = %q, want the loop to continue past both calls", got)
+	}
+}
+
 type recordedMessage struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content"`
