@@ -660,6 +660,105 @@ func TestRunStreamIgnoresDeltasBeyondTheFirstChoice(t *testing.T) {
 	}
 }
 
+// A reasoning model thinks before it answers, and the thinking streams in
+// delta.reasoning_content — its own channel, never the answer's. A message that
+// only thinks still completes, so it owes exactly one reasoning event holding
+// the joined fragments and no text event at all, and the reasoning stays out of
+// the result event's prose.
+func TestRunStreamReasoningOnlyAnswerEmitsOneReasoningEvent(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"thinking "}}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"about it"},"finish_reason":"stop"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	var reasoningEvents, textEvents []map[string]any
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		switch ev["kind"] {
+		case "reasoning":
+			reasoningEvents = append(reasoningEvents, ev)
+		case "text":
+			textEvents = append(textEvents, ev)
+		}
+	}
+	if len(reasoningEvents) != 1 {
+		t.Fatalf("stdout carries %d reasoning event(s), want the fragments joined into one: %q", len(reasoningEvents), stdout.String())
+	}
+	if reasoningEvents[0]["text"] != "thinking about it" {
+		t.Errorf("reasoning event text = %v, want both fragments concatenated in order", reasoningEvents[0]["text"])
+	}
+	if reasoningEvents[0]["message_id"] != "msg-1" {
+		t.Errorf("reasoning event message_id = %v, want the msg-1 of the call that thought it", reasoningEvents[0]["message_id"])
+	}
+	if len(textEvents) != 0 {
+		t.Errorf("stdout carries %d text event(s), want none when the message only reasoned: %q", len(textEvents), stdout.String())
+	}
+	if got := resultText(t, stdout.String()); strings.Contains(got, "thinking") {
+		t.Errorf("result text = %q, want none of the reasoning in it", got)
+	}
+}
+
+// Reasoning and prose in one message stay two accumulators and two events: the
+// thought goes out first, then the answer alone, and the result event reports
+// the prose only.
+func TestRunStreamReasoningAndProseEmitReasoningThenText(t *testing.T) {
+	srv := newScriptedSSEServer(t,
+		[]string{
+			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"let me "}}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"check"}}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"the "}}]}`,
+			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}`,
+			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":11}}`,
+		},
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	var kinds []string
+	var reasoningText, proseText string
+	usageEvents := 0
+	for _, ev := range events {
+		switch ev["kind"] {
+		case "reasoning":
+			kinds = append(kinds, "reasoning")
+			reasoningText = fmt.Sprint(ev["text"])
+		case "text":
+			kinds = append(kinds, "text")
+			proseText = fmt.Sprint(ev["text"])
+		case "usage":
+			usageEvents++
+		}
+	}
+	if want := []string{"reasoning", "text"}; !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("stdout prose kinds = %v, want %v (one reasoning event then one text event): %q", kinds, want, stdout.String())
+	}
+	if reasoningText != "let me check" {
+		t.Errorf("reasoning event text = %q, want only the reasoning fragments joined", reasoningText)
+	}
+	if proseText != "the answer" {
+		t.Errorf("text event text = %q, want only the content fragments joined", proseText)
+	}
+	if got := resultText(t, stdout.String()); got != "the answer" {
+		t.Errorf("result text = %q, want the prose alone, without the reasoning", got)
+	}
+	if usageEvents != 1 {
+		t.Errorf("stdout carries %d usage event(s), want the one this call owes: %q", usageEvents, stdout.String())
+	}
+}
+
 // A streamed Tool Call arrives in fragments: the first delta names the call and
 // the rest only append to its arguments, so the fragments are not calls. The
 // Driver has to hand the loop one whole call — the same shape a non-streamed
