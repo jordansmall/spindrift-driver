@@ -586,6 +586,295 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	}
 }
 
+// A Tool Call is the only place the Driver must pair two events by tool id, and
+// the pair belongs inside the Model call that asked for it: after that call's
+// usage event and before the next start, so a reader can attribute the pair to
+// msg-1 and never mistake a tool's output for assistant prose.
+func TestRunEmitsToolCallAndToolResultPair(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	var kinds []string
+	for _, ev := range events {
+		kinds = append(kinds, fmt.Sprint(ev["kind"]))
+	}
+	// The first turn has no prose, so its only events are start, usage and the
+	// tool pair; the pair sits between that usage and the next start.
+	wantKinds := []string{"start", "usage", "tool_call", "tool_result", "start", "text", "usage", "result"}
+	if !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("stdout kinds = %v, want %v: %q", kinds, wantKinds, stdout.String())
+	}
+
+	callEv, resultEv := events[2], events[3]
+	if callEv["tool_id"] != "call_1" || resultEv["tool_id"] != "call_1" {
+		t.Errorf("pair tool_id = %v / %v, want the same id call_1 on both", callEv["tool_id"], resultEv["tool_id"])
+	}
+	if callEv["tool_name"] != "bash" || resultEv["tool_name"] != "bash" {
+		t.Errorf("pair tool_name = %v / %v, want bash on both", callEv["tool_name"], resultEv["tool_name"])
+	}
+	if callEv["tool_target"] != "echo hello" {
+		t.Errorf("tool_call tool_target = %v, want the command the bash tool acts on", callEv["tool_target"])
+	}
+	input, ok := callEv["tool_input"].(map[string]any)
+	if !ok || input["command"] != "echo hello" {
+		t.Errorf("tool_call tool_input = %#v, want the decoded arguments object with command echo hello", callEv["tool_input"])
+	}
+
+	// tool_output is the Tool Result the Model got, byte for byte: same bounded
+	// string with its exit-code line, not a re-derived summary of it.
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(msgs))
+	}
+	toolMsg := msgs[1][len(msgs[1])-1]
+	if got, want := resultEv["tool_output"], toolMsg.Content; got != want {
+		t.Errorf("tool_result tool_output = %v, want exactly the tool message content %q", got, want)
+	}
+	if _, ok := callEv["tool_output"]; ok {
+		t.Errorf("tool_call carries tool_output, which only tool_result fills: %v", callEv)
+	}
+	if _, ok := resultEv["tool_input"]; ok {
+		t.Errorf("tool_result carries tool_input, which only tool_call fills: %v", resultEv)
+	}
+}
+
+// Absence of is_error means false on the wire, so a succeeding command must not
+// state the key at all while a non-zero exit states it — both on one turn, so
+// neither can be mistaken for the other's tool.
+func TestRunToolResultIsErrorTracksExitCode(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_ok","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo ok\"}"}},{"id":"call_fail","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 3\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failing command is an ordinary result); stderr = %q", code, stderr.String())
+	}
+
+	var order []string
+	results := map[string]map[string]any{}
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		id, _ := ev["tool_id"].(string)
+		order = append(order, id)
+		results[id] = ev
+	}
+	if !reflect.DeepEqual(order, []string{"call_ok", "call_fail"}) {
+		t.Fatalf("tool_result order = %v, want the call order [call_ok call_fail]: %q", order, stdout.String())
+	}
+	if ev, ok := results["call_ok"]["is_error"]; ok {
+		t.Errorf("a succeeding tool_result states is_error = %v, want the key absent (absence is false): %v", ev, results["call_ok"])
+	}
+	if results["call_fail"]["is_error"] != true {
+		t.Errorf("exit 3 tool_result is_error = %v, want true: %v", results["call_fail"]["is_error"], results["call_fail"])
+	}
+}
+
+// An unknown tool stays an ordinary Tool Result for the Model and becomes an
+// is_error pair for the reader: tool_name still says what was asked for, and
+// tool_target stays off the wire because the Driver never learned what it acted
+// on. The event's tool_output is the same string the Model is handed.
+func TestRunToolPairForUnknownTool(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"squiggle","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (an unknown tool must not crash the loop); stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	callEv, resultEv := toolPair(t, events)
+	if callEv["tool_name"] != "squiggle" || resultEv["tool_name"] != "squiggle" {
+		t.Errorf("pair tool_name = %v / %v, want squiggle on both", callEv["tool_name"], resultEv["tool_name"])
+	}
+	for _, ev := range []map[string]any{callEv, resultEv} {
+		if _, ok := ev["tool_target"]; ok {
+			t.Errorf("%v carries tool_target for a tool that was never run, want it omitted: %v", ev["kind"], ev)
+		}
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("unknown tool tool_result is_error = %v, want true", resultEv["is_error"])
+	}
+	want := fmt.Sprintf("error: unknown tool %q", "squiggle")
+	msgs := srv.messageBodies(t)
+	toolMsg := msgs[1][len(msgs[1])-1]
+	if resultEv["tool_output"] != want || toolMsg.Content != want {
+		t.Errorf("tool_output = %v, tool message = %q, want both exactly %q", resultEv["tool_output"], toolMsg.Content, want)
+	}
+}
+
+// Arguments that are not valid JSON cannot be decoded, so tool_input falls back
+// to the raw arguments string — the malformed text is the fact worth reporting —
+// and no target can be named. The parse error is the Tool Result.
+func TestRunToolPairForUnparseableArguments(t *testing.T) {
+	rawArgs := `{"command": "echo broken`
+	argsJSON, err := json.Marshal(rawArgs)
+	if err != nil {
+		t.Fatalf("marshal scripted arguments: %v", err)
+	}
+	srv := newScriptedChatServer(t,
+		fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_bad","type":"function","function":{"name":"bash","arguments":%s}}]}}]}`, argsJSON),
+		`{"choices":[{"message":{"role":"assistant","content":"moving on"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (malformed arguments must not crash the loop); stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	callEv, resultEv := toolPair(t, events)
+	if got, ok := callEv["tool_input"].(string); !ok || got != rawArgs {
+		t.Errorf("tool_call tool_input = %#v, want the raw arguments string %q", callEv["tool_input"], rawArgs)
+	}
+	for _, ev := range []map[string]any{callEv, resultEv} {
+		if _, ok := ev["tool_target"]; ok {
+			t.Errorf("%v carries tool_target for arguments that never parsed, want it omitted: %v", ev["kind"], ev)
+		}
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("unparseable arguments tool_result is_error = %v, want true", resultEv["is_error"])
+	}
+	msgs := srv.messageBodies(t)
+	toolMsg := msgs[1][len(msgs[1])-1]
+	if resultEv["tool_output"] != toolMsg.Content {
+		t.Errorf("tool_output = %v, want exactly the tool message content %q", resultEv["tool_output"], toolMsg.Content)
+	}
+	if out, _ := resultEv["tool_output"].(string); !strings.HasPrefix(out, "error: cannot parse tool arguments: ") {
+		t.Errorf("tool_output = %q, want the parse-error text the Model receives", out)
+	}
+}
+
+// A server that sends no call id still owes pairs a reader can join, so the
+// Driver synthesises call-<n> over the whole run; the Model-facing replay keeps
+// the empty id it was given, because the synthesised key belongs to the stream.
+func TestRunSynthesisesToolIDsWhenServerSendsNone(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}},{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"paired"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	events := stdoutEvents(t, stdout.String())
+	var kinds []string
+	for _, ev := range events {
+		kinds = append(kinds, fmt.Sprint(ev["kind"]))
+	}
+	wantKinds := []string{"start", "usage", "tool_call", "tool_result", "tool_call", "tool_result", "start", "text", "usage", "result"}
+	if !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("stdout kinds = %v, want each tool_call immediately followed by its own tool_result (%v): %q", kinds, wantKinds, stdout.String())
+	}
+	for i, want := range []struct {
+		toolID string
+		target string
+	}{
+		{"call-1", "echo one"},
+		{"call-2", "echo two"},
+	} {
+		callEv, resultEv := events[2+i*2], events[3+i*2]
+		if callEv["tool_id"] != want.toolID || resultEv["tool_id"] != want.toolID {
+			t.Errorf("pair %d tool_id = %v / %v, want %v on both lines", i+1, callEv["tool_id"], resultEv["tool_id"], want.toolID)
+		}
+		if callEv["tool_target"] != want.target || resultEv["tool_target"] != want.target {
+			t.Errorf("pair %d tool_target = %v / %v, want %q on both lines", i+1, callEv["tool_target"], resultEv["tool_target"], want.target)
+		}
+	}
+	for _, msg := range srv.messageBodies(t)[1] {
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			t.Errorf("replayed tool message carries tool_call_id %q, want the server's empty id replayed unchanged", msg.ToolCallID)
+		}
+	}
+}
+
+// The pair belongs to the Model call that asked for it: message_id is the usage
+// dedup key and the reader's message boundary, so a pair stamped with the wrong
+// turn would attribute a tool to a call that never requested it.
+func TestRunToolPairCarriesTheMessageIDOfItsModelCall(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"both done"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+
+	seen := map[string][]string{}
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		id, _ := ev["message_id"].(string)
+		seen[id] = append(seen[id], fmt.Sprint(ev["kind"]))
+	}
+	for id, want := range map[string][]string{
+		"msg-1": {"start", "usage", "tool_call", "tool_result"},
+		"msg-2": {"start", "usage", "tool_call", "tool_result"},
+		"msg-3": {"start", "text", "usage"},
+	} {
+		if !reflect.DeepEqual(seen[id], want) {
+			t.Errorf("message_id %q carries kinds %v, want %v", id, seen[id], want)
+		}
+	}
+	// A pair that lost its message_id would land in the no-id bucket and break the
+	// exact per-message kind lists above; the result event legitimately has none.
+	if extra := seen[""]; len(extra) != 1 || extra[0] != "result" {
+		t.Errorf("events with no message_id = %v, want only the result event", extra)
+	}
+}
+
+// toolPair picks the single tool_call/tool_result pair out of a run's events and
+// asserts it is one adjacent pair, so the caller reads the two lines that belong
+// together rather than indexes into a stream.
+func toolPair(t *testing.T, events []map[string]any) (map[string]any, map[string]any) {
+	t.Helper()
+	var callEv, resultEv map[string]any
+	for i, ev := range events {
+		switch ev["kind"] {
+		case "tool_call":
+			if callEv != nil {
+				t.Fatalf("stdout carries more than one tool_call event: %v", events)
+			}
+			callEv = ev
+			if i+1 >= len(events) || events[i+1]["kind"] != "tool_result" {
+				t.Fatalf("tool_call is not immediately followed by its tool_result: %v", events)
+			}
+		case "tool_result":
+			if resultEv != nil {
+				t.Fatalf("stdout carries more than one tool_result event: %v", events)
+			}
+			resultEv = ev
+		}
+	}
+	if callEv == nil || resultEv == nil {
+		t.Fatalf("stdout carries no tool_call/tool_result pair: %v", events)
+	}
+	return callEv, resultEv
+}
+
 func TestRunFailingToolCommandIsOrdinaryResult(t *testing.T) {
 	srv := newScriptedChatServer(t,
 		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 7\"}"}}]}}]}`,
@@ -654,6 +943,12 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	}
 	if !strings.Contains(tool.Content, "99999\n100000") {
 		t.Errorf("tool content = %q, want the tail of the generated output (99999, 100000) present", tool.Content)
+	}
+	// The event carries the very same bounded string, so a decoder never sees more
+	// of a flood than the Model did.
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	if resultEv["tool_output"] != tool.Content {
+		t.Errorf("tool_result tool_output = %d bytes, want the truncated tool message verbatim (%d bytes)", len(fmt.Sprint(resultEv["tool_output"])), len(tool.Content))
 	}
 }
 
