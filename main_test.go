@@ -2893,6 +2893,39 @@ func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	}
 }
 
+// -h is the only manual the Driver ships, so it has to point at the Driver
+// Config: an operator who never opens the README still needs to learn that the
+// file exists, where it lives and what beats what.
+func TestUsageNamesDriverConfig(t *testing.T) {
+	for _, want := range []string{"Driver Config", envConfigPath, defaultDriverConfigPath} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage does not mention %q:\n%s", want, usage)
+		}
+	}
+	if !indexOrder(usage, "flag", "environment", "Driver Config", "default") {
+		t.Errorf("usage does not state the precedence flag, environment, Driver Config, default in that order:\n%s", usage)
+	}
+	// The key stays flag-less, and the usage text must not seed the idea that it
+	// is otherwise.
+	if strings.Contains(usage, "--api-key") {
+		t.Errorf("usage advertises --api-key:\n%s", usage)
+	}
+	// The variable holds the path to the file; it is not a directory the file
+	// sits in, and an operator who reads it the other way exports a folder.
+	if regexp.MustCompile(`\bat \$` + envConfigPath + `\b`).MatchString(usage) {
+		t.Errorf("usage says the Driver Config is at $%s itself; the variable names a path:\n%s", envConfigPath, usage)
+	}
+	if !regexp.MustCompile(`path \$` + envConfigPath).MatchString(usage) {
+		t.Errorf("usage does not put the Driver Config at the path $%s names:\n%s", envConfigPath, usage)
+	}
+	// -h is the only manual the Driver ships, so the one lenient case has to be
+	// stated there too: text that makes every unreadable file fatal sends an
+	// operator to create a file that was never meant to exist.
+	if !near(usage, "absent", "not an error", 160) {
+		t.Errorf("usage does not say an absent file at the default path is not an error:\n%s", usage)
+	}
+}
+
 func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
 	// One attempt can stream a whole long generation, so the default must be
 	// minutes-scale; a sub-minute default would expire healthy turns.
