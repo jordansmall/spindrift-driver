@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -45,6 +46,27 @@ func isKnownConfigField(key string) bool {
 		}
 	}
 	return false
+}
+
+// driverConfigPath reports which Driver Config file to read and whether the
+// operator named it, which is the difference between a missing file being
+// fatal and being nothing at all.
+//
+// HOME is read through the injected lookupEnv, never through os.UserHomeDir:
+// that would bypass the seam every test stubs and leak a developer's real
+// ~/.config/spindrift-driver/config.json into the byte-exact golden log.
+func driverConfigPath(lookupEnv func(string) (string, bool)) (path string, explicit bool) {
+	// Returned verbatim: no Clean, no tilde expansion, so the path the operator
+	// typed is the path a later error message names.
+	if v, ok := lookupEnv(envConfigPath); ok && v != "" {
+		return v, true
+	}
+	// A set-but-empty HOME reads as unset, as SPINDRIFT_API_KEY does: an
+	// unresolvable home means "no default file", never an error.
+	if home, ok := lookupEnv("HOME"); ok && home != "" {
+		return filepath.Join(home, defaultDriverConfigPath), false
+	}
+	return "", false
 }
 
 // loadDriverConfig reads exactly one path and never falls back. It writes
