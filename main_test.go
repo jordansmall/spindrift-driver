@@ -3548,3 +3548,50 @@ func TestRunHelpIgnoresBrokenDriverConfig(t *testing.T) {
 		}
 	}
 }
+
+// The Driver reads no config from the Target repo: nothing in the working
+// directory is ever consulted, so a checkout cannot steer the endpoint, the
+// secret or the timeout of a run started inside it.
+func TestParseArgsReadsNoConfigFromWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	planted := map[string]string{
+		"spindrift.json":         `{"base_url":"http://planted.invalid/spindrift/v1","api_key":"sk-planted-spindrift","timeout":"7s"}`,
+		"config.json":            `{"base_url":"http://planted.invalid/config/v1","api_key":"sk-planted-config","timeout":"8s"}`,
+		".spindrift-driver.json": `{"base_url":"http://planted.invalid/dotfile/v1","api_key":"sk-planted-dotfile","timeout":"9s"}`,
+		".env":                   "SPINDRIFT_BASE_URL=http://planted.invalid/dotenv/v1\nSPINDRIFT_API_KEY=sk-planted-dotenv\nSPINDRIFT_TIMEOUT=10s\n",
+	}
+	for name, body := range planted {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	// The fixtures have to be real and have to disagree with the defaults, or
+	// this test could pass by writing nothing at all.
+	for name, body := range planted {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("planted %s is not readable after WriteFile: %v", name, err)
+		}
+		if string(raw) != body {
+			t.Fatalf("planted %s = %q, want the bytes written to it", name, string(raw))
+		}
+		if !strings.Contains(body, "planted.invalid") {
+			t.Fatalf("planted %s carries no non-default base URL: %q", name, body)
+		}
+	}
+
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.baseURL != "http://localhost:8080/v1" {
+		t.Errorf("baseURL = %q, want the built-in default: something in the working directory was read", cfg.baseURL)
+	}
+	if cfg.apiKey != "" {
+		t.Errorf("apiKey = %q, want empty: something in the working directory was read", cfg.apiKey)
+	}
+	if cfg.timeout != chatAttemptTimeout {
+		t.Errorf("timeout = %v, want the built-in %v: something in the working directory was read", cfg.timeout, chatAttemptTimeout)
+	}
+}
