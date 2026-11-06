@@ -117,6 +117,44 @@ CGO_ENABLED=0 go test ./...
 The suite drives real processes, so it needs `bash`, `sleep` and `seq` on `PATH`;
 nothing in it opens a socket beyond the loopback `httptest` servers it starts itself.
 
+## Driver Config
+
+A run can take its settings from a JSON file rather than from anything on the command
+line ([ADR-0005](docs/adr/0005-driver-config.md)). spindrift writes the file through
+`envFiles`, its only run-time channel for putting content where a Box will read it, which
+is why the file exists at all.
+
+```
+{"base_url": "http://model.example:8080/v1", "api_key": "sk-...", "timeout": "90s"}
+```
+
+The file holds exactly three fields: `base_url`, an optional `api_key`, and `timeout` —
+the idle bound `--timeout` sets, written as a Go duration string such as `"90s"`. Nothing
+else belongs in it: the Model name and `--max-turns` stay flags, so a file can move a
+run's traffic but never change what a run does. It lives at
+`$HOME/.config/spindrift-driver/config.json`, or at the path `$SPINDRIFT_CONFIG` names,
+which is used verbatim.
+
+Precedence is one ladder for every field: the flag, then the environment variable
+(`SPINDRIFT_BASE_URL` for the URL, `SPINDRIFT_API_KEY` for the key), then the Driver
+Config, then the built-in default — a knob an operator turned by hand always outranks
+content baked into a Box. `timeout` has no environment variable, so for it the ladder is
+flag, Driver Config, default.
+
+An absent file at the default path is not an error; that is the ordinary state of a
+machine with no config, and the run goes on with whatever the flags and defaults give it.
+A file you actually named is held to the letter: a `SPINDRIFT_CONFIG` path that does not
+exist, malformed JSON, an unknown field, and a field of the wrong type are each a startup
+error naming the file and the problem at exit 2, beside the other startup errors — and
+`-h` still prints its usage with a broken file in place. A typo such as `base_ur1` never
+falls back to the default endpoint in silence.
+
+No flag carries the key: the API key comes from `$SPINDRIFT_API_KEY` or from this file and
+never travels on the command line, so it never appears in a process listing where another
+user of the host could read it. Nothing is read from the working directory or from the
+Target repo — no `spindrift.json`, no `config.json` in the checkout, no dotenv file —
+because the repository under repair does not get to configure the run that repairs it.
+
 ## Manual live smoke test
 
 Manual by design — it needs a Model server that is actually running, so it is run by
@@ -126,9 +164,9 @@ hand and is not part of `nix flake check` or CI.
 2. Point the Driver at it, with `--base-url <url>` or `$SPINDRIFT_BASE_URL` (default
    `http://localhost:8080/v1`). The `/chat/completions` path is appended for you.
 3. If the server expects a bearer token, export it: `export SPINDRIFT_API_KEY=…`.
-   The key is read from `$SPINDRIFT_API_KEY` only — there is no flag for it, so it
-   never lands in the process listing — and with it unset no `Authorization` header
-   is sent at all.
+   The key comes from `$SPINDRIFT_API_KEY` or from the Driver Config — there is no flag
+   for it, so it never lands in the process listing — and with both unset no
+   `Authorization` header is sent at all.
 4. Run it:
 
    ```
