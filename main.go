@@ -34,8 +34,9 @@ type config struct {
 	prompt   string
 	maxTurns int
 	timeout  time.Duration
-	// apiKey is env-only by design: a --api-key flag would put the secret in
-	// argv, where process listings and shell history expose it.
+	// apiKey comes from the environment or the Driver Config by design: a
+	// --api-key flag would put the secret in argv, where process listings and
+	// shell history expose it.
 	apiKey string
 }
 
@@ -50,7 +51,7 @@ The prompt may be given positionally or on stdin. --model is required.
 gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
 arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a
 long time before its first token, or when a proxy buffers the response.
-The API key is read from $` + envAPIKey + ` only, never from argv.
+The API key is read from $` + envAPIKey + ` or the Driver Config, never from argv.
 `
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
@@ -324,9 +325,12 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		}
 	}
 
-	// a set-but-empty key reads as unset, so no Authorization header is sent
-	if v, ok := lookupEnv(envAPIKey); ok {
+	// a set-but-empty env key reads as unset, so it falls through to the file
+	// instead of blanking it; with neither set, no Authorization header is sent
+	if v, ok := lookupEnv(envAPIKey); ok && v != "" {
 		cfg.apiKey = v
+	} else {
+		cfg.apiKey = file.apiKey
 	}
 
 	prompt, err := promptFrom(positional, stdin)

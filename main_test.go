@@ -2772,6 +2772,91 @@ func TestParseArgsTimeoutIncludesDriverConfig(t *testing.T) {
 	}
 }
 
+// The key reaches the Driver from the environment or the Driver Config, never
+// from argv. A set-but-empty env value reads as unset, so it must fall through
+// to the file instead of blanking it.
+func TestParseArgsAPIKeyEnvAndDriverConfig(t *testing.T) {
+	configPath := writeDriverConfig(t, `{"api_key":"sk-from-file"}`)
+	empty := ""
+	set := "sk-from-env"
+
+	for _, tc := range []struct {
+		name       string
+		envAPIKey  *string
+		envConfig  string
+		wantAPIKey string
+	}{
+		{
+			name:       "env alone",
+			envAPIKey:  &set,
+			wantAPIKey: "sk-from-env",
+		},
+		{
+			name:       "config alone",
+			envConfig:  configPath,
+			wantAPIKey: "sk-from-file",
+		},
+		{
+			name:       "env beats config",
+			envAPIKey:  &set,
+			envConfig:  configPath,
+			wantAPIKey: "sk-from-env",
+		},
+		{
+			name:       "set-but-empty env does not blank the config",
+			envAPIKey:  &empty,
+			envConfig:  configPath,
+			wantAPIKey: "sk-from-file",
+		},
+		{
+			name:       "nothing set",
+			wantAPIKey: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// keyed by name: anything this case does not name (HOME included)
+			// reads as unset
+			lookup := func(name string) (string, bool) {
+				switch name {
+				case envAPIKey:
+					if tc.envAPIKey == nil {
+						return "", false
+					}
+					return *tc.envAPIKey, true
+				case envConfigPath:
+					return tc.envConfig, tc.envConfig != ""
+				default:
+					return "", false
+				}
+			}
+			cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, lookup)
+			if err != nil {
+				t.Fatalf("parseArgs returned error: %v", err)
+			}
+			if cfg.apiKey != tc.wantAPIKey {
+				t.Errorf("apiKey = %q, want %q", cfg.apiKey, tc.wantAPIKey)
+			}
+		})
+	}
+}
+
+// The two knobs that must never become flags: --api-key would put the secret in
+// argv where process listings and shell history expose it, and --config would
+// let a caller swap in a Driver Config the operator never approved. Both stay
+// env-only, so the flag package itself has to reject them.
+func TestParseArgsHasNoAPIKeyOrConfigFlag(t *testing.T) {
+	for _, name := range []string{"--api-key", "--config"} {
+		_, err := parseArgs([]string{"--model", "m", name, "sk-x", "p"}, nil, func(string) (string, bool) { return "", false })
+		if err == nil {
+			t.Fatalf("%s was accepted; it must stay env-only", name)
+		}
+		want := "flag provided but not defined: -" + strings.TrimPrefix(name, "--")
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s error = %v, want it to report %q", name, err, want)
+		}
+	}
+}
+
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	// --help output is the only place an operator learns the knob exists, so it
 	// must name the flag and the default actually in effect. The default is read
