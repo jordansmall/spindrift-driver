@@ -72,6 +72,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// instant the run began, the accumulated round-trip milliseconds, the summed
 	// token tally and the set of model ids that answered.
 	call := 0
+	// toolSeq counts Tool Calls across the whole run, so a server that sends no
+	// call id still gets pair keys that stay unique turn after turn.
+	toolSeq := 0
 	runStart := nowMS()
 	var apiMS int64
 	var totals tokenTotals
@@ -120,9 +123,38 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		// OpenAI convention: replay the assistant message verbatim (with its
 		// tool_calls), then one tool message per call.
 		messages = append(messages, assistant)
-		for _, call := range assistant.ToolCalls {
-			result := executeToolCall(call)
-			messages = append(messages, chatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
+		for _, tc := range assistant.ToolCalls {
+			toolSeq++
+			toolID := tc.ID
+			if toolID == "" {
+				toolID = fmt.Sprintf("call-%d", toolSeq)
+			}
+			plan := planToolCall(tc)
+			// tool_call goes out before the command starts: a command can run for
+			// minutes, and a reader has to see the call at the moment the Model made
+			// it. The pair stays adjacent, and both lines carry the message id of the
+			// Model call that asked for them.
+			_ = events.emit(event{
+				Kind:       "tool_call",
+				MessageID:  messageID,
+				ToolID:     toolID,
+				ToolName:   tc.Function.Name,
+				ToolInput:  plan.input,
+				ToolTarget: plan.target,
+			})
+			output := plan.run()
+			_ = events.emit(event{
+				Kind:       "tool_result",
+				MessageID:  messageID,
+				ToolID:     toolID,
+				ToolName:   tc.Function.Name,
+				ToolTarget: plan.target,
+				ToolOutput: output,
+				IsError:    toolResultIsError(output),
+			})
+			// The replayed Tool Result message is unchanged, idless calls included:
+			// the synthesised tool id belongs to the event stream, not to the Model.
+			messages = append(messages, chatMessage{Role: "tool", Content: output, ToolCallID: tc.ID})
 		}
 	}
 	turnLimit := fmt.Errorf("reached the turn limit of %d without a final answer", cfg.maxTurns)
@@ -155,20 +187,64 @@ func errorExit(events eventWriter, code int, err error) int {
 	return code
 }
 
-// executeToolCall runs one assistant tool call and returns its Tool Result
-// content. Unknown tools and unparseable arguments are ordinary results too,
-// so the loop can hand them back to the model instead of crashing.
-func executeToolCall(call toolCall) string {
+// toolPlan is one assistant tool call read before it runs. The tool_call event
+// has to carry the decoded arguments and the target while the command has yet to
+// start, so the read cannot live on the far side of execution.
+type toolPlan struct {
+	// input is the arguments JSON decoded to a value, or the raw arguments
+	// string when they are not valid JSON at all.
+	input any
+	// target is the input field that best identifies what the call acted on —
+	// the command for bash — and "" when the tool is unknown or the arguments
+	// cannot be parsed, which is the contract's way of saying "unknown".
+	target string
+	// run produces the exact Tool Result string that goes back into the
+	// conversation.
+	run func() string
+}
+
+// planToolCall parses one tool call without executing it. An unknown tool and
+// unparseable arguments are ordinary results rather than crashes, so the plan
+// answers with the very error text the Model has always received.
+func planToolCall(call toolCall) toolPlan {
+	input := decodeToolArguments(call.Function.Arguments)
 	if call.Function.Name != "bash" {
-		return fmt.Sprintf("error: unknown tool %q", call.Function.Name)
+		name := call.Function.Name
+		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: unknown tool %q", name) }}
 	}
 	var args struct {
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return fmt.Sprintf("error: cannot parse tool arguments: %v", err)
+		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: cannot parse tool arguments: %v", err) }}
 	}
-	return runBashTool(args.Command)
+	return toolPlan{input: input, target: args.Command, run: func() string { return runBashTool(args.Command) }}
+}
+
+// decodeToolArguments yields the value the tool_call event carries. Arguments
+// that are not valid JSON come back as the raw string instead of nothing: a
+// malformed call is the fact worth reporting, and its text is what the Model is
+// told failed.
+func decodeToolArguments(raw string) any {
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return raw
+	}
+	return v
+}
+
+// toolResultIsError is the is_error test: a Tool Result always closes with an
+// exit-code line, so anything that is not a clean 0 — a non-zero exit, a signal,
+// a timeout, or an error prefix that never ran a command — reads as the tool
+// having failed. A succeeding command leaves is_error false, which omitempty
+// keeps off the wire entirely.
+//
+// Gotcha: the clean-0 literal lives in runBashTool's success return, not here,
+// and this match is a suffix test on the last line it appends. Reword that
+// suffix there and every tool result flips to is_error true silently — the two
+// sites have to change together.
+func toolResultIsError(output string) bool {
+	return !strings.HasSuffix(output, "\nexit code: 0")
 }
 
 func main() {
