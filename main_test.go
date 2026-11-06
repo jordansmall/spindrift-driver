@@ -1998,6 +1998,32 @@ func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
 	}
 }
 
+// assertStreamFields pins the streaming declaration on a chat request body.
+// Every request the Driver makes is streaming, so there is no state in which
+// these keys may be absent.
+func assertStreamFields(t *testing.T, label string, raw []byte) {
+	t.Helper()
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("%s: body is not valid JSON: %v; body = %q", label, err, raw)
+	}
+	if v, ok := top["stream"]; !ok {
+		t.Errorf("%s missing key %q; body = %s", label, "stream", raw)
+	} else if v != true {
+		t.Errorf("%s stream = %v, want true", label, v)
+	}
+	opts, ok := top["stream_options"].(map[string]any)
+	if !ok {
+		t.Errorf("%s stream_options = %v, want an object", label, top["stream_options"])
+		return
+	}
+	if v, ok := opts["include_usage"]; !ok {
+		t.Errorf("%s stream_options missing key %q; body = %s", label, "include_usage", raw)
+	} else if v != true {
+		t.Errorf("%s stream_options.include_usage = %v, want true", label, v)
+	}
+}
+
 func TestChatRequestWireShape(t *testing.T) {
 	req := chatRequest{
 		Model: "m",
@@ -2005,7 +2031,9 @@ func TestChatRequestWireShape(t *testing.T) {
 			{Role: "assistant", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: "{\"command\":\"ls\"}"}}}},
 			{Role: "tool", Content: "file listing", ToolCallID: "call_1"},
 		},
-		Tools: []toolSpec{bashTool},
+		Tools:         []toolSpec{bashTool},
+		Stream:        true,
+		StreamOptions: streamOptions{IncludeUsage: true},
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -2016,11 +2044,26 @@ func TestChatRequestWireShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &top); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"model", "messages", "tools"} {
+	for _, key := range []string{"model", "messages", "tools", "stream", "stream_options"} {
 		if _, ok := top[key]; !ok {
 			t.Errorf("request JSON missing key %q; body = %s", key, raw)
 		}
 	}
+	assertStreamFields(t, "request JSON", raw)
+
+	// The same fields must be on the body the Driver actually POSTs, not just
+	// on a hand-built struct: sendChat owns the envelope.
+	drv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", drv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	sent := drv.requestBodies(t)
+	if len(sent) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(sent))
+	}
+	assertStreamFields(t, "sent request body", sent[0])
 
 	// exactly one function tool, named bash, with a command:string schema
 	tools, ok := top["tools"].([]any)
