@@ -8,6 +8,10 @@ A minimal LLM agent harness that runs as a **Driver** in the spindrift coordinat
 This program — the headless agent CLI that spindrift invokes: one-shot prompt in, final answer and session record out. One of the swappable Drivers beside `claude`, `opencode`, and `pi`.
 _Avoid_: harness (that's spindrift itself), agent CLI, backend
 
+**Driver Config**:
+The JSON file a run reads its settings from — the Model server's base URL, an optional API key, and `timeout`, the idle timeout on a chat attempt — and no other setting, the Model name and `--max-turns` being flags a file cannot supply. It lives at `$HOME/.config/spindrift-driver/config.json` unless `SPINDRIFT_CONFIG` names another path, which is used verbatim, and spindrift writes it through `envFiles`, its only run-time channel into a Box. For each field the file ranks below the flag and that field's environment variable and above the built-in default, and it is read strictly: a file missing when named, malformed JSON, an unknown field, or a value of the wrong type is a startup error, never a silent fallback, and nothing of the kind is ever read from the working directory or the Target repo.
+_Avoid_: dotfile, project config, settings file, argv
+
 **Model**:
 The LLM behind the OpenAI-compatible endpoint the Driver talks to. The thing that receives context and chooses tool calls or a final answer.
 _Avoid_: agent (a running Driver process, in spindrift's parlance), assistant, LLM

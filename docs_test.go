@@ -117,6 +117,40 @@ func TestContextDefinesEventAndPassLog(t *testing.T) {
 	}
 }
 
+// TestContextDefinesDriverConfig pins the glossary entry for the Driver Config.
+// The file is the only channel that carries a host-side setting into a running
+// Box, so an author who calls it a "project config" or a "dotfile" goes looking
+// for it in the working directory — where a Target repo could steer its own
+// repair — instead of under $HOME where only spindrift writes it.
+func TestContextDefinesDriverConfig(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the driver config vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "driver config")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Driver Config** glossary entry")
+	}
+	for _, want := range []string{"json", "base url", "api key", "idle timeout", "home", "spindrift_config", "envfiles", "target repo"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Driver Config** entry does not state that it is the JSON file of base_url, api_key and the timeout idle bound at $HOME/.config/spindrift-driver/config.json, overridable by SPINDRIFT_CONFIG, written through envFiles and never read out of the Target repo (missing %q)", want)
+		}
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Driver Config** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "dotfile", "project config", "settings file", "argv"); n < 2 {
+		t.Errorf("the **Driver Config** entry retires %d of the old words (dotfile, project config, settings file, argv); want at least 2", n)
+	}
+	// The ladder belongs inside the definition: three places can set one field,
+	// and a reader who cannot see which wins cannot predict what a run does.
+	if !near(entry, "below", "above", 200) {
+		t.Error("the **Driver Config** entry does not rank the file in one breath — what it sits below (the flag, the environment variable) and what it sits above (the built-in default)")
+	}
+}
+
 // readADRs loads every ADR from disk keyed by file name, mapping to its raw text:
 // which decision supersedes which is a property of the record set, not of a file
 // name somebody chose, so the directory is read rather than its names assumed.
