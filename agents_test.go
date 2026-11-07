@@ -1,0 +1,309 @@
+package main
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// writeAgentFile puts contents in a named file inside dir and returns the path,
+// the one thing both parseAgentFile and loadAgentDir are given.
+func writeAgentFile(t *testing.T, dir, name, contents string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write agent file %s: %v", path, err)
+	}
+	return path
+}
+
+func TestLoadAgentDirOrdersEntriesByFileName(t *testing.T) {
+	// Written in scrambled order so the result can only come out sorted if the
+	// loader sorts, and not because of the order the test happened to write in.
+	dir := t.TempDir()
+	for _, name := range []string{"zeta.md", "alpha.md", "mid.md"} {
+		writeAgentFile(t, dir, name, "---\nname: "+name[:len(name)-3]+"\nmodel: m-"+name+"\n---\nbody\n")
+	}
+
+	entries, err := loadAgentDir(dir)
+	if err != nil {
+		t.Fatalf("loadAgentDir(%q) error = %v, want nil", dir, err)
+	}
+	want := []string{"alpha", "mid", "zeta"}
+	if len(entries) != len(want) {
+		t.Fatalf("len(entries) = %d, want %d (%+v)", len(entries), len(want), entries)
+	}
+	for i, name := range want {
+		if entries[i].Name != name {
+			t.Errorf("entries[%d].Name = %q, want %q", i, entries[i].Name, name)
+		}
+	}
+}
+
+func TestLoadAgentDirSkipsNonMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFile(t, dir, "real.md", "---\nname: real\nmodel: m\n---\nbody\n")
+	writeAgentFile(t, dir, "README.txt", "not an agent\n")
+	writeAgentFile(t, dir, "notes.md.bak", "---\nname: bak\nmodel: m\n---\nbody\n")
+	// a directory whose name ends in .md is not an Agent File either
+	if err := os.Mkdir(filepath.Join(dir, "nested.md"), 0o755); err != nil {
+		t.Fatalf("mkdir nested.md: %v", err)
+	}
+
+	entries, err := loadAgentDir(dir)
+	if err != nil {
+		t.Fatalf("loadAgentDir(%q) error = %v, want nil", dir, err)
+	}
+	if len(entries) != 1 || entries[0].Name != "real" {
+		t.Fatalf("entries = %+v, want exactly the one .md entry", entries)
+	}
+}
+
+func TestParseAgentFileSingleEntry(t *testing.T) {
+	path := writeAgentFile(t, t.TempDir(), "reviewer.md", `---
+name: reviewer
+description: reads the diff and reports blockers
+model: gpt-4o-mini
+---
+You review diffs. Be brief.
+`)
+
+	entry, err := parseAgentFile(path)
+	if err != nil {
+		t.Fatalf("parseAgentFile(%q) error = %v, want nil", path, err)
+	}
+	if entry.Name != "reviewer" {
+		t.Errorf("Name = %q, want %q", entry.Name, "reviewer")
+	}
+	if entry.Description != "reads the diff and reports blockers" {
+		t.Errorf("Description = %q, want %q", entry.Description, "reads the diff and reports blockers")
+	}
+	if entry.Model != "gpt-4o-mini" {
+		t.Errorf("Model = %q, want %q", entry.Model, "gpt-4o-mini")
+	}
+	if entry.SystemPrompt != "You review diffs. Be brief." {
+		t.Errorf("SystemPrompt = %q, want %q", entry.SystemPrompt, "You review diffs. Be brief.")
+	}
+	if len(entry.Tools) != 0 || len(entry.Spawns) != 0 {
+		t.Errorf("Tools = %v, Spawns = %v, want both empty when the file says nothing", entry.Tools, entry.Spawns)
+	}
+}
+
+func TestParseAgentFileListFields(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		contents   string
+		wantTools  []string
+		wantSpawns []string
+	}{
+		{
+			name:       "inline comma",
+			contents:   "---\nname: a\nmodel: m\ntools: bash, read\nspawns: scout, worker\n---\nbody\n",
+			wantTools:  []string{"bash", "read"},
+			wantSpawns: []string{"scout", "worker"},
+		},
+		{
+			name:       "block list",
+			contents:   "---\nname: a\nmodel: m\ntools:\n- bash\n- read\nspawns:\n- scout\n---\nbody\n",
+			wantTools:  []string{"bash", "read"},
+			wantSpawns: []string{"scout"},
+		},
+		{
+			name:       "one of each form in one file",
+			contents:   "---\nname: a\nmodel: m\ntools: bash\nspawns:\n- scout\n- worker\n---\nbody\n",
+			wantTools:  []string{"bash"},
+			wantSpawns: []string{"scout", "worker"},
+		},
+		{
+			name:       "single inline item",
+			contents:   "---\nname: a\nmodel: m\ntools: read\n---\nbody\n",
+			wantTools:  []string{"read"},
+			wantSpawns: nil,
+		},
+		{
+			name:       "empty value reads as no items",
+			contents:   "---\nname: a\nmodel: m\ntools:\ndescription: just a scalar after it\n---\nbody\n",
+			wantTools:  nil,
+			wantSpawns: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			entry, err := parseAgentFile(path)
+			if err != nil {
+				t.Fatalf("parseAgentFile(%q) error = %v, want nil", path, err)
+			}
+			if !reflect.DeepEqual(entry.Tools, tc.wantTools) {
+				t.Errorf("Tools = %v, want %v", entry.Tools, tc.wantTools)
+			}
+			if !reflect.DeepEqual(entry.Spawns, tc.wantSpawns) {
+				t.Errorf("Spawns = %v, want %v", entry.Spawns, tc.wantSpawns)
+			}
+			if entry.SystemPrompt != "body" {
+				t.Errorf("SystemPrompt = %q, want %q", entry.SystemPrompt, "body")
+			}
+		})
+	}
+}
+
+func TestParseAgentFileMissingRequiredField(t *testing.T) {
+	for _, tc := range []struct{ name, contents, want string }{
+		{"no name", "---\nmodel: gpt-4o-mini\n---\nbody\n", "name"},
+		{"name with no value", "---\nname:\nmodel: gpt-4o-mini\n---\nbody\n", "name"},
+		{"no model", "---\nname: reviewer\n---\nbody\n", "model"},
+		{"model with no value", "---\nname: reviewer\nmodel: \n---\nbody\n", "model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			entry, err := parseAgentFile(path)
+			assertErrMessage(t, err, path, "is required", tc.want)
+			if !reflect.DeepEqual(entry, agentEntry{}) {
+				t.Errorf("entry = %+v, want zero value on error", entry)
+			}
+		})
+	}
+}
+
+func TestParseAgentFileFrontmatterFence(t *testing.T) {
+	for _, tc := range []struct{ name, contents, want string }{
+		{"unclosed fence", "---\nname: a\nmodel: m\nbody without a closing fence\n", "unclosed"},
+		{"no fence at all", "name: a\nmodel: m\njust prose\n", "missing opening"},
+		{"empty file", "", "missing opening"},
+		{"leading blank line is not a fence", "\n---\nname: a\nmodel: m\n---\nbody\n", "missing opening"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			_, err := parseAgentFile(path)
+			assertErrMessage(t, err, path, "frontmatter")
+			if errors.Is(err, errNoAgentDir) {
+				t.Errorf("errors.Is(err, errNoAgentDir) = true, want false; err = %v", err)
+			}
+		})
+	}
+}
+
+func TestParseAgentFileUnknownField(t *testing.T) {
+	for _, tc := range []struct{ name, contents, want string }{
+		{"stray key", "---\nname: a\nmodel: m\ncolor: blue\n---\nbody\n", "color"},
+		{"near-miss typo", "---\nname: a\nmodel: m\ndecription: nope\n---\nbody\n", "decription"},
+		{"temperature is not an agent field", "---\nname: a\nmodel: m\ntemperature: 0.2\n---\nbody\n", "temperature"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			_, err := parseAgentFile(path)
+			assertErrMessage(t, err, path, "unknown field", tc.want)
+		})
+	}
+}
+
+func TestParseAgentFileUnknownFieldReportsFirstInFileOrder(t *testing.T) {
+	// Lines are scanned in file order, so the same broken file always names the
+	// same key instead of complaining about whichever one came last.
+	path := writeAgentFile(t, t.TempDir(), "a.md", "---\nname: a\nzulu: 1\nalpha: 2\nmodel: m\n---\nbody\n")
+
+	_, err := parseAgentFile(path)
+	assertErrMessage(t, err, path, "unknown field", `"zulu"`)
+	if strings.Contains(err.Error(), "alpha") {
+		t.Errorf("error %q names a key other than the first in file order", err.Error())
+	}
+}
+
+func TestParseAgentFileMalformedFieldLine(t *testing.T) {
+	for _, tc := range []struct{ name, contents, want string }{
+		{"line with no colon", "---\nname: a\nmodel m\n---\nbody\n", "malformed frontmatter line"},
+		{"list items under a scalar", "---\nname:\n- a\nmodel: m\n---\nbody\n", `field "name" does not accept a list`},
+		{"list item before any field", "---\n- a\nname: b\nmodel: m\n---\nbody\n", "list item with no field"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			_, err := parseAgentFile(path)
+			assertErrMessage(t, err, path, tc.want)
+		})
+	}
+}
+
+func TestLoadAgentDirMalformedFileIsNamed(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFile(t, dir, "good.md", "---\nname: good\nmodel: m\n---\nbody\n")
+	bad := writeAgentFile(t, dir, "bad.md", "---\nname: bad\n---\nbody\n")
+
+	entries, err := loadAgentDir(dir)
+	assertErrMessage(t, err, bad, "is required", "model")
+	if strings.Contains(err.Error(), "good.md") {
+		t.Errorf("error %q names a file that is not the broken one", err.Error())
+	}
+	if entries != nil {
+		t.Errorf("entries = %+v, want nil on error", entries)
+	}
+	if errors.Is(err, errNoAgentDir) {
+		t.Errorf("errors.Is(err, errNoAgentDir) = true, want false; err = %v", err)
+	}
+}
+
+// TestLoadAgentDirMissingDirIsDistinct: an absent directory is the sentinel, and
+// an empty one is not — "no Agent Files because there is nothing there to read"
+// has to stay separable from "the directory is broken" for the caller.
+func TestLoadAgentDirMissingDirIsDistinct(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "agents")
+
+	entries, err := loadAgentDir(missing)
+	assertErrMessage(t, err, missing, "directory not found")
+	if !errors.Is(err, errNoAgentDir) {
+		t.Errorf("errors.Is(err, errNoAgentDir) = false, want true; err = %v", err)
+	}
+	if entries != nil {
+		t.Errorf("entries = %+v, want nil", entries)
+	}
+
+	empty, err := loadAgentDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("loadAgentDir on an existing empty dir error = %v, want nil", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("entries from an existing empty dir = %+v, want none", empty)
+	}
+}
+
+func TestParseAgentFileBodyIsVerbatim(t *testing.T) {
+	path := writeAgentFile(t, t.TempDir(), "a.md", "---\nname: a\nmodel: m\n---\n\nFirst line.\n\n  indented\n\nLast.\n\n")
+
+	entry, err := parseAgentFile(path)
+	if err != nil {
+		t.Fatalf("parseAgentFile(%q) error = %v, want nil", path, err)
+	}
+	if want := "First line.\n\n  indented\n\nLast."; entry.SystemPrompt != want {
+		t.Errorf("SystemPrompt = %q, want %q", entry.SystemPrompt, want)
+	}
+}
+
+func TestParseAgentFileDescriptionKeepsColons(t *testing.T) {
+	path := writeAgentFile(t, t.TempDir(), "a.md", "---\nname: a\ndescription: reads: the diff, then reports\nmodel: m\n---\nbody\n")
+
+	entry, err := parseAgentFile(path)
+	if err != nil {
+		t.Fatalf("parseAgentFile(%q) error = %v, want nil", path, err)
+	}
+	if want := "reads: the diff, then reports"; entry.Description != want {
+		t.Errorf("Description = %q, want %q", entry.Description, want)
+	}
+}
+
+func TestParseAgentFileCRLFLines(t *testing.T) {
+	path := writeAgentFile(t, t.TempDir(), "a.md", "---\r\nname: a\r\nmodel: m\r\n---\r\nbody\r\n")
+
+	entry, err := parseAgentFile(path)
+	if err != nil {
+		t.Fatalf("parseAgentFile(%q) error = %v, want nil", path, err)
+	}
+	if entry.Name != "a" || entry.SystemPrompt != "body" {
+		t.Errorf("entry = %+v, want the CRLF file read as LF", entry)
+	}
+}
