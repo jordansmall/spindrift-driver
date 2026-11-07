@@ -42,6 +42,11 @@ type config struct {
 	// the home-relative default, or "" when neither resolves — which is "no
 	// Agent Files", never an error.
 	agentsDir string
+	// agents is the roster loaded from agentsDir at startup, empty when there is
+	// none. tools is what this run offers the Model, derived from that roster by
+	// offeredTools so the offer and the roster cannot disagree later.
+	agents []agentEntry
+	tools  []toolSpec
 }
 
 // usage is a var, not a const: the --timeout default is interpolated from
@@ -348,6 +353,21 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if file.agentsDir != "" {
 		cfg.agentsDir = file.agentsDir
 	}
+	// An agents_dir the Driver Config names is a directory the operator expects
+	// to be in use, so its absence is fatal exactly as a $SPINDRIFT_CONFIG-named
+	// file's is; the home-relative default is only where Agent Files would go, so
+	// not finding it reads as "no Agent Files". A file that exists and does not
+	// parse is fatal either way. loadAgentDir already names the offending
+	// directory or file in every message it returns, so a wrap here would add
+	// nothing but a repeated path.
+	if cfg.agentsDir != "" {
+		entries, err := loadAgentDir(cfg.agentsDir)
+		if err != nil && (file.agentsDir != "" || !errors.Is(err, errNoAgentDir)) {
+			return config{}, err
+		}
+		cfg.agents = entries
+	}
+	cfg.tools = offeredTools(cfg.agents)
 
 	prompt, err := promptFrom(positional, stdin)
 	if err != nil {
@@ -553,6 +573,25 @@ var bashTool = toolSpec{
 				"command": map[string]any{"type": "string", "description": "The shell command to run."},
 			},
 			"required": []string{"command"},
+		},
+	},
+}
+
+// subagentTool delegates one task to a subagent chosen by name; offeredTools
+// puts it in the offer only when a roster exists. The description names no
+// agents on purpose — issue #26 owns the agent-listing wording.
+var subagentTool = toolSpec{
+	Type: "function",
+	Function: functionSpec{
+		Name:        "subagent",
+		Description: "Delegate one task to a named subagent and return that subagent's final answer.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"agent": map[string]any{"type": "string", "description": "The name of the subagent to delegate to."},
+				"task":  map[string]any{"type": "string", "description": "The task for the subagent to carry out."},
+			},
+			"required": []string{"agent", "task"},
 		},
 	},
 }
@@ -909,10 +948,16 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
+	// A config assembled anywhere but parseArgs has no offer of its own, and the
+	// bash-only offer is what predates the tool list, so it stays the default.
+	tools := cfg.tools
+	if len(tools) == 0 {
+		tools = []toolSpec{bashTool}
+	}
 	reqBody, err := json.Marshal(chatRequest{
 		Model:         cfg.model,
 		Messages:      messages,
-		Tools:         []toolSpec{bashTool},
+		Tools:         tools,
 		Stream:        true,
 		StreamOptions: streamOptions{IncludeUsage: true},
 	})

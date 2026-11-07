@@ -203,6 +203,24 @@ func TestParseAgentFileUnknownField(t *testing.T) {
 	}
 }
 
+func TestParseAgentFileFieldGivenTwice(t *testing.T) {
+	// A key the file does not know is fatal, so a key that overwrites one of its
+	// own kind is the same mistake in the other direction: last-one-wins would
+	// run the model the operator did not mean to name.
+	for _, tc := range []struct{ name, contents, want string }{
+		{"model twice", "---\nname: a\nmodel: m\nmodel: m2\n---\nbody\n", `"model"`},
+		{"tools twice", "---\nname: a\nmodel: m\ntools: bash\ntools: read\n---\nbody\n", `"tools"`},
+		{"name twice", "---\nname: a\nname: b\nmodel: m\n---\nbody\n", `"name"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeAgentFile(t, t.TempDir(), "a.md", tc.contents)
+
+			_, err := parseAgentFile(path)
+			assertErrMessage(t, err, path, "given twice", tc.want)
+		})
+	}
+}
+
 func TestParseAgentFileUnknownFieldReportsFirstInFileOrder(t *testing.T) {
 	// Lines are scanned in file order, so the same broken file always names the
 	// same key instead of complaining about whichever one came last.
@@ -239,6 +257,26 @@ func TestLoadAgentDirMalformedFileIsNamed(t *testing.T) {
 	assertErrMessage(t, err, bad, "is required", "model")
 	if strings.Contains(err.Error(), "good.md") {
 		t.Errorf("error %q names a file that is not the broken one", err.Error())
+	}
+	if entries != nil {
+		t.Errorf("entries = %+v, want nil on error", entries)
+	}
+	if errors.Is(err, errNoAgentDir) {
+		t.Errorf("errors.Is(err, errNoAgentDir) = true, want false; err = %v", err)
+	}
+}
+
+func TestLoadAgentDirDuplicateNameNamesBothFiles(t *testing.T) {
+	// findAgent answers with the first entry it matches, so a roster that lets
+	// two files claim one name would run whichever sorts first and never say so.
+	dir := t.TempDir()
+	first := writeAgentFile(t, dir, "a-reviewer.md", "---\nname: reviewer\nmodel: m-a\n---\nbody\n")
+	second := writeAgentFile(t, dir, "b-reviewer.md", "---\nname: reviewer\nmodel: m-b\n---\nbody\n")
+
+	entries, err := loadAgentDir(dir)
+	assertErrMessage(t, err, first, `"reviewer"`, "agent dir", "defined by both")
+	if !strings.Contains(err.Error(), second) {
+		t.Errorf("error %q does not name the second file %q", err.Error(), second)
 	}
 	if entries != nil {
 		t.Errorf("entries = %+v, want nil on error", entries)
@@ -380,5 +418,37 @@ func TestParseAgentFileCRLFLines(t *testing.T) {
 	}
 	if entry.Name != "a" || entry.SystemPrompt != "body" {
 		t.Errorf("entry = %+v, want the CRLF file read as LF", entry)
+	}
+}
+
+// offeredNames reduces a tool list to what a failure message can show without
+// dumping four structs.
+func offeredNames(tools []toolSpec) []string {
+	var names []string
+	for _, tool := range tools {
+		names = append(names, tool.Function.Name)
+	}
+	return names
+}
+
+// TestOfferedTools: the Subagent Tool exists in the offer only when there is a
+// roster to delegate to — an empty roster must never offer a call that has no
+// subagent to answer it.
+func TestOfferedTools(t *testing.T) {
+	if got := offeredNames(offeredTools(nil)); !reflect.DeepEqual(got, []string{"bash"}) {
+		t.Errorf("offeredTools(nil) = %v, want [bash]", got)
+	}
+	if got := offeredNames(offeredTools([]agentEntry{})); !reflect.DeepEqual(got, []string{"bash"}) {
+		t.Errorf("offeredTools(empty slice) = %v, want [bash]", got)
+	}
+	roster := []agentEntry{{Name: "reviewer", Model: "m-r"}}
+	if got := offeredNames(offeredTools(roster)); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
+		t.Errorf("offeredTools(roster) = %v, want [bash subagent]", got)
+	}
+	// The entries are the package-level specs themselves, not copies that can
+	// drift from the shape the Model is taught. toolSpec carries a map, so
+	// DeepEqual is the only comparison available.
+	if got := offeredTools(roster); !reflect.DeepEqual(got, []toolSpec{bashTool, subagentTool}) {
+		t.Errorf("offeredTools(roster) = %+v, want [bashTool subagentTool]", got)
 	}
 }
