@@ -186,15 +186,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				ToolTarget: plan.target,
 			})
 			output := plan.run()
-			_ = events.emit(event{
-				Kind:       "tool_result",
-				MessageID:  messageID,
-				ToolID:     toolID,
-				ToolName:   tc.Function.Name,
-				ToolTarget: plan.target,
-				ToolOutput: output,
-				IsError:    toolResultIsError(output),
-			})
+			_ = events.emit(toolResultEvent(messageID, toolID, tc.Function.Name, plan, output))
 			// The replayed Tool Result message is unchanged, idless calls included:
 			// the synthesised tool id belongs to the event stream, not to the Model.
 			messages = append(messages, chatMessage{Role: "tool", Content: output, ToolCallID: tc.ID})
@@ -241,9 +233,37 @@ type toolPlan struct {
 	// the command for bash — and "" when the tool is unknown or the arguments
 	// cannot be parsed, which is the contract's way of saying "unknown".
 	target string
+	// subagent is the agent a Subagent Tool call acted on, and "" for every other
+	// tool, so the subagent key stays off every ordinary tool_result line.
+	subagent string
+	// isError is the rule that decides is_error for this plan's output; nil means
+	// toolResultIsError, so only a tool whose result is not command output — a
+	// Subagent Tool Result is the child's answer — has to state one.
+	isError func(output string) bool
 	// run produces the exact Tool Result string that goes back into the
 	// conversation.
 	run func() string
+}
+
+// toolResultEvent is the tool_result half of the pair. The plan brings its own
+// is_error rule because the exit-code suffix rule describes a command and
+// nothing else: a result with no exit-code line — a subagent's answer — would
+// otherwise be reported as a failure on every success.
+func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output string) event {
+	isError := plan.isError
+	if isError == nil {
+		isError = toolResultIsError
+	}
+	return event{
+		Kind:       "tool_result",
+		MessageID:  messageID,
+		ToolID:     toolID,
+		ToolName:   toolName,
+		ToolTarget: plan.target,
+		ToolOutput: output,
+		IsError:    isError(output),
+		Subagent:   plan.subagent,
+	}
 }
 
 // planToolCall parses one tool call without executing it. An unknown tool and
@@ -284,8 +304,10 @@ func decodeToolArguments(raw string) any {
 //
 // Gotcha: the clean-0 literal lives in runBashTool's success return, not here,
 // and this match is a suffix test on the last line it appends. Reword that
-// suffix there and every tool result flips to is_error true silently — the two
-// sites have to change together.
+// suffix there and every tool still planned by this rule flips to is_error true
+// silently — the two sites have to change together. toolResultEvent is the
+// third: it is where a plan opts out of this rule, so a new tool that needs a
+// different verdict sets toolPlan.isError rather than bending the suffix here.
 func toolResultIsError(output string) bool {
 	return !strings.HasSuffix(output, "\nexit code: 0")
 }

@@ -180,7 +180,9 @@ func TestEventWireFieldNamesAreSnakeCase(t *testing.T) {
 	pinClock(t, 1700000000000)
 
 	var buf bytes.Buffer
-	err := (eventWriter{w: &buf}).emit(event{
+
+	ew := eventWriter{w: &buf}
+	if err := ew.emit(event{
 		Kind:       "tool_call",
 		Role:       "assistant",
 		MessageID:  "msg-1",
@@ -188,18 +190,48 @@ func TestEventWireFieldNamesAreSnakeCase(t *testing.T) {
 		ToolName:   "bash",
 		ToolInput:  map[string]any{"command": "ls"},
 		ToolTarget: "ls",
-	})
-	if err != nil {
-		t.Fatalf("emit: %v", err)
+	}); err != nil {
+		t.Fatalf("emit tool_call: %v", err)
 	}
-	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
-	for _, name := range []string{"kind", "role", "message_id", "timestamp", "tool_id", "tool_name", "tool_input", "tool_target"} {
-		if _, ok := got[name]; !ok {
-			t.Errorf("wire line %q has no %q key", buf.String(), name)
+	// subagent is pinned on a tool_result line because that is the kind the
+	// contract names the agent on (#17); the tool_call line above is the
+	// emission that must not grow the key.
+	if err := ew.emit(event{
+		Kind:       "tool_result",
+		MessageID:  "msg-1",
+		ToolID:     "call-2",
+		ToolName:   "subagent",
+		ToolTarget: "reviewer",
+		ToolOutput: "the child's answer",
+		Subagent:   "reviewer",
+	}); err != nil {
+		t.Fatalf("emit tool_result: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2: %q", len(lines), buf.String())
+	}
+	callEv, resultEv := decodeLine(t, lines[0]), decodeLine(t, lines[1])
+	for _, pin := range []struct {
+		ev   map[string]any
+		want []string
+	}{
+		{callEv, []string{"kind", "role", "message_id", "timestamp", "tool_id", "tool_name", "tool_input", "tool_target"}},
+		{resultEv, []string{"kind", "message_id", "timestamp", "tool_id", "tool_name", "tool_target", "tool_output", "subagent"}},
+	} {
+		for _, name := range pin.want {
+			if _, ok := pin.ev[name]; !ok {
+				t.Errorf("wire line %q has no %q key", buf.String(), name)
+			}
 		}
 	}
-	if _, ok := got["tool_input"].(map[string]any); !ok {
-		t.Errorf("tool_input = %#v, want a JSON object, not a string", got["tool_input"])
+	if _, ok := callEv["tool_input"].(map[string]any); !ok {
+		t.Errorf("tool_input = %#v, want a JSON object, not a string", callEv["tool_input"])
+	}
+	// omitempty owes the other half: an emission that names no agent must not
+	// gain the key at all, so its absence keeps meaning "not a delegation".
+	if _, ok := callEv["subagent"]; ok {
+		t.Errorf("a tool_call that delegates to nobody states subagent = %v: %v", callEv["subagent"], callEv)
 	}
 }
 
