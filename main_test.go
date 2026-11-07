@@ -3340,6 +3340,210 @@ func TestRunOffersSubagentToolWithAgentFiles(t *testing.T) {
 	}
 }
 
+// agentFixture writes one Agent File into a fresh directory and returns the path
+// of a Driver Config naming that directory: the roster a --agent test resolves
+// its entry against.
+func agentFixture(t *testing.T, name, model, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeAgentFile(t, dir, name+".md", "---\nname: "+name+"\nmodel: "+model+"\n---\n"+body+"\n")
+	return writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+}
+
+// TestParseArgsAgentSelectsRosterEntry: --agent is what makes a run a child, so
+// all three facts the entry carries land on the config — the name it was
+// selected by, its model id and its body as the system prompt.
+func TestParseArgsAgentSelectsRosterEntry(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	cfg, err := parseArgs([]string{"--agent", "reviewer", "p"}, nil, driverConfigEnv(cfgPath))
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.agent != "reviewer" {
+		t.Errorf("agent = %q, want %q", cfg.agent, "reviewer")
+	}
+	if cfg.model != "m-r" {
+		t.Errorf("model = %q, want the entry's model id %q", cfg.model, "m-r")
+	}
+	if cfg.systemPrompt != "review things" {
+		t.Errorf("systemPrompt = %q, want the Agent File body %q", cfg.systemPrompt, "review things")
+	}
+}
+
+// TestParseArgsModelFlagBeatsAgentEntry keeps the documented ladder intact: an
+// explicit --model still outranks the entry, while the entry keeps supplying the
+// system prompt it exists for.
+func TestParseArgsModelFlagBeatsAgentEntry(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	cfg, err := parseArgs([]string{"--agent", "reviewer", "--model", "m-flag", "p"}, nil, driverConfigEnv(cfgPath))
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.model != "m-flag" {
+		t.Errorf("model = %q, want the flag value %q to win over the entry", cfg.model, "m-flag")
+	}
+	if cfg.systemPrompt != "review things" {
+		t.Errorf("systemPrompt = %q, want the entry body even when --model wins", cfg.systemPrompt)
+	}
+}
+
+// TestParseArgsModelRequiredStillFires guards the move of the --model check to
+// after the roster resolves (an entry can satisfy it): with neither flag the
+// message is the one every existing test pins, word for word.
+func TestParseArgsModelRequiredStillFires(t *testing.T) {
+	_, err := parseArgs([]string{"p"}, nil, func(string) (string, bool) { return "", false })
+	if err == nil || err.Error() != "--model is required" {
+		t.Errorf("err = %v, want exactly %q", err, "--model is required")
+	}
+}
+
+// TestParseArgsUnknownAgent: a name the roster does not contain is a startup
+// error naming it. The available names are deliberately not listed — issue #26
+// owns the roster-policy wording.
+func TestParseArgsUnknownAgent(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	_, err := parseArgs([]string{"--agent", "ghost", "--model", "m", "p"}, nil, driverConfigEnv(cfgPath))
+	if err == nil {
+		t.Fatal("parseArgs accepted an agent the roster does not name")
+	}
+	if want := `unknown agent "ghost"`; err.Error() != want {
+		t.Errorf("err = %v, want exactly %q", err, want)
+	}
+}
+
+// TestRunUnknownAgentExitsTwo: the unknown name travels the same startup-error
+// path as every other parseArgs error — exit 2, one error event, and the Model
+// is never contacted.
+func TestRunUnknownAgentExitsTwo(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--agent", "ghost", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); got != `unknown agent "ghost"` {
+		t.Errorf("error event text = %q, want %q", got, `unknown agent "ghost"`)
+	}
+	if n := len(srv.requestBodies(t)); n != 0 {
+		t.Errorf("POSTs = %d, want 0: a startup error never reaches the server", n)
+	}
+}
+
+// TestRunAgentModelPostedVerbatim: the entry's model id is the request's model
+// id. An id carrying a vendor prefix, a "{"-free colon and an effort suffix is
+// what a router actually names, and nothing in the Driver splits or normalises
+// it — asserted on the POST body, because a server that omits a model from its
+// reply would mask any mangle in the usage event.
+func TestRunAgentModelPostedVerbatim(t *testing.T) {
+	const modelID = "vendor/model-x:2025-01-01-effort-high"
+	cfgPath := agentFixture(t, "thinker", modelID, "think hard")
+	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--agent", "thinker", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	sent := srv.requestBodies(t)
+	if len(sent) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(sent))
+	}
+	var body struct {
+		Model    string            `json:"model"`
+		Messages []recordedMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(sent[0], &body); err != nil {
+		t.Fatalf("POST body is not valid JSON: %v; body = %q", err, sent[0])
+	}
+	if body.Model != modelID {
+		t.Errorf("posted model = %q, want the entry id verbatim %q", body.Model, modelID)
+	}
+	if len(body.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(body.Messages))
+	}
+	if body.Messages[0].Role != "system" || body.Messages[0].Content != "think hard" {
+		t.Errorf("system message = %+v, want the Agent File body as the system prompt", body.Messages[0])
+	}
+}
+
+// TestRunChildNotOfferedSubagentTool: a run selected by --agent is a child, and
+// a child holding the Subagent Tool could spawn without bound. The top-level
+// case rides along so the suppression cannot leak upward out of the child.
+func TestRunChildNotOfferedSubagentTool(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	for _, tc := range []struct {
+		name  string
+		agent []string
+		want  []string
+	}{
+		{name: "child", agent: []string{"--agent", "reviewer"}, want: []string{"bash"}},
+		{name: "top level keeps the tool", agent: nil, want: []string{"bash", "subagent"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			args := append([]string{"p"}, tc.agent...)
+			args = append(args, "--model", "m", "--base-url", srv.srv.URL)
+			var stdout, stderr bytes.Buffer
+			code := run(args, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+			}
+			sent := srv.requestBodies(t)
+			if len(sent) != 1 {
+				t.Fatalf("POSTs = %d, want 1", len(sent))
+			}
+			if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("offered tools = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunSystemPromptFallsBackToDefault: every caller of run that never went
+// through parseArgs hands over a config with an empty systemPrompt field, and
+// those runs have always started from the package prompt. The fallback keeps
+// them byte-identical.
+func TestRunSystemPromptFallsBackToDefault(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 1 || len(msgs[0]) != 2 {
+		t.Fatalf("messages = %+v, want one POST of two messages", msgs)
+	}
+	if msgs[0][0].Role != "system" || msgs[0][0].Content != systemPrompt {
+		t.Errorf("system message = %+v, want the package default prompt %q", msgs[0][0], systemPrompt)
+	}
+}
+
+// TestUsageDocumentsAgentFlag: --help is the only manual the Driver ships, so it
+// has to carry the flag in the copyable usage line and say what the entry
+// supplies — an operator who cannot tell that from -h passes --model by habit
+// and wonders why the prompt changed.
+func TestUsageDocumentsAgentFlag(t *testing.T) {
+	if !strings.Contains(usage, "--agent") {
+		t.Errorf("usage does not document the --agent flag:\n%s", usage)
+	}
+	if !regexp.MustCompile(`usage: spindrift-driver.*\[--agent <name>\]`).MatchString(usage) {
+		t.Errorf("usage line does not list [--agent <name>]:\n%s", usage)
+	}
+	if !strings.Contains(usage, "Agent File") {
+		t.Errorf("usage does not say --agent selects an Agent File entry:\n%s", usage)
+	}
+	if !regexp.MustCompile(`(?s)--agent <name>[^.]*model`).MatchString(usage) {
+		t.Errorf("usage does not say --agent supplies the entry's model id:\n%s", usage)
+	}
+	if !regexp.MustCompile(`(?s)--agent <name>[^.]*system prompt`).MatchString(usage) {
+		t.Errorf("usage does not say the Agent File body is the system prompt:\n%s", usage)
+	}
+	if !regexp.MustCompile(`(?s)--agent.*never offered\s+the Subagent Tool`).MatchString(usage) {
+		t.Errorf("usage does not say a run selected by --agent is never offered the Subagent Tool:\n%s", usage)
+	}
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }

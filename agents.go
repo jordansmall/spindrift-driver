@@ -193,6 +193,18 @@ func offeredTools(agents []agentEntry) []toolSpec {
 	return []toolSpec{bashTool, subagentTool}
 }
 
+// findAgent resolves a --agent name against the roster. The match is exact:
+// a prefix or case-folded lookup would let a typo in argv run a different
+// subagent than the operator named, silently.
+func findAgent(agents []agentEntry, name string) (agentEntry, bool) {
+	for _, entry := range agents {
+		if entry.Name == name {
+			return entry, true
+		}
+	}
+	return agentEntry{}, false
+}
+
 // splitInlineList reads the comma-separated form of a list field. An empty
 // value is no items at all — the block form below may still fill the field.
 func splitInlineList(value string) []string {
