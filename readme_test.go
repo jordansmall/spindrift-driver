@@ -595,6 +595,14 @@ func TestReadmeDocumentsSubagents(t *testing.T) {
 	if !near(sec, "inherit", "hook manifest", 240) {
 		t.Error("the Subagents section does not say the child inherits the Hook Manifest, and so the parent's Guard Hooks")
 	}
+	// What does not cross the boundary: the parent's own flags stay with it, so a
+	// run aimed at an endpoint by --base-url must not be described as handing that
+	// endpoint to a child.
+	for _, flag := range []string{"--base-url", "--timeout", "--max-turns"} {
+		if !near(sec, flag, "not passed on", 400) {
+			t.Errorf("the Subagents section does not say %s is not passed on to the child", flag)
+		}
+	}
 	// Relay and accounting: a host decoding the parent's Pass log sees the child's
 	// events attributed, and the parent's totals include the delegated spend.
 	for _, want := range []string{"role", "in_subagent"} {
