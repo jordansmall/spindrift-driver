@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"slices"
 	"sort"
 )
@@ -15,7 +18,8 @@ import (
 // rewrites is read and recorded but not enforced until issue #22 owns the
 // rewrite path and the post-call summary hook — the same precedent this branch
 // already sets for an Agent File's tools and spawns, which are parsed, recorded,
-// and only later acted on. Nothing in this file executes a hook.
+// and only later acted on. guardCommand below does execute the pre-call chain,
+// but only its deny verdict acts.
 type guardHook struct {
 	path     string
 	tools    []string
@@ -163,6 +167,118 @@ func (h guardHook) appliesTo(protocolName string) bool {
 		return true
 	}
 	return slices.Contains(h.tools, protocolName)
+}
+
+// hookToolName is the Driver's tool name in the hook protocol's vocabulary, the
+// one the manifest is written in; #22 extends this map when the Edit and Write
+// Tools land.
+func hookToolName(driverTool string) string {
+	if driverTool == "bash" {
+		return "Bash"
+	}
+	return driverTool
+}
+
+// hookRequest and hookToolInput are the pre-call payload a hook reads on stdin,
+// in the protocol's tool vocabulary: {"tool_name":"Bash","tool_input":{"command":…}}.
+type hookRequest struct {
+	ToolName  string        `json:"tool_name"`
+	ToolInput hookToolInput `json:"tool_input"`
+}
+
+type hookToolInput struct {
+	Command string `json:"command"`
+}
+
+// hookResponse is the part of a hook's stdout this step reads. updatedInput —
+// the rewrite path — and updatedToolOutput belong to #22, which owns rewriting
+// and the post-call summary hook, so a hook that supplies them changes nothing
+// here.
+type hookResponse struct {
+	HookSpecificOutput struct {
+		PermissionDecision       string `json:"permissionDecision"`
+		PermissionDecisionReason string `json:"permissionDecisionReason"`
+	} `json:"hookSpecificOutput"`
+}
+
+// guardCommand runs command through the pre-call Guard Hooks in manifest order
+// and returns the refusal to hand back as the Tool Result, or "" when every
+// applicable hook let the call through. The first refusal stops the chain: a
+// command already refused has no reason to be asked of a second hook.
+//
+// Only a literal "deny" decision refuses. Everything else — "allow", "ask", no
+// decision, no hookSpecificOutput, and stdout that is empty or all whitespace,
+// which is a hook's silence rather than a verdict — proceeds, because a hook
+// that did not say no did not say no. The remaining silences are not verdicts
+// either yet: non-zero exit, unparsable stdout, a script that cannot be started,
+// and a hook that hangs are slice 4b's fail-closed cases, marked at each site
+// below.
+func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) string {
+	if len(hooks) == 0 {
+		// An unguarded run pays nothing: no marshalling, no fork, no wait.
+		return ""
+	}
+	protocolName := hookToolName(driverTool)
+	var request bytes.Buffer
+	// Encoder rather than Marshal, for events.go's reason: markup in a command
+	// must reach the hook literally instead of as \u003c escapes, and writing into
+	// a bytes.Buffer cannot fail — Encode's trailing newline is the encoder's
+	// doing, not part of the payload.
+	enc := json.NewEncoder(&request)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}})
+	payload := bytes.TrimSuffix(request.Bytes(), []byte("\n"))
+
+	for _, hook := range hooks {
+		if !hook.appliesTo(protocolName) {
+			continue
+		}
+		cmd := exec.Command(hook.path)
+		// The script is what the host baked — shebang, mode bits and all — so it is
+		// exec'd directly. A shell in between would add a second quoting layer over
+		// text the hook is handed as data, and a manifest path is not a command.
+		cmd.Stdin = bytes.NewReader(payload)
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		// A hook's own noise goes to the operator's progress copy, never to the wire:
+		// stdout carries only event lines, so a stray byte from a hook would be a
+		// malformed event. Hence the buffer for stdout — the child is never handed
+		// the parent's stdout fd — and nil here meaning there is no copy to write to,
+		// so the noise is dropped rather than inherited.
+		if stderr == nil {
+			cmd.Stderr = io.Discard
+		} else {
+			cmd.Stderr = stderr
+		}
+		// No cmd.Dir and no cmd.Env, following runBashTool: the hook judges the
+		// command in the same cwd and environment the command is about to run in.
+		if err := cmd.Start(); err != nil {
+			// 4b: a hook that never ran fails closed here. Until then it has no say.
+			continue
+		}
+		// 4b reads the exit status and enforces a timeout here; until then the
+		// status is not consulted, so it is deliberately not even kept.
+		_ = cmd.Wait()
+		if len(bytes.TrimSpace(stdout.Bytes())) == 0 {
+			continue
+		}
+		var response hookResponse
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			// 4b: unparsable stdout fails closed here.
+			continue
+		}
+		if response.HookSpecificOutput.PermissionDecision != "deny" {
+			continue
+		}
+		reason := response.HookSpecificOutput.PermissionDecisionReason
+		if reason == "" {
+			reason = "the hook gave no reason"
+		}
+		// The "error: " prefix is what turns this string into an error Tool Result
+		// downstream, and the path is how the operator finds the script to ask why.
+		return fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
+	}
+	return ""
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

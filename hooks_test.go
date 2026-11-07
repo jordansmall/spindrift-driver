@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -227,5 +230,249 @@ func TestLoadHookManifestNoPreField(t *testing.T) {
 	}
 	if len(hooks) != 0 {
 		t.Errorf("loadHookManifest returned %d hooks, want none: %+v", len(hooks), hooks)
+	}
+}
+
+func TestHookToolName(t *testing.T) {
+	// The manifest and the hooks themselves speak the hook protocol's tool
+	// names; only bash needs translating today.
+	for _, tc := range []struct{ driver, want string }{
+		{"bash", "Bash"},
+		{"Bash", "Bash"},
+		{"read", "read"},
+		{"", ""},
+	} {
+		if got := hookToolName(tc.driver); got != tc.want {
+			t.Errorf("hookToolName(%q) = %q, want %q", tc.driver, got, tc.want)
+		}
+	}
+}
+
+// hookInterpreter resolves bash for the fixture scripts' shebang. The
+// portable spelling is "#!/usr/bin/env bash", but a sandbox without /usr/bin
+// — which is what this tree's CI runs in — makes every fixture unstartable and
+// every assertion about a hook that did not run meaningless, so the interpreter
+// is found on PATH the way main_test.go finds sleep.
+func hookInterpreter(t *testing.T) string {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatalf("locate bash for the hook fixtures: %v", err)
+	}
+	return bash
+}
+
+// writeGuardHookScript writes a real Guard Hook script — the parent spec's
+// "real scripts, not doubles" — with its own shebang and mode bits, so
+// guardCommand has to exec it the way the host bakes it rather than hand it to
+// a shell.
+func writeGuardHookScript(t *testing.T, name, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte("#!"+hookInterpreter(t)+"\n"+body+"\n"), 0o755); err != nil {
+		t.Fatalf("write guard hook script %s: %v", name, err)
+	}
+	return path
+}
+
+// hookMarkerExists reports whether the script left its marker behind. A stat
+// error other than "not there" is a broken fixture, not a verdict on the hook.
+func hookMarkerExists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	t.Fatalf("stat marker %s: %v", path, err)
+	return false
+}
+
+func TestGuardCommandDenies(t *testing.T) {
+	script := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	got := guardCommand("cat ~/.ssh/id_ed25519", "bash", []guardHook{{path: script}}, nil)
+
+	// The "error: " prefix is what makes the Tool Result an error downstream,
+	// and the script path is what the operator has to go read.
+	want := "error: guard hook " + script + " denied this command: credential path"
+	if got != want {
+		t.Errorf("guardCommand = %q, want %q", got, want)
+	}
+}
+
+func TestGuardCommandDenyWithoutReasonUsesFallback(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"missing reason", `echo '{"hookSpecificOutput":{"permissionDecision":"deny"}}'`},
+		{"empty reason", `echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":""}}'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "deny.sh", tc.body)
+
+			got := guardCommand("rm -rf /", "bash", []guardHook{{path: script}}, nil)
+
+			want := "error: guard hook " + script + " denied this command: the hook gave no reason"
+			if got != want {
+				t.Errorf("guardCommand = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGuardCommandProceedsUnlessTheHookDenies(t *testing.T) {
+	// The last two cases are slice 4b's fail-closed cases. They are pinned here
+	// only so this slice can neither panic on them nor deny on them; 4b replaces
+	// them with refusals.
+	for _, tc := range []struct{ name, body string }{
+		{"allow", `echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`},
+		{"ask", `echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'`},
+		{"near-miss decision", `echo '{"hookSpecificOutput":{"permissionDecision":"Deny"}}'`},
+		{"no decision", `echo '{"hookSpecificOutput":{}}'`},
+		{"no hookSpecificOutput", `echo '{"somethingElse":true}'`},
+		{"null hookSpecificOutput", `echo '{"hookSpecificOutput":null}'`},
+		{"empty stdout", `:`},
+		{"whitespace stdout", `printf '  \n\t\n'`},
+		{"unparsable stdout (4b)", `echo 'not json at all'`},
+		{"non-zero exit (4b)", `echo '{"permissionDecision":"allow"}' >&2; exit 3`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "hook.sh", tc.body)
+
+			if got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
+				t.Errorf("guardCommand = %q, want the empty string (proceed)", got)
+			}
+		})
+	}
+}
+
+func TestGuardCommandNoHooksPaysNothing(t *testing.T) {
+	for _, hooks := range [][]guardHook{nil, {}} {
+		if got := guardCommand("ls", "bash", hooks, nil); got != "" {
+			t.Errorf("guardCommand with no hooks = %q, want the empty string", got)
+		}
+	}
+}
+
+func TestGuardCommandSkipsHookThatDoesNotApply(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := writeGuardHookScript(t, "write-only.sh",
+		`touch `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"no"}}'`)
+
+	got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{"Write"}}}, nil)
+
+	if got != "" {
+		t.Errorf("guardCommand = %q, want the empty string", got)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("hook %s ran for a tool its tools list does not name", script)
+	}
+}
+
+func TestGuardCommandEmptyToolsApplies(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := writeGuardHookScript(t, "any.sh",
+		`touch `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"because"}}'`)
+
+	got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{}}}, nil)
+
+	if !hookMarkerExists(t, marker) {
+		t.Errorf("hook %s did not run: an empty tools list guards every tool", script)
+	}
+	if want := "error: guard hook " + script + " denied this command: because"; got != want {
+		t.Errorf("guardCommand = %q, want %q", got, want)
+	}
+}
+
+func TestGuardCommandFirstRefusalStopsTheChain(t *testing.T) {
+	dir := t.TempDir()
+	secondMarker := filepath.Join(dir, "second-ran")
+	first := writeGuardHookScript(t, "first.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"first word"}}'`)
+	second := writeGuardHookScript(t, "second.sh",
+		`touch `+secondMarker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
+
+	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+
+	if want := "error: guard hook " + first + " denied this command: first word"; got != want {
+		t.Errorf("guardCommand = %q, want %q", got, want)
+	}
+	if hookMarkerExists(t, secondMarker) {
+		t.Errorf("hook %s ran although an earlier hook already refused", second)
+	}
+}
+
+func TestGuardCommandSendsTheProtocolRequest(t *testing.T) {
+	// The expected bytes are written out instead of generated: the payload is the
+	// protocol's, so '<' and '&' travel literally and only '"' needs escaping. A
+	// generated comparison would also accept \u003c-style HTML escapes, which
+	// decode to the same value but are not the payload the protocol shows.
+	for _, tc := range []struct{ name, command, want string }{
+		{
+			"plain command",
+			"ls -la ~/.ssh",
+			`{"tool_name":"Bash","tool_input":{"command":"ls -la ~/.ssh"}}`,
+		},
+		{
+			"quotes and markup",
+			`echo "<a> & 'b'"`,
+			`{"tool_name":"Bash","tool_input":{"command":"echo \"<a> & 'b'\""}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			received := filepath.Join(dir, "request.json")
+			script := writeGuardHookScript(t, "record.sh", "cat > "+received)
+
+			if got := guardCommand(tc.command, "bash", []guardHook{{path: script}}, nil); got != "" {
+				t.Fatalf("guardCommand = %q, want the empty string", got)
+			}
+			raw, err := os.ReadFile(received)
+			if err != nil {
+				t.Fatalf("read what the hook received: %v", err)
+			}
+			if string(raw) != tc.want {
+				t.Errorf("hook received %s, want exactly %s", raw, tc.want)
+			}
+		})
+	}
+}
+
+func TestGuardCommandForwardsHookStderrToTheOperatorCopy(t *testing.T) {
+	// A hook's own noise is the operator's progress copy, never the wire's, and
+	// a nil writer means there is no copy to make.
+	for _, tc := range []struct{ name, writer string }{
+		{"stderr writer", "buffer"},
+		{"nil stderr", "nil"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "noisy.sh",
+				`echo 'hook noise' >&2
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"nope"}}'`)
+			var out bytes.Buffer
+			var stderr io.Writer
+			if tc.writer == "buffer" {
+				stderr = &out
+			}
+
+			got := guardCommand("ls", "bash", []guardHook{{path: script}}, stderr)
+
+			if want := "error: guard hook " + script + " denied this command: nope"; got != want {
+				t.Errorf("guardCommand = %q, want %q", got, want)
+			}
+			if tc.writer == "buffer" && !strings.Contains(out.String(), "hook noise") {
+				t.Errorf("stderr copy = %q, want it to contain the hook's noise", out.String())
+			}
+			if strings.Contains(got, "hook noise") {
+				t.Errorf("refusal %q carries the hook's stderr, which belongs to the operator's copy", got)
+			}
+		})
 	}
 }
