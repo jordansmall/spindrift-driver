@@ -68,9 +68,10 @@ var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>]
 
 The prompt may be given positionally or on stdin. --model is required.
 Precedence for every setting: flag, then environment, then the Driver Config, then the built-in default.
-The Driver Config is JSON at the path $` + envConfigPath + ` names, else $HOME/` + defaultDriverConfigPath + `; it carries base_url, api_key, timeout and agents_dir.
+The Driver Config is JSON at the path $` + envConfigPath + ` names, else $HOME/` + defaultDriverConfigPath + `; it carries base_url, api_key, timeout, agents_dir and hook_manifest.
 An absent file at the default path is not an error; a missing file that $` + envConfigPath + ` names, or any file that cannot be
 parsed, is a startup error, never a fallback.
+A configured hook_manifest lists the Guard Hooks every Bash Tool Call runs through; one that cannot be read is a startup error, never an unguarded run.
 The API key comes from $` + envAPIKey + ` or that file, never from argv.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
