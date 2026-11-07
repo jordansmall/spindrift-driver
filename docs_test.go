@@ -203,9 +203,9 @@ func TestContextDefinesSubagentTool(t *testing.T) {
 	if entry == "" {
 		t.Fatal("CONTEXT.md has no **Subagent Tool** glossary entry")
 	}
-	for _, want := range []string{"delegate", "named", "re-execut", "role", "in_subagent", "usage", "result", "subagent", "one at a time"} {
+	for _, want := range []string{"delegate", "named", "re-execut", "role", "in_subagent", "usage", "result", "subagent", "one at a time", "hook manifest"} {
 		if !strings.Contains(entry, want) {
-			t.Errorf("the **Subagent Tool** entry does not state that it delegates one task to a named roster entry by re-executing this same binary, relaying the child's events with role and in_subagent, rolling its usage into the parent's totals, returning its answer as the Tool Result that names the agent in subagent, and spawning one at a time (missing %q)", want)
+			t.Errorf("the **Subagent Tool** entry does not state that it delegates one task to a named roster entry by re-executing this same binary, relaying the child's events with role and in_subagent, rolling its usage into the parent's totals, returning its answer as the Tool Result that names the agent in subagent, spawning one at a time, and inheriting the Hook Manifest (missing %q)", want)
 		}
 	}
 	// A child that dies must not take the run down with it, or the Model has no
@@ -217,11 +217,101 @@ func TestContextDefinesSubagentTool(t *testing.T) {
 	if !near(entry, "child", "never", 240) {
 		t.Error("the **Subagent Tool** entry does not state that a child is never offered the Tool itself")
 	}
+	// Inheritance is what keeps the guards holding across a delegation: a child
+	// that resolved its own manifest would run the command its parent was refused.
+	if !near(entry, "inherit", "hook manifest", 240) {
+		t.Error("the **Subagent Tool** entry does not state that a child inherits the Hook Manifest alongside the Driver Config")
+	}
 	if !strings.Contains(entry, "_avoid_:") {
 		t.Error("the **Subagent Tool** entry has no _Avoid_ line")
 	}
 	if n := countAny(entry, "subprocess", "fork", "nested agent", "mcp"); n < 2 {
 		t.Errorf("the **Subagent Tool** entry retires %d of the old words (subprocess, fork, nested agent, MCP); want at least 2", n)
+	}
+}
+
+// TestContextDefinesGuardHookAndHookManifest pins the two glossary entries the
+// pre-call Guard Hook chain adds. Both name things a host bakes and the Driver
+// only reads: an author who calls the script "middleware" or the manifest a
+// "policy file" goes looking for the policy in the Driver's source, where there is
+// none, and writes a manifest whose verdicts the run cannot honour.
+func TestContextDefinesGuardHookAndHookManifest(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the guard hook vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	hook := glossarySection(norm, "guard hook")
+	if hook == "" {
+		t.Fatal("CONTEXT.md has no **Guard Hook** glossary entry")
+	}
+	// The wire shape first: a hook author writes against these field names, and
+	// nothing else in the repo tells them what to read on stdin or answer with.
+	for _, want := range []string{"script", "stdin", "tool_name", "tool_input", "hookspecificoutput", "permissiondecision", "permissiondecisionreason"} {
+		if !strings.Contains(hook, want) {
+			t.Errorf("the **Guard Hook** entry does not state that the Driver runs a host-baked script, hands it tool_name and tool_input on stdin, and reads permissionDecision and permissionDecisionReason out of hookSpecificOutput (missing %q)", want)
+		}
+	}
+	// A deny blocks, and it blocks as an error Tool Result — the only form of
+	// refusal the Model has a turn in which to act on.
+	if !near(hook, "deny", "error tool result", 240) {
+		t.Error("the **Guard Hook** entry does not state that a deny blocks the call with an error Tool Result naming the script")
+	}
+	// The fail-closed half, case by case: the Driver cannot tell a broken hook from
+	// an approving one, so every one of these refuses.
+	for _, want := range []string{"cannot be run", "overrun", "non-zero", "nothing readable"} {
+		if !strings.Contains(hook, want) {
+			t.Errorf("the **Guard Hook** entry does not fail closed on one of its cases (missing %q)", want)
+		}
+	}
+	// Silence passing is what separates a guard from a gate: a hook with no opinion
+	// must let the call through, or every command an entry does not name is refused.
+	if !near(hook, "silence", "no objection", 160) {
+		t.Error("the **Guard Hook** entry does not state that silence on a clean exit raises no objection")
+	}
+	// What it is for, and that none of the policy lives in the Driver.
+	for _, want := range []string{"credential", "background"} {
+		if !strings.Contains(hook, want) {
+			t.Errorf("the **Guard Hook** entry does not name what a Guard Hook is for (missing %q)", want)
+		}
+	}
+	if !near(hook, "hardcode", "hook name", 160) {
+		t.Error("the **Guard Hook** entry does not state that the Driver hardcodes no hook names")
+	}
+	if !strings.Contains(hook, "_avoid_:") {
+		t.Error("the **Guard Hook** entry has no _Avoid_ line")
+	}
+	if n := countAny(hook, "middleware", "interceptor", "permission prompt", "guardrail", "filter"); n < 2 {
+		t.Errorf("the **Guard Hook** entry retires %d of the wrong words (middleware, interceptor, permission prompt, guardrail, filter); want at least 2", n)
+	}
+
+	manifest := glossarySection(norm, "hook manifest")
+	if manifest == "" {
+		t.Fatal("CONTEXT.md has no **Hook Manifest** glossary entry")
+	}
+	for _, want := range []string{"json", "run order", "path", "tool name", "rewrite", "hook_manifest", "no default path"} {
+		if !strings.Contains(manifest, want) {
+			t.Errorf("the **Hook Manifest** entry does not state that it is the JSON file listing the pre-call Guard Hooks in run order — script path, hook-protocol tool names, whether it rewrites — named only by the Driver Config's hook_manifest with no default path (missing %q)", want)
+		}
+	}
+	// The two states a reader has to be able to tell apart: nothing configured, so
+	// nothing is guarded, versus something configured and unreadable.
+	if !near(manifest, "unconfigured", "unguarded", 200) {
+		t.Error("the **Hook Manifest** entry does not state that an unconfigured manifest means nothing is guarded")
+	}
+	if !near(manifest, "cannot be read", "startup", 240) {
+		t.Error("the **Hook Manifest** entry does not state that a configured manifest which cannot be read or parsed stops the run at startup")
+	}
+	// Inheritance, or delegation is an escape hatch out of every guard.
+	if !near(manifest, "child", "inherit", 200) {
+		t.Error("the **Hook Manifest** entry does not state that a spawned child inherits the manifest the way the Driver Config is inherited")
+	}
+	if !strings.Contains(manifest, "_avoid_:") {
+		t.Error("the **Hook Manifest** entry has no _Avoid_ line")
+	}
+	if n := countAny(manifest, "hook config", "plugin list", "policy file", "pre-flight"); n < 2 {
+		t.Errorf("the **Hook Manifest** entry retires %d of the wrong words (hook config, plugin list, policy file, pre-flight); want at least 2", n)
 	}
 }
 
