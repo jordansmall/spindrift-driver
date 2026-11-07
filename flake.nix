@@ -52,8 +52,10 @@
 
           # main_test.go looks `sleep` up with exec.LookPath and creates a
           # probe file in the process cwd, so the check phase needs these on
-          # PATH and runs in a writable build dir, never the store.
-          nativeCheckInputs = with pkgs; [ bash coreutils ];
+          # PATH and runs in a writable build dir, never the store. jq is here
+          # because every guarded Bash call is refused unless jq is on PATH, so
+          # the hook tests cannot run without it.
+          nativeCheckInputs = with pkgs; [ bash coreutils jq ];
         });
       });
 
