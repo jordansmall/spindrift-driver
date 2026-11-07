@@ -3283,6 +3283,19 @@ func TestUsageNamesDriverConfig(t *testing.T) {
 	if !near(usage, "absent", "not an error", 160) {
 		t.Errorf("usage does not say an absent file at the default path is not an error:\n%s", usage)
 	}
+	// hook_manifest is the one config field whose absence changes what a run is
+	// allowed to do, so -h has to carry both halves: that it guards every Bash Tool
+	// Call, and that an unreadable manifest stops the run instead of starting it
+	// unguarded — otherwise an operator debugs a missing file as a warning.
+	if !strings.Contains(usage, "hook_manifest") {
+		t.Errorf("usage does not name the hook_manifest config field:\n%s", usage)
+	}
+	if !near(usage, "hook_manifest", "Bash", 200) {
+		t.Errorf("usage does not say the configured Hook Manifest guards every Bash Tool Call:\n%s", usage)
+	}
+	if !near(usage, "hook_manifest", "startup error", 240) {
+		t.Errorf("usage does not say a manifest the config names that cannot be read is a startup error:\n%s", usage)
+	}
 }
 
 func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
