@@ -182,6 +182,17 @@ func loadAgentDir(dir string) ([]agentEntry, error) {
 	return entries, nil
 }
 
+// offeredTools is the run's tool list, derived from the roster and nothing
+// else: an empty roster means the Model has no subagent it could name, so
+// offering the tool would only invite a call that cannot be honoured. bash is
+// always there, roster or not.
+func offeredTools(agents []agentEntry) []toolSpec {
+	if len(agents) == 0 {
+		return []toolSpec{bashTool}
+	}
+	return []toolSpec{bashTool, subagentTool}
+}
+
 // splitInlineList reads the comma-separated form of a list field. An empty
 // value is no items at all — the block form below may still fill the field.
 func splitInlineList(value string) []string {

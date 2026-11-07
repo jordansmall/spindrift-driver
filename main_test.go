@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -2893,17 +2894,27 @@ func TestParseArgsAgentsDir(t *testing.T) {
 		return cfg.agentsDir
 	}
 
+	// The directory a configured agents_dir names has to exist for parseArgs to
+	// return at all, so these resolve against real directories.
 	t.Run("file supplies the directory and beats the default", func(t *testing.T) {
-		path := writeDriverConfig(t, `{"agents_dir":"/srv/agents"}`)
-		if got := resolve(t, named(path, "/home/dev")); got != "/srv/agents" {
-			t.Errorf("agentsDir = %q, want %q", got, "/srv/agents")
+		agents := t.TempDir()
+		path := writeDriverConfig(t, `{"agents_dir":"`+agents+`"}`)
+		if got := resolve(t, named(path, "/home/dev")); got != agents {
+			t.Errorf("agentsDir = %q, want %q", got, agents)
 		}
 	})
 
 	t.Run("file value is verbatim", func(t *testing.T) {
-		path := writeDriverConfig(t, `{"agents_dir":"/srv/./agents"}`)
-		if got := resolve(t, named(path, "")); got != "/srv/./agents" {
-			t.Errorf("agentsDir = %q, want %q uncleaned", got, "/srv/./agents")
+		agents := t.TempDir()
+		if err := os.Mkdir(filepath.Join(agents, "srv"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// Written with a "." element the string has to survive: filepath.Join
+		// would clean it away and the test would assert nothing.
+		verbatim := agents + "/./srv"
+		path := writeDriverConfig(t, `{"agents_dir":"`+verbatim+`"}`)
+		if got := resolve(t, named(path, "")); got != verbatim {
+			t.Errorf("agentsDir = %q, want %q uncleaned", got, verbatim)
 		}
 	})
 
@@ -2922,9 +2933,10 @@ func TestParseArgsAgentsDir(t *testing.T) {
 	})
 
 	t.Run("default file supplies the directory", func(t *testing.T) {
-		home := writeDefaultDriverConfig(t, `{"agents_dir":"/from-home/agents"}`)
-		if got := resolve(t, homeOnly(home)); got != "/from-home/agents" {
-			t.Errorf("agentsDir = %q, want %q", got, "/from-home/agents")
+		agents := t.TempDir()
+		home := writeDefaultDriverConfig(t, `{"agents_dir":"`+agents+`"}`)
+		if got := resolve(t, homeOnly(home)); got != agents {
+			t.Errorf("agentsDir = %q, want %q", got, agents)
 		}
 	})
 
@@ -2939,6 +2951,97 @@ func TestParseArgsAgentsDir(t *testing.T) {
 			t.Errorf("agentsDir = %q, want empty, not an error", got)
 		}
 	})
+}
+
+// TestParseArgsAbsentDefaultAgentsDir: the home-relative default is never the
+// operator's promise, so a directory that is simply not there reads as "no
+// Agent Files" — no entries, no error, bash-only offer. A configured directory
+// missing is fatal, which is the asymmetry this test pins from the other side.
+func TestParseArgsAbsentDefaultAgentsDir(t *testing.T) {
+	home := t.TempDir()
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(name string) (string, bool) {
+		if name == "HOME" {
+			return home, true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatalf("parseArgs error = %v, want none for an absent default directory", err)
+	}
+	if len(cfg.agents) != 0 {
+		t.Errorf("agents = %+v, want none", cfg.agents)
+	}
+	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash"}) {
+		t.Errorf("tools = %v, want [bash]", got)
+	}
+}
+
+// TestParseArgsAbsentConfiguredAgentsDir: an agents_dir the Driver Config names
+// is a directory the operator expects to be used, so its absence is a startup
+// error naming it — exactly how SPINDRIFT_CONFIG treats a file it names.
+func TestParseArgsAbsentConfiguredAgentsDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "agents")
+	path := writeDriverConfig(t, `{"agents_dir":"`+missing+`"}`)
+	_, err := parseArgs([]string{"--model", "m", "p"}, nil, func(name string) (string, bool) {
+		if name == envConfigPath {
+			return path, true
+		}
+		return "", false
+	})
+	if err == nil {
+		t.Fatalf("parseArgs error = nil, want a startup error naming %q", missing)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error = %v, want it to name %q", err, missing)
+	}
+	if !errors.Is(err, errNoAgentDir) {
+		t.Errorf("error = %v, want it to wrap errNoAgentDir", err)
+	}
+}
+
+// TestParseArgsMalformedAgentFile: a broken Agent File is fatal wherever the
+// directory came from — reading the operator's roster strictly is the only way
+// a typo surfaces instead of silently shrinking the offer.
+func TestParseArgsMalformedAgentFile(t *testing.T) {
+	dir := t.TempDir()
+	file := writeAgentFile(t, dir, "reviewer.md", "name: reviewer\nmodel: m-r\n")
+	path := writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+	_, err := parseArgs([]string{"--model", "m", "p"}, nil, func(name string) (string, bool) {
+		if name == envConfigPath {
+			return path, true
+		}
+		return "", false
+	})
+	if err == nil {
+		t.Fatalf("parseArgs error = nil, want a startup error naming %q", file)
+	}
+	if !strings.Contains(err.Error(), file) {
+		t.Errorf("error = %v, want it to name %q", err, file)
+	}
+}
+
+// TestParseArgsLoadsRosterAndOffer: the roster loaded at startup is what the
+// offer is derived from, so the two cannot disagree by the time sendChat runs.
+func TestParseArgsLoadsRosterAndOffer(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFile(t, dir, "beta.md", "---\nname: beta\nmodel: m-b\n---\nb\n")
+	writeAgentFile(t, dir, "alpha.md", "---\nname: alpha\nmodel: m-a\n---\na\n")
+	path := writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(name string) (string, bool) {
+		if name == envConfigPath {
+			return path, true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatalf("parseArgs error = %v", err)
+	}
+	if len(cfg.agents) != 2 || cfg.agents[0].Name != "alpha" || cfg.agents[1].Name != "beta" {
+		t.Errorf("agents = %+v, want [alpha beta] in file-name order", cfg.agents)
+	}
+	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
+		t.Errorf("tools = %v, want [bash subagent]", got)
+	}
 }
 
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
@@ -3123,6 +3226,117 @@ func TestChatRequestWireShape(t *testing.T) {
 	toolMsg, _ := msgs[1].(map[string]any)
 	if toolMsg["role"] != "tool" || toolMsg["content"] != "file listing" || toolMsg["tool_call_id"] != "call_1" {
 		t.Errorf("tool message = %v, want role/content/tool_call_id", toolMsg)
+	}
+}
+
+// TestSubagentToolWireShape: the Subagent Tool travels to the Model in the same
+// envelope bash does, and its schema is the only thing the Model has to go on —
+// the agent names themselves arrive in a later issue, so the description must
+// not enumerate them.
+func TestSubagentToolWireShape(t *testing.T) {
+	raw, err := json.Marshal(subagentTool)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if top["type"] != "function" {
+		t.Errorf("type = %v, want function", top["type"])
+	}
+	fn, _ := top["function"].(map[string]any)
+	if fn["name"] != "subagent" {
+		t.Errorf("function.name = %v, want subagent", fn["name"])
+	}
+	desc, _ := fn["description"].(string)
+	if desc == "" {
+		t.Error("function.description is empty: the Model cannot tell what the tool is for")
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	if params["type"] != "object" {
+		t.Errorf("parameters.type = %v, want object", params["type"])
+	}
+	props, _ := params["properties"].(map[string]any)
+	for _, name := range []string{"agent", "task"} {
+		prop, _ := props[name].(map[string]any)
+		if prop == nil || prop["type"] != "string" {
+			t.Errorf("parameters.properties.%s = %v, want a string property", name, props[name])
+		}
+	}
+	required, _ := params["required"].([]any)
+	if len(required) != 2 {
+		t.Fatalf("parameters.required = %v, want agent and task", params["required"])
+	}
+	want := map[string]bool{"agent": true, "task": true}
+	for _, item := range required {
+		name, _ := item.(string)
+		if !want[name] {
+			t.Errorf("parameters.required contains %v, want only agent and task", item)
+		}
+		delete(want, name)
+	}
+	if len(want) != 0 {
+		t.Errorf("parameters.required = %v, want both agent and task", params["required"])
+	}
+}
+
+// postedToolNames reads the tool offer back off a recorded POST body: what the
+// Model was actually told, not what a hand-built struct was meant to hold.
+func postedToolNames(t *testing.T, raw []byte) []string {
+	t.Helper()
+	var body struct {
+		Tools []toolSpec `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("POST body is not valid JSON: %v; body = %q", err, raw)
+	}
+	return offeredNames(body.Tools)
+}
+
+// TestRunOffersBashOnlyWithNoAgentFiles is the issue's first acceptance
+// criterion: with no Agent Files the run offers no Subagent Tool at all.
+func TestRunOffersBashOnlyWithNoAgentFiles(t *testing.T) {
+	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	sent := srv.requestBodies(t)
+	if len(sent) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(sent))
+	}
+	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash"}) {
+		t.Errorf("offered tools = %v, want [bash] only", got)
+	}
+}
+
+// TestRunOffersSubagentToolWithAgentFiles: a roster the Driver Config points at
+// is the only thing that puts the Subagent Tool in front of the Model.
+func TestRunOffersSubagentToolWithAgentFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFile(t, dir, "reviewer.md", "---\nname: reviewer\nmodel: m-r\n---\nreview things\n")
+	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(name string) (string, bool) {
+		if name == envConfigPath {
+			return cfgPath, true
+		}
+		return "", false
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	sent := srv.requestBodies(t)
+	if len(sent) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(sent))
+	}
+	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
+		t.Errorf("offered tools = %v, want [bash subagent]", got)
 	}
 }
 
