@@ -32,12 +32,16 @@ type driverConfig struct {
 	baseURL string
 	apiKey  string
 	timeout time.Duration // 0 = absent; non-positive values are rejected at load time
+	// agentsDir is the Agent Files directory, stored verbatim: an empty value
+	// means the file said nothing, so the caller falls back to the home-relative
+	// default rather than to a directory named "".
+	agentsDir string
 }
 
 // knownConfigFields is the whole file schema: the contents list of the issue,
 // and deliberately not the rest of the runtime knobs — model and max turns stay
 // flags so a checked-in file cannot silently change what an agent run does.
-var knownConfigFields = []string{"api_key", "base_url", "timeout"}
+var knownConfigFields = []string{"agents_dir", "api_key", "base_url", "timeout"}
 
 func isKnownConfigField(key string) bool {
 	for _, k := range knownConfigFields {
@@ -120,6 +124,13 @@ func loadDriverConfig(path string) (driverConfig, error) {
 		}
 	}
 	var cfg driverConfig
+	if raw, ok := fields["agents_dir"]; ok {
+		s, err := configString(path, "agents_dir", raw)
+		if err != nil {
+			return driverConfig{}, err
+		}
+		cfg.agentsDir = s
+	}
 	if raw, ok := fields["base_url"]; ok {
 		s, err := configString(path, "base_url", raw)
 		if err != nil {

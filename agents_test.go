@@ -248,6 +248,81 @@ func TestLoadAgentDirMalformedFileIsNamed(t *testing.T) {
 	}
 }
 
+// TestAgentsDirPath: the Agent Files directory is home-relative and resolved
+// through the injected lookupEnv only — os.UserHomeDir would bypass this seam and
+// leak a developer's own ~/.config into whatever run a test drives.
+func TestAgentsDirPath(t *testing.T) {
+	if filepath.IsAbs(defaultAgentsDirPath) {
+		t.Errorf("defaultAgentsDirPath %q is absolute, want home-relative", defaultAgentsDirPath)
+	}
+	if strings.HasPrefix(defaultAgentsDirPath, string(os.PathSeparator)) {
+		t.Errorf("defaultAgentsDirPath %q is cwd-relative, want home-relative", defaultAgentsDirPath)
+	}
+	for _, tc := range []struct {
+		name      string
+		lookupEnv func(string) (string, bool)
+		want      string
+	}{
+		{
+			// Spelled out rather than built from defaultAgentsDirPath, so
+			// renaming the default has to fail here.
+			name: "HOME only",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "HOME" {
+					return "/home/dev", true
+				}
+				return "", false
+			},
+			want: "/home/dev/.config/spindrift-driver/agents",
+		},
+		{
+			name:      "no HOME is no Agent Files, not an error",
+			lookupEnv: func(string) (string, bool) { return "", false },
+			want:      "",
+		},
+		{
+			name: "set-but-empty HOME reads as unset",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "HOME" {
+					return "", true
+				}
+				return "", false
+			},
+			want: "",
+		},
+		{
+			// The home-relative spelling is joined, not expanded: nothing here
+			// knows what a leading ~ means, so a literal home stays literal.
+			name: "tilde is not expanded",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "HOME" {
+					return "~/dev", true
+				}
+				return "", false
+			},
+			want: filepath.Join("~/dev", ".config/spindrift-driver/agents"),
+		},
+		{
+			// An environment variable of its own would make the golden log
+			// depend on the machine running the suite, so there is none.
+			name: "no env override of its own",
+			lookupEnv: func(name string) (string, bool) {
+				if name == "SPINDRIFT_AGENTS" {
+					return "/from/env", true
+				}
+				return "", false
+			},
+			want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentsDirPath(tc.lookupEnv); got != tc.want {
+				t.Errorf("agentsDirPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadAgentDirMissingDirIsDistinct: an absent directory is the sentinel, and
 // an empty one is not — "no Agent Files because there is nothing there to read"
 // has to stay separable from "the directory is broken" for the caller.

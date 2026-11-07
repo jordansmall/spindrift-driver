@@ -122,6 +122,27 @@ func parseAgentFile(path string) (agentEntry, error) {
 	return entry, nil
 }
 
+// defaultAgentsDirPath is home-relative for the same reason the Driver Config
+// path is: the caller joins it to $HOME, so resolution stays free of environment
+// reads and the same code runs under any stub.
+const defaultAgentsDirPath = ".config/spindrift-driver/agents"
+
+// agentsDirPath reports where Agent Files live, or "" when there are none to
+// look for. HOME goes through the injected lookupEnv, never os.UserHomeDir: that
+// would bypass the seam every test stubs and make the byte-exact golden log
+// depend on whose home directory the suite runs in. The only override is the
+// Driver Config's agents_dir, applied by the caller, because a file the operator
+// checked is the one place a directory may be redirected from; an environment
+// variable would let any invocation swap in a different roster.
+func agentsDirPath(lookupEnv func(string) (string, bool)) string {
+	// A set-but-empty HOME reads as unset, as the Driver Config's does: an
+	// unresolvable home means "no Agent Files", never an error.
+	if home, ok := lookupEnv("HOME"); ok && home != "" {
+		return filepath.Join(home, defaultAgentsDirPath)
+	}
+	return ""
+}
+
 // loadAgentDir reads every Agent File in dir as ordered entries. Ordering is
 // what makes the spawn offer reproducible across runs, and os.ReadDir supplies
 // it sorted by file name — nothing here reorders, so the entry order is the

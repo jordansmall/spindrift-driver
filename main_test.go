@@ -2858,6 +2858,89 @@ func TestParseArgsHasNoAPIKeyOrConfigFlag(t *testing.T) {
 	}
 }
 
+// TestParseArgsAgentsDir: the Agent Files directory has no flag and no
+// environment variable, so the Driver Config is the only thing above the
+// home-relative default, and what it supplies is used verbatim.
+func TestParseArgsAgentsDir(t *testing.T) {
+	const homeDefault = "/home/dev/.config/spindrift-driver/agents"
+	// keyed by name: an unnamed HOME stays unset in named(), an unnamed
+	// override stays unset in homeOnly()
+	named := func(path, home string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			switch name {
+			case envConfigPath:
+				return path, true
+			case "HOME":
+				return home, home != ""
+			}
+			return "", false
+		}
+	}
+	homeOnly := func(home string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			if name == "HOME" {
+				return home, true
+			}
+			return "", false
+		}
+	}
+	resolve := func(t *testing.T, lookup func(string) (string, bool)) string {
+		t.Helper()
+		cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, lookup)
+		if err != nil {
+			t.Fatalf("parseArgs returned error: %v", err)
+		}
+		return cfg.agentsDir
+	}
+
+	t.Run("file supplies the directory and beats the default", func(t *testing.T) {
+		path := writeDriverConfig(t, `{"agents_dir":"/srv/agents"}`)
+		if got := resolve(t, named(path, "/home/dev")); got != "/srv/agents" {
+			t.Errorf("agentsDir = %q, want %q", got, "/srv/agents")
+		}
+	})
+
+	t.Run("file value is verbatim", func(t *testing.T) {
+		path := writeDriverConfig(t, `{"agents_dir":"/srv/./agents"}`)
+		if got := resolve(t, named(path, "")); got != "/srv/./agents" {
+			t.Errorf("agentsDir = %q, want %q uncleaned", got, "/srv/./agents")
+		}
+	})
+
+	t.Run("empty file value reads as unset", func(t *testing.T) {
+		path := writeDriverConfig(t, `{"agents_dir":""}`)
+		if got := resolve(t, named(path, "/home/dev")); got != homeDefault {
+			t.Errorf("agentsDir = %q, want the default %q", got, homeDefault)
+		}
+	})
+
+	t.Run("file without the key uses the default", func(t *testing.T) {
+		path := writeDriverConfig(t, `{"base_url":"http://named:6/v1"}`)
+		if got := resolve(t, named(path, "/home/dev")); got != homeDefault {
+			t.Errorf("agentsDir = %q, want the default %q", got, homeDefault)
+		}
+	})
+
+	t.Run("default file supplies the directory", func(t *testing.T) {
+		home := writeDefaultDriverConfig(t, `{"agents_dir":"/from-home/agents"}`)
+		if got := resolve(t, homeOnly(home)); got != "/from-home/agents" {
+			t.Errorf("agentsDir = %q, want %q", got, "/from-home/agents")
+		}
+	})
+
+	t.Run("HOME alone gives the home-relative default", func(t *testing.T) {
+		if got := resolve(t, homeOnly("/home/dev")); got != homeDefault {
+			t.Errorf("agentsDir = %q, want the default %q", got, homeDefault)
+		}
+	})
+
+	t.Run("no HOME and no file resolves to nothing", func(t *testing.T) {
+		if got := resolve(t, func(string) (string, bool) { return "", false }); got != "" {
+			t.Errorf("agentsDir = %q, want empty, not an error", got)
+		}
+	})
+}
+
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	// --help output is the only place an operator learns the knob exists, so it
 	// must name the flag and the default actually in effect. The default is read
