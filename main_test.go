@@ -1654,6 +1654,115 @@ func TestRunTurnCapEmitsErrorEventNamingTheLimit(t *testing.T) {
 	}
 }
 
+// TestRunThirdConsecutiveIdenticalCallIsRefused is the refusal half of the
+// repeated-call breaker: a third identical Tool Call in a row is refused without
+// ever starting its command, and the Model reads a synthetic Tool Result that
+// points it at a different action. A refusal is a Tool Result and not a run
+// failure, so the run still reaches its final answer.
+func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
+	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+	srv := newScriptedChatServer(t,
+		forever, forever, forever,
+		`{"choices":[{"message":{"role":"assistant","content":"moved on"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	events := stdoutEvents(t, raw)
+	var results []map[string]any
+	for i, ev := range events {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		if i == 0 || events[i-1]["kind"] != "tool_call" {
+			t.Errorf("tool_result at %d has no tool_call immediately before it: %q", i, raw)
+		}
+		results = append(results, ev)
+	}
+	if len(results) != 3 {
+		t.Fatalf("tool_result events = %d, want one per scripted call: %q", len(results), raw)
+	}
+	for i, ev := range results[:2] {
+		output, _ := ev["tool_output"].(string)
+		if !strings.Contains(output, "exit code:") {
+			t.Errorf("tool_result %d tool_output = %q, want the real command output with its exit-code line", i+1, output)
+		}
+	}
+	refusal, _ := results[2]["tool_output"].(string)
+	// No exit-code line is the proof the command never started: runBashTool puts
+	// that line on everything it executes, success and failure alike.
+	if strings.Contains(refusal, "exit code:") {
+		t.Errorf("third tool_output = %q, want no exit-code line because the refused call never ran", refusal)
+	}
+	if !strings.Contains(strings.ToLower(refusal), "different") {
+		t.Errorf("third tool_output = %q, want it to ask for a different action", refusal)
+	}
+	if results[2]["is_error"] != true {
+		t.Errorf("refusal tool_result is_error = %v, want true: %v", results[2]["is_error"], results[2])
+	}
+	// The refusal is the conversation's Tool Result verbatim, so the Model is told
+	// exactly what the event stream reported.
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 4 {
+		t.Fatalf("POSTs = %d, want 4 (three calls plus the final answer)", len(msgs))
+	}
+	if last := msgs[3][len(msgs[3])-1]; last.Role != "tool" || last.Content != refusal {
+		t.Errorf("replayed tool message = %+v, want role tool carrying the refusal %q", last, refusal)
+	}
+	if got := resultText(t, raw); got != "moved on" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+}
+
+// TestRunDifferentCallResetsRepeatedCallCount is the other half of the breaker:
+// only identical consecutive calls count, so a call with different arguments in
+// between starts the count again and nothing is ever refused.
+func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
+	callA := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+	callB := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo other\"}"}}]}}]}`
+	srv := newScriptedChatServer(t,
+		callA, callA, callB, callA, callA,
+		`{"choices":[{"message":{"role":"assistant","content":"no call was a third in a row"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	var results []map[string]any
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "tool_result" {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 5 {
+		t.Fatalf("tool_result events = %d, want one per scripted call: %q", len(results), raw)
+	}
+	for i, ev := range results {
+		output, _ := ev["tool_output"].(string)
+		// Every result carries the exit-code line a real command leaves behind, which
+		// a refusal never does, so no call in the A-A-B-A-A run was refused.
+		if !strings.Contains(output, "exit code:") {
+			t.Errorf("tool_result %d tool_output = %q, want the real command output with its exit-code line", i+1, output)
+		}
+		if ev["is_error"] == true {
+			t.Errorf("tool_result %d is_error = true, want no refusal in the run: %v", i+1, ev)
+		}
+	}
+	if !strings.Contains(raw, "other") {
+		t.Errorf("stdout = %q, want call B's real output so the alternating call ran too", raw)
+	}
+	if got := resultText(t, raw); got != "no call was a third in a row" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+}
+
 func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
 	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
 	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond

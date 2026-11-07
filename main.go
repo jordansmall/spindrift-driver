@@ -135,6 +135,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	var delegated tokenTotals
 	seenModels := map[string]struct{}{}
 	sess := session{cfg: cfg, events: events, stderr: stderr, delegated: &delegated, models: seenModels}
+	// Repeated-call breaker state: the last call seen and how many times in a row.
+	// These are run() locals rather than package counters because a package counter
+	// would carry across every run() in one process, and the state is per run.
+	var lastKey string
+	repeat := 0
 	for turn := 0; turn < cfg.maxTurns; turn++ {
 		call++
 		messageID := fmt.Sprintf("msg-%d", call)
@@ -204,8 +209,29 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				ToolInput:  plan.input,
 				ToolTarget: plan.target,
 			})
-			output := plan.run()
-			_ = events.emit(toolResultEvent(messageID, toolID, tc.Function.Name, plan, output))
+			// The key is the call exactly as the Model sent it: the tool name and the
+			// raw arguments wire string, joined by a NUL neither can contain. Keying on
+			// the decoded arguments would follow Go map order instead of what was sent.
+			key := tc.Function.Name + "\x00" + tc.Function.Arguments
+			if key == lastKey {
+				repeat++
+			} else {
+				lastKey, repeat = key, 1
+			}
+			var output string
+			refused := repeat >= repeatedCallRefuseLimit
+			if refused {
+				output = repeatedCallRefusal(tc.Function.Name, repeat)
+			} else {
+				output = plan.run()
+			}
+			result := toolResultEvent(messageID, toolID, tc.Function.Name, plan, output)
+			if refused {
+				// The plan's own rule cannot judge a refusal: the bash rule closes over a
+				// verdict only plan.run() writes, and a refused call never got there.
+				result.IsError = true
+			}
+			_ = events.emit(result)
 			// The replayed Tool Result message is unchanged, idless calls included:
 			// the synthesised tool id belongs to the event stream, not to the Model.
 			messages = append(messages, chatMessage{Role: "tool", Content: output, ToolCallID: tc.ID})
@@ -300,6 +326,21 @@ func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output s
 		IsError:    isError(output),
 		Subagent:   plan.subagent,
 	}
+}
+
+// repeatedCallRefuseLimit is how many identical calls in a row the breaker lets
+// run before it starts refusing: the third gets the synthetic Tool Result in
+// place of running. The two 3s of the breaker count different things — calls and
+// refusals — so each gets its own name rather than one shared literal that would
+// tie two independent limits together.
+const repeatedCallRefuseLimit = 3
+
+// repeatedCallRefusal is the synthetic Tool Result a refused call gets in place
+// of running. It carries the "error: " prefix the Guard Hook refusal established
+// as how a refusal reads, and names the call so the Model can tell which action
+// to change.
+func repeatedCallRefusal(toolName string, repeat int) string {
+	return fmt.Sprintf("error: %s was already called %d times in a row with these exact arguments, so it was not run again; take a different action", toolName, repeat-1)
 }
 
 // planToolCall parses one tool call without executing it. An unknown tool and
