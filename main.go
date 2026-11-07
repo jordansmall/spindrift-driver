@@ -47,11 +47,19 @@ type config struct {
 	// offeredTools so the offer and the roster cannot disagree later.
 	agents []agentEntry
 	tools  []toolSpec
+	// agent is the roster entry this run was started as by --agent, "" for a
+	// top-level run. It is the fact that makes a run a child, and the tool offer
+	// is read with it: a child never gets the Subagent Tool.
+	agent string
+	// systemPrompt is the selected Agent File's body, the system prompt that
+	// entry's run starts from. "" means no entry, so the package default applies
+	// — which is every hand-built config's case as much as a top-level run's.
+	systemPrompt string
 }
 
 // usage is a var, not a const: the --timeout default is interpolated from
 // chatAttemptTimeout so the text cannot drift from the value in effect.
-var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>]
+var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>] [--agent <name>]
 
 The prompt may be given positionally or on stdin. --model is required.
 Precedence for every setting: flag, then environment, then the Driver Config, then the built-in default.
@@ -61,6 +69,9 @@ parsed, is a startup error, never a fallback.
 The API key comes from $` + envAPIKey + ` or that file, never from argv.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
 --max-turns caps the number of agent turns (default 50).
+--agent <name> runs as that Agent File entry: its model id names the model unless --model
+gives one, and the file body replaces the system prompt. A run selected this way is never offered
+the Subagent Tool, so a subagent cannot spawn another.
 --timeout is an idle bound on one chat attempt: the dial, the response headers and the
 gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
 arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a
@@ -82,8 +93,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	}
 	// Autonomous tool loop: each turn posts the whole conversation with the
 	// tools parameter; the server decides tool calls (never parsed from text).
+	// The empty-field fallback is what keeps a run that came from anywhere other
+	// than parseArgs — and therefore has no systemPrompt of its own — on the
+	// package prompt it has always used.
+	sys := cfg.systemPrompt
+	if sys == "" {
+		sys = systemPrompt
+	}
 	messages := []chatMessage{
-		{Role: "system", Content: systemPrompt},
+		{Role: "system", Content: sys},
 		{Role: "user", Content: cfg.prompt},
 	}
 	// Run bookkeeping for the result event, all of it local: the Model-call
@@ -282,6 +300,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	baseURL := fs.String("base-url", "", "OpenAI-compatible API base URL (default: $SPINDRIFT_BASE_URL or "+defaultBaseURL+")")
 	model := fs.String("model", "", "model name (required)")
 	maxTurns := fs.Int("max-turns", 50, "maximum agent turns")
+	agentName := fs.String("agent", "", "run as this Agent File entry: its model id is used unless --model names one, and its body is the system prompt")
 	timeout := fs.Duration("timeout", chatAttemptTimeout, "idle timeout for one chat request: caps the dial, the response headers and the gap between received bytes, not the whole generation; accepts Go durations such as 90s or 2m")
 	pre, post := splitAtEndOfFlags(args)
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
@@ -322,9 +341,6 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	// those), so the unset-flag case still lands on chatAttemptTimeout
 	if !timeoutSet && file.timeout != 0 {
 		cfg.timeout = file.timeout
-	}
-	if cfg.model == "" {
-		return config{}, errors.New("--model is required")
 	}
 	// flag > env > Driver Config > built-in default; a set-but-empty env value
 	// reads as unset, so it never blanks out a value the file supplied
@@ -367,7 +383,34 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		}
 		cfg.agents = entries
 	}
+	// Resolved against the loaded roster, never opened from a path in argv: the
+	// configured directory is the only place an Agent File comes from.
+	cfg.agent = *agentName
+	if cfg.agent != "" {
+		entry, ok := findAgent(cfg.agents, cfg.agent)
+		if !ok {
+			return config{}, fmt.Errorf("unknown agent %q", cfg.agent)
+		}
+		// The entry's model id is used verbatim — no effort suffix, no splitting on
+		// "/" — because it is a router's key, not something the Driver composes.
+		if cfg.model == "" {
+			cfg.model = entry.Model
+		}
+		cfg.systemPrompt = entry.SystemPrompt
+	}
+	// Below the roster, because an entry can supply the model: a run named by
+	// --agent has one whether or not --model was typed.
+	if cfg.model == "" {
+		return config{}, errors.New("--model is required")
+	}
 	cfg.tools = offeredTools(cfg.agents)
+	if cfg.agent != "" {
+		// A child is never offered the Subagent Tool: a subagent able to spawn is
+		// unbounded recursion, and the roster's own spawns field is not enforcement
+		// until #26 lands. bash is the whole offer because this tree has no file
+		// Tools to add yet (#24).
+		cfg.tools = []toolSpec{bashTool}
+	}
 
 	prompt, err := promptFrom(positional, stdin)
 	if err != nil {
