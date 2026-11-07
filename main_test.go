@@ -1201,6 +1201,106 @@ func TestRunToolResultIsErrorTracksExitCode(t *testing.T) {
 	}
 }
 
+// A plan that names an agent is the only thing that puts subagent on a
+// tool_result line. The dispatch case that sets it is not written yet, so the
+// plumbing is pinned at the emit seam with a plan built directly rather than a
+// scripted subagent call planToolCall cannot yet plan.
+func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
+	pinClock(t, 1700000000000)
+
+	plan := toolPlan{
+		input:    map[string]any{"agent": "reviewer", "task": "read main.go"},
+		target:   "reviewer",
+		subagent: "reviewer",
+		run:      func() string { return "the child's answer" },
+	}
+
+	var buf bytes.Buffer
+	ev := toolResultEvent("msg-1", "call_1", "subagent", plan, plan.run())
+	if err := (eventWriter{w: &buf}).emit(ev); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
+	if got["subagent"] != "reviewer" {
+		t.Errorf("tool_result subagent = %v, want the agent the Subagent Tool acted on: %v", got["subagent"], got)
+	}
+	for _, pin := range []struct {
+		key  string
+		want any
+	}{
+		{"kind", "tool_result"},
+		{"message_id", "msg-1"},
+		{"tool_id", "call_1"},
+		{"tool_name", "subagent"},
+		{"tool_target", "reviewer"},
+		{"tool_output", "the child's answer"},
+	} {
+		if got[pin.key] != pin.want {
+			t.Errorf("tool_result %s = %v, want %v", pin.key, got[pin.key], pin.want)
+		}
+	}
+	// tool_input belongs to the tool_call half of the pair, so naming an agent
+	// must not turn the result line into a dump of the plan's input.
+	if _, ok := got["tool_input"]; ok {
+		t.Errorf("tool_result carries tool_input, which only tool_call fills: %v", got)
+	}
+}
+
+// The bash exit-code suffix rule is the default, not the only rule: a Subagent
+// Tool Result is the child's answer text and never ends in the literal a command
+// appends, so a plan carrying its own rule must have that rule consulted — the
+// default alone reports every successful delegation as a failure.
+func TestToolResultIsErrorUsesThePlanRuleWhenOneIsSet(t *testing.T) {
+	pinClock(t, 1700000000000)
+
+	agentRule := func(output string) bool { return strings.HasPrefix(output, "error:") }
+	for _, tc := range []struct {
+		name   string
+		plan   toolPlan
+		output string
+		want   bool
+	}{
+		{"default rule, clean exit", toolPlan{}, "ran\nexit code: 0", false},
+		{"default rule, non-zero exit", toolPlan{}, "blew up\nexit code: 4", true},
+		{"default rule, error prefix", toolPlan{}, "error: unknown tool \"squiggle\"", true},
+		{"plan rule accepts child prose", toolPlan{isError: agentRule}, "the child's answer", false},
+		{"plan rule rejects child failure", toolPlan{isError: agentRule}, "error: agent \"reviewer\" failed", true},
+	} {
+		ev := toolResultEvent("msg-1", "call_1", "bash", tc.plan, tc.output)
+		if ev.IsError != tc.want {
+			t.Errorf("%s: is_error = %v, want %v", tc.name, ev.IsError, tc.want)
+		}
+		var buf bytes.Buffer
+		if err := (eventWriter{w: &buf}).emit(ev); err != nil {
+			t.Fatalf("%s: emit: %v", tc.name, err)
+		}
+		_, onWire := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))["is_error"]
+		if onWire != tc.want {
+			t.Errorf("%s: is_error key on wire = %v, want it present only when true: %q", tc.name, onWire, buf.String())
+		}
+	}
+}
+
+// A run that delegates to nobody must look exactly like the run it was before
+// the field existed: no event line may grow a subagent key.
+func TestRunWithNoSubagentNeverStatesSubagent(t *testing.T) {
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if v, ok := ev["subagent"]; ok {
+			t.Errorf("%v states subagent = %v for a run with no delegation, want the key absent", ev["kind"], v)
+		}
+	}
+}
+
 // An unknown tool stays an ordinary Tool Result for the Model and becomes an
 // is_error pair for the reader: tool_name still says what was asked for, and
 // tool_target stays off the wire because the Driver never learned what it acted

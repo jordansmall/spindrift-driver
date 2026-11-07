@@ -22,9 +22,15 @@ var nowMS = func() int64 { return time.Now().UnixMilli() }
 // fill unset, and omitempty keeps them off the wire; kind and timestamp are
 // always present.
 //
-// Field names are snake_case per the wire contract. ToolInput is `any`
-// rather than a string so `tool_input` lands on the wire as a JSON value —
-// the decoded arguments object — not as an escaped string of one.
+// `in_subagent` is absent on purpose: a relayed child line goes to the wire as a
+// map, because re-encoding it through this struct would re-stamp the child's
+// timestamp and drop any field this struct lacks — so it is filled on the relay
+// path, never here.
+//
+// Field names are snake_case per the wire contract; `subagent` is filled only on
+// the Subagent Tool Result. ToolInput is `any` rather than a string so
+// `tool_input` lands on the wire as a JSON value — the decoded arguments
+// object — not as an escaped string of one.
 type event struct {
 	Kind string `json:"kind"`
 	// Role is the one contract field this Driver declares and never fills: it
@@ -41,6 +47,7 @@ type event struct {
 	ToolName   string       `json:"tool_name,omitempty"`
 	ToolInput  any          `json:"tool_input,omitempty"`
 	ToolTarget string       `json:"tool_target,omitempty"`
+	Subagent   string       `json:"subagent,omitempty"`
 	ToolOutput string       `json:"tool_output,omitempty"`
 	IsError    bool         `json:"is_error,omitempty"`
 	Tokens     *tokenTotals `json:"tokens,omitempty"`
