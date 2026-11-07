@@ -21,15 +21,23 @@ import (
 	"time"
 )
 
-// TestMain doubles as an escape helper: re-invoked with the env var set, it
-// detaches into a new session — outside the process group a timeout SIGKILL
-// targets — and sleeps holding the inherited stdout pipe. No setsid binary
-// ships in this environment, so the test binary itself is the escape vehicle.
+// TestMain doubles as helper-process entry points before any test runs: the
+// escape helper — re-invoked with the env var set, it detaches into a new
+// session, outside the process group a timeout SIGKILL targets, and sleeps
+// holding the inherited stdout pipe (no setsid binary ships in this environment,
+// so the test binary itself is the escape vehicle) — and the child Driver a
+// subagent spawn test re-invokes.
 func TestMain(m *testing.M) {
 	if os.Getenv("BASH_TOOL_ESCAPE_HELPER") == "1" {
 		syscall.Setsid()
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	}
+	// The subagent spawn tests start this binary as a child Driver, so the branch
+	// that turns it into one has to sit ahead of every flag parse too — the child
+	// is handed the Driver's argv, never a test flag set.
+	if os.Getenv(subagentHelperEnv) == "1" {
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
 	// built argv rather than os.Args, so the test binary has no other flag set, and

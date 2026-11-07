@@ -172,7 +172,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			if toolID == "" {
 				toolID = fmt.Sprintf("call-%d", toolSeq)
 			}
-			plan := planToolCall(tc)
+			plan := planToolCall(tc, cfg, events, stderr)
 			// tool_call goes out before the command starts: a command can run for
 			// minutes, and a reader has to see the call at the moment the Model made
 			// it. The pair stays adjacent, and both lines carry the message id of the
@@ -269,8 +269,15 @@ func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output s
 // planToolCall parses one tool call without executing it. An unknown tool and
 // unparseable arguments are ordinary results rather than crashes, so the plan
 // answers with the very error text the Model has always received.
-func planToolCall(call toolCall) toolPlan {
+//
+// A Subagent Tool call needs the run itself — the roster to resolve the name
+// against, the event writer to relay the child's lines onto, and the stderr the
+// child inherits — so those are passed in rather than read from a global.
+func planToolCall(call toolCall, cfg config, events eventWriter, stderr io.Writer) toolPlan {
 	input := decodeToolArguments(call.Function.Arguments)
+	if call.Function.Name == "subagent" {
+		return planSubagentCall(call, input, cfg, events, stderr)
+	}
 	if call.Function.Name != "bash" {
 		name := call.Function.Name
 		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: unknown tool %q", name) }}
