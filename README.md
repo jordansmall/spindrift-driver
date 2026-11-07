@@ -163,29 +163,46 @@ because the repository under repair does not get to configure the run that repai
 
 ## Guard Hooks
 
-A Guard Hook is a script the host bakes into the Box that the Driver runs before a Bash Tool
-Call, and the Hook Manifest is the JSON file that lists them. Its path comes only from the
-Driver Config's `hook_manifest` — there is no default path, and no flag or environment
-variable names it. With no `hook_manifest` in the file the run is unconfigured and
-unguarded: no manifest, no hooks, nothing inspected.
+A Guard Hook is a script the host bakes into the Box that the Driver runs around a Bash Tool
+Call — before it, to decide whether the command may run and what command that is, and after
+it, to summarise the Tool Result the Model reads. The Hook Manifest is the JSON file that
+lists them. Its path comes only from the Driver Config's `hook_manifest` — there is no
+default path, and no flag or environment variable names it. With no `hook_manifest` in the
+file the run is unconfigured and unguarded: no manifest, no hooks, nothing inspected.
 
 ```
-{"pre": [{"path": "/usr/lib/spindrift-hooks/deny-credentials.sh", "tools": ["Bash"], "rewrites": false}]}
+{"pre": [{"path": "/usr/lib/spindrift-hooks/deny-credentials.sh", "tools": ["Bash"], "rewrites": false}],
+ "post": {"path": "/usr/lib/spindrift-hooks/summarise-output.sh", "tools": ["Bash"]}}
 ```
 
-The top-level object's only field is `pre`, an array of hooks run in manifest order — the
+The top-level object has two fields. `pre` is an array of hooks run in manifest order — the
 file order is the run order, sorted by nothing, and the first refusal stops the chain. Each
 entry names `path` (the script to exec), `tools` (the hook-protocol tool names the entry
 applies to — `Bash` is the Bash Tool — an empty or absent list meaning every tool, so a hook
 that forgets to name its tools guards rather than skips), and `rewrites` (whether the hook
-rewrites the tool input).
+rewrites the tool input). `post` is one object rather than an array — the contract is one
+summary hook, not a chain — and its entry names `path` and `tools` only. `rewrites` on it is
+refused as an unknown field, because rewriting the Tool Result is what the post-call script
+exists for, so the flag would only be a switch nothing reads.
 
-A hook is handed one JSON object on stdin — `{"tool_name":"Bash","tool_input":{"command":"…"}}`
-— and answers on stdout with `hookSpecificOutput`, whose `permissionDecision` is the verdict
-and whose `permissionDecisionReason` is the text the Model is given. A `deny` blocks the
-call: the command is never run, and the Tool Result comes back as an error naming the script
-and the reason. Silence passes — an empty stdout on a clean exit, or an absent or null
+A pre-call hook is handed one JSON object on stdin —
+`{"tool_name":"Bash","tool_input":{"command":"…"}}` — and answers on stdout with
+`hookSpecificOutput`, whose `permissionDecision` is the verdict, whose
+`permissionDecisionReason` is the text the Model is given, and whose
+`updatedInput.command` replaces the command the run goes on with. A `deny` blocks the call:
+the command is never run, and the Tool Result comes back as an error naming the script and
+the reason. Silence passes — an empty stdout on a clean exit, or an absent or null
 `hookSpecificOutput`, is a hook with no opinion.
+
+A rewrite is applied to the rest of the chain and to what executes: it is the command the next
+hook is asked about, and the rewritten command is the command that runs. One handed back by a
+hook that did not declare `rewrites` is applied anyway — the flag is a promise about the
+answer a hook owes, never a gate on applying it. A hook that does declare `rewrites: true`
+owes that answer for any command worth rewriting, and one that returns no rewrite is refused
+by name, since the Driver cannot tell "there was nothing to sanitize" from a hook that stopped
+answering halfway; the empty command owes nothing, because there is nothing in it to rewrite.
+The `tool_call` event still reports the command the Model asked for: a rewrite is host policy
+on what executes, not a claim about what was requested.
 
 Anything else fails closed, because the Driver cannot tell a broken hook from an approving
 one: a script that cannot be run, a hook that overruns its per-hook bound of 5s
@@ -193,14 +210,31 @@ one: a script that cannot be run, a hook that overruns its per-hook bound of 5s
 (`guardHookOutputLimit`), a hook that exits non-zero, and an answer that is nothing readable
 all block the call exactly as a deny does.
 
+`jq` is a precondition of a guarded run. The baked hook scripts read the request above out of
+their own stdin with it, so a run that cannot find `jq` refuses every guarded call naming `jq`
+rather than letting a hook exit 0 having inspected nothing — that silence reads as a pass.
+A run whose Hook Manifest is unconfigured needs no `jq`, because nothing is guarded and so
+nothing needs reading.
+
+After the call, the `post` hook is handed the pre-call request with `tool_response` added —
+`{"tool_name":"Bash","tool_input":{"command":…},"tool_response":…}` — carrying the command
+that actually ran, which after a rewrite is not the one the Model asked for, and the finished
+Tool Result exactly as the Model would otherwise receive it. It answers with
+`hookSpecificOutput.updatedToolOutput`, which replaces the Tool Result both on the wire and in
+what the Model sees next. A summary hook fails open where the
+chain fails closed, and each failure leaves the original output unchanged: a call that already
+ran has earned its result. The cases are the ones the chain refuses for — a script that cannot
+be started, a run past the same 5s (`guardHookTimeout`) and 1 MiB (`guardHookOutputLimit`)
+bound, a non-zero exit, a flood of stdout, an answer that is nothing readable, and an empty
+replacement, which would trade a real result for the empty string. The Driver's own 10 KiB
+Tool Result cap (`bashToolMaxOutput`) stays in place as the floor under a replacement, so a
+hook cannot summarise upwards. A refused call is never summarised.
+
 A `hook_manifest` naming a file that cannot be read, or JSON that does not parse, is a
 startup error at exit 2 naming the file: the run refuses to start unguarded rather than
-discovering the missing file mid-task. A spawned child inherits the manifest exactly as it
+discovering the missing file mid-task, and a malformed `post` stops the run exactly as a
+malformed `pre` does. A spawned child inherits the manifest exactly as it
 inherits the Driver Config, so delegation is no way around the guards.
-
-Not implemented here, and #22's to build: the rewrite path (`rewrites` is read and recorded,
-never applied), the post-call summary hook, and the `jq` precondition — a hook that inspects
-its own request needs a JSON reader such as `jq` baked into the Box beside it.
 
 ## Subagents
 
