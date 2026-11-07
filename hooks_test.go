@@ -539,6 +539,43 @@ func TestGuardCommandFailsClosedWhenTheHookHangs(t *testing.T) {
 	}
 }
 
+func TestGuardCommandFailsClosedKillsTheHooksProcessGroup(t *testing.T) {
+	// A hook that detaches a grandchild must not leave it running past the bound:
+	// killing only the hook would orphan the spinner, still ticking in the
+	// background. The grandchild closes the inherited output fds so it cannot be
+	// what WaitDelay is unblocking on — the test is about the kill, not the wait.
+	old := guardHookTimeout
+	guardHookTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { guardHookTimeout = old })
+	marker := filepath.Join(t.TempDir(), "ticks")
+	t.Setenv("SPINDRIFT_HOOK_TICK_MARKER", marker)
+	script := writeGuardHookScript(t, "spin.sh", `( exec 1>&- 2>&-; while :; do echo tick >> "$SPINDRIFT_HOOK_TICK_MARKER"; sleep 0.05; done ) &
+sleep 30`)
+
+	_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+
+	want := "error: guard hook " + script + " timed out after 300ms, so the command is blocked"
+	if got != want {
+		t.Fatalf("guardCommand = %q, want %q", got, want)
+	}
+
+	before, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read tick marker %s: %v", marker, err)
+	}
+	if len(before) == 0 {
+		t.Fatalf("tick marker %s is empty: the detached grandchild never ran, so nothing was killed", marker)
+	}
+	time.Sleep(250 * time.Millisecond)
+	after, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read tick marker %s: %v", marker, err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("detached grandchild survived the timeout: marker grew from %d to %d bytes", len(before), len(after))
+	}
+}
+
 func TestGuardCommandAFailingHookStopsTheChain(t *testing.T) {
 	// The refusal a non-zero exit produces stops the chain like a denial does:
 	// the second hook never gets to speak for a command already blocked.
@@ -893,5 +930,147 @@ func TestGuardCommandDenialBeatsTheRewriteDebt(t *testing.T) {
 	}
 	if ran != "" {
 		t.Errorf("command to run = %q, want the empty string", ran)
+	}
+}
+
+// summarizeToolOutput is the post-call half of the Hook Manifest. Its failure
+// rule is the mirror of guardCommand's: everything the summary hook does wrong
+// leaves the original Tool Result standing, because the Driver already has a
+// truthful answer and a broken summariser is no reason to lose it.
+func TestSummarizeToolOutputReplacesTheToolResult(t *testing.T) {
+	script := writeGuardHookScript(t, "summarize.sh",
+		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+
+	got := summarizeToolOutput("bash", "ls -l", "file listing\nexit code: 0", &summaryHook{path: script}, nil)
+
+	if got != "SUMMARY" {
+		t.Errorf("summarizeToolOutput = %q, want the hook's replacement SUMMARY", got)
+	}
+}
+
+func TestSummarizeToolOutputHandsTheHookTheCommandAndTheToolResult(t *testing.T) {
+	stdin := filepath.Join(t.TempDir(), "stdin.json")
+	script := writeGuardHookScript(t, "summarize.sh",
+		`cat > `+stdin+`
+echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+
+	if got := summarizeToolOutput("bash", "ls -l", summarizeFixtureOutput, &summaryHook{path: script}, nil); got != "SUMMARY" {
+		t.Fatalf("summarizeToolOutput = %q, want SUMMARY", got)
+	}
+
+	// The payload is the contract a hook author codes against: the protocol's tool
+	// name, the command that actually ran, and the finished Tool Result — exit-code
+	// line and all — as one JSON string.
+	want := `{"tool_name":"Bash","tool_input":{"command":"ls -l"},"tool_response":"` + summarizeFixtureJSON + `"}`
+	got, err := os.ReadFile(stdin)
+	if err != nil {
+		t.Fatalf("read the payload the hook was handed: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("hook stdin = %s, want %s", got, want)
+	}
+}
+
+// summarizeFixtureOutput is one finished Tool Result; summarizeFixtureJSON is
+// the same text as it appears inside the payload's JSON string.
+const (
+	summarizeFixtureOutput = "total 4\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 dir\nexit code: 0"
+	summarizeFixtureJSON   = `total 4\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 dir\nexit code: 0`
+)
+
+func TestSummarizeToolOutputKeepsTheOriginalWhenTheSummaryCannotBeHad(t *testing.T) {
+	// The fail-open half: every one of these is a summary the Driver never got, and
+	// a Tool Result it did get beats speculation about what the summary would have
+	// said. guardCommand refuses the same list outright — the two callers disagree
+	// because their defaults differ, not because the anomalies differ.
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"hook exits non-zero", "echo '{\"hookSpecificOutput\":{\"updatedToolOutput\":\"SUMMARY\"}}'\nexit 1"},
+		{"hook writes unparsable output", "echo 'not json at all'"},
+		{"hook answers JSON with no updatedToolOutput", `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'`},
+		{"hook answers an empty updatedToolOutput", `echo '{"hookSpecificOutput":{"updatedToolOutput":""}}'`},
+		{"hook answers a null hookSpecificOutput", `echo '{"hookSpecificOutput":null}'`},
+		{"hook writes nothing", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := &summaryHook{path: writeGuardHookScript(t, "summarize.sh", tc.body)}
+
+			got := summarizeToolOutput("bash", "ls -l", "file listing\nexit code: 0", hook, nil)
+
+			if got != "file listing\nexit code: 0" {
+				t.Errorf("summarizeToolOutput = %q, want the original Tool Result unchanged", got)
+			}
+		})
+	}
+}
+
+func TestSummarizeToolOutputKeepsTheOriginalWithoutASummaryHook(t *testing.T) {
+	// The unconfigured case is the common one, and it is the same answer: the
+	// command's own output, untouched.
+	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", nil, nil)
+
+	if got != "file listing\nexit code: 0" {
+		t.Errorf("summarizeToolOutput = %q, want the original Tool Result", got)
+	}
+}
+
+func TestSummarizeToolOutputKeepsTheOriginalWhenTheScriptCannotBeStarted(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "never-installed.sh")
+
+	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", &summaryHook{path: missing}, nil)
+
+	if got != "file listing\nexit code: 0" {
+		t.Errorf("summarizeToolOutput = %q, want the original Tool Result: a summary hook that is not on disk loses the summary, not the answer", got)
+	}
+}
+
+func TestSummarizeToolOutputKeepsTheOriginalWhenTheHookHangs(t *testing.T) {
+	old := guardHookTimeout
+	guardHookTimeout = 100 * time.Millisecond
+	defer func() { guardHookTimeout = old }()
+	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
+
+	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", &summaryHook{path: script}, nil)
+
+	if got != "file listing\nexit code: 0" {
+		t.Errorf("summarizeToolOutput = %q, want the original Tool Result: a fired bound loses the summary, not the answer", got)
+	}
+}
+
+func TestSummarizeToolOutputSkipsAToolTheEntryDoesNotName(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	script := writeGuardHookScript(t, "summarize.sh",
+		`touch `+marker+`
+echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+
+	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", &summaryHook{path: script, tools: []string{"Write"}}, nil)
+
+	if got != "file listing\nexit code: 0" {
+		t.Errorf("summarizeToolOutput = %q, want the original for a tool the entry does not name", got)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("summary script %s ran for a tool its entry does not name", script)
+	}
+}
+
+func TestSummarizeToolOutputCapsTheReplacementWithTheToolResultBound(t *testing.T) {
+	// The same floor runBashTool applies, so a hook summarising upwards cannot hand
+	// the Model a longer result than the command itself was allowed.
+	old := bashToolMaxOutput
+	bashToolMaxOutput = 64
+	defer func() { bashToolMaxOutput = old }()
+	long := strings.Repeat("s", 200)
+	script := writeGuardHookScript(t, "summarize.sh",
+		`printf '{"hookSpecificOutput":{"updatedToolOutput":"`+long+`"}}'`)
+
+	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", &summaryHook{path: script}, nil)
+
+	if !strings.HasPrefix(got, truncatedOutputMarker(bashToolMaxOutput)+"\n") {
+		t.Errorf("summary replacement = %q, want it capped behind %q", got, truncatedOutputMarker(bashToolMaxOutput))
+	}
+	if tail := long[len(long)-bashToolMaxOutput:]; !strings.HasSuffix(got, tail) {
+		t.Errorf("summary replacement = %q, want the last %d bytes of the hook's summary kept", got, bashToolMaxOutput)
 	}
 }
