@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -135,14 +136,24 @@ func spawnPair(t *testing.T, raw string) (callEv, resultEv map[string]any) {
 type subagentReplyServer struct {
 	mu        sync.Mutex
 	failModel string
-	replies   []string
-	answered  int
-	bodies    [][]byte
-	srv       *httptest.Server
+	// passes counts how many of failModel's POSTs are still answered from the
+	// script before the refusals start, so a test can hand a child one Model call
+	// that succeeds — and one that fails afterwards.
+	passes   int
+	replies  []string
+	answered int
+	bodies   [][]byte
+	srv      *httptest.Server
 }
 
 func newSubagentReplyServer(t *testing.T, failModel string, replies ...string) *subagentReplyServer {
-	s := &subagentReplyServer{failModel: failModel, replies: replies}
+	return newSubagentReplyServerPassing(t, failModel, 0, replies...)
+}
+
+// newSubagentReplyServerPassing refuses failModel only after answering its first
+// passes POSTs from the script.
+func newSubagentReplyServerPassing(t *testing.T, failModel string, passes int, replies ...string) *subagentReplyServer {
+	s := &subagentReplyServer{failModel: failModel, passes: passes, replies: replies}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
@@ -151,9 +162,12 @@ func newSubagentReplyServer(t *testing.T, failModel string, replies ...string) *
 			Model string `json:"model"`
 		}
 		_ = json.Unmarshal(body, &req)
-		fail := req.Model == failModel
+		fail := req.Model == failModel && s.passes <= 0
 		if !fail {
 			if s.answered < len(s.replies) {
+				if req.Model == failModel {
+					s.passes--
+				}
 				reply := s.replies[s.answered]
 				s.answered++
 				s.mu.Unlock()
@@ -502,7 +516,7 @@ func TestSubagentRelayDropsNonObjectLines(t *testing.T) {
 	stream := "not an event at all\nnull\n" +
 		`{"kind":"result","timestamp":1234567890123,"text":"child answer","num_turns":1}` + "\n"
 
-	text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", eventWriter{w: &out}, &errOut)
+	text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut))
 	if !sawResult || text != "child answer" {
 		t.Errorf("relay returned text %q sawResult %v, want the result event's text", text, sawResult)
 	}
@@ -521,5 +535,319 @@ func TestSubagentRelayDropsNonObjectLines(t *testing.T) {
 	dropped := errOut.String()
 	if !strings.Contains(dropped, "not an event at all") {
 		t.Errorf("stderr does not name the discarded line: %q", dropped)
+	}
+}
+
+// TestSubagentChildTurnDoesNotBumpParentNumTurns keeps num_turns what it has
+// always been: this process's own Model calls, however many a child made.
+func TestSubagentChildTurnDoesNotBumpParentNumTurns(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		withUsage(parentToolCallResponse, "m-parent", 100, 20),
+		usageCompletion("m-reviewer", "child answer", 7, 1),
+		usageCompletion("m-parent", "parent answer", 30, 5),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	// The child ran a whole turn of its own inside the pair; the parent still
+	// counts only its two Model calls.
+	if got, _ := parentResult(t, stdout.String())["num_turns"].(float64); int(got) != 2 {
+		t.Errorf("parent result num_turns = %v, want the parent's own two Model calls", got)
+	}
+}
+
+// TestSubagentRollUpAddsNoUsageEventOfTheParents: the child's spend reaches the
+// result through the tally, never through a usage event the parent invents — a
+// reader that sums the usage events it sees must still get one per parent call.
+func TestSubagentRollUpAddsNoUsageEventOfTheParents(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		withUsage(parentToolCallResponse, "m-parent", 100, 20),
+		usageCompletion("m-reviewer", "child answer", 7, 1),
+		usageCompletion("m-parent", "parent answer", 30, 5),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	own, relayedUsage := 0, 0
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] != "usage" {
+			continue
+		}
+		if ev["in_subagent"] == true {
+			relayedUsage++
+			// The relayed line stays attributed to the child even though its spend is
+			// now counted: attribution and accounting are separate facts.
+			if ev["role"] != "reviewer" {
+				t.Errorf("relayed usage role = %v, want the agent name", ev["role"])
+			}
+			continue
+		}
+		own++
+		if ev["model"] != "m-parent" {
+			t.Errorf("parent usage model = %v, want the parent's own model", ev["model"])
+		}
+	}
+	if own != 2 {
+		t.Errorf("stdout carries %d non-relayed usage events, want exactly one per parent Model call: %q", own, stdout.String())
+	}
+	if relayedUsage != 1 {
+		t.Errorf("stdout carries %d relayed usage events, want the child's one: %q", relayedUsage, stdout.String())
+	}
+}
+
+// childBashTurnResponse is a child turn that keeps the child running: one bash
+// Tool Call, so its next Model call is the one the fake refuses.
+const childBashTurnResponse = `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+
+// TestSubagentFailingChildStillContributesItsSpend is why the roll-up folds usage
+// events rather than the child's result totals: a child that dies emits no result
+// event at all, and the tokens it already spent are still real.
+func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newSubagentReplyServerPassing(t, "m-reviewer", 1,
+		withUsage(parentToolCallResponse, "m-parent", 100, 20),
+		withUsage(childBashTurnResponse, "m-reviewer", 7, 1),
+		usageCompletion("m-parent", "parent answer", 30, 5),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a dead child is still a Tool Result; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	result := parentResult(t, stdout.String())
+	got := resultTokenFields(t, result)
+	if got["input"] != 137 || got["output"] != 26 {
+		t.Errorf("parent result tokens = %v, want parent 130/25 plus the dead child's 7/1", got)
+	}
+	// The premise of the assertion above: the child got one usage event relayed,
+	// and died before it could report a result of its own.
+	var relayedResult, relayedUsage int
+	for _, ev := range relayedEvents(t, stdout.String()) {
+		switch ev["kind"] {
+		case "result":
+			relayedResult++
+		case "usage":
+			relayedUsage++
+		}
+	}
+	if relayedUsage != 1 || relayedResult != 0 {
+		t.Errorf("relayed stream has %d usage and %d result events, want the child's one usage and no result: %q", relayedUsage, relayedResult, stdout.String())
+	}
+	_, resultEv := spawnPair(t, stdout.String())
+	out, _ := resultEv["tool_output"].(string)
+	if !strings.HasPrefix(out, "error:") {
+		t.Errorf("tool_output = %q, want an error:-prefixed result", out)
+	}
+	if got, _ := result["num_turns"].(float64); int(got) != 2 {
+		t.Errorf("parent result num_turns = %v, want the parent's own two Model calls", got)
+	}
+}
+
+// TestSubagentRelayIgnoresUnusableUsageTokens: one child usage line with no
+// tokens, or tokens of the wrong shape, contributes nothing and must not corrupt
+// the parent's totals — and it still gets relayed, because relaying and
+// accounting are separate jobs.
+func TestSubagentRelayIgnoresUnusableUsageTokens(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var spent tokenTotals
+	s := session{events: eventWriter{w: &out}, stderr: &errOut, delegated: &spent, models: map[string]struct{}{}}
+	stream := strings.Join([]string{
+		`{"kind":"usage","timestamp":1,"model":"m-reviewer"}`,
+		`{"kind":"usage","timestamp":2,"tokens":"not an object"}`,
+		`{"kind":"usage","timestamp":3,"tokens":{"input":"seven"}}`,
+		`{"kind":"usage","timestamp":4,"tokens":null}`,
+	}, "\n") + "\n"
+
+	if _, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", s); sawResult {
+		t.Errorf("sawResult = true, want false: the stream carries no result event")
+	}
+	if spent != (tokenTotals{}) {
+		t.Errorf("delegated tally = %+v, want unusable usage lines to contribute nothing", spent)
+	}
+	// A model id is a separate fact from the tokens, so the one line that carried
+	// it still counts.
+	if _, ok := s.models["m-reviewer"]; !ok {
+		t.Errorf("model set = %v, want the usage event's model id recorded", s.models)
+	}
+	if events := stdoutEvents(t, out.String()); len(events) != 4 {
+		t.Errorf("parent stdout got %d lines, want all four usage events relayed: %q", len(events), out.String())
+	}
+}
+
+// TestSubagentRelayResultWithoutText: a result event is how the child hands over
+// its answer, so one carrying no usable text is a failure rather than an empty
+// success — the error: prefix is the only failure signal the Tool Result can
+// carry, and it still gets relayed because relaying and answering are separate.
+func TestSubagentRelayResultWithoutText(t *testing.T) {
+	for _, stream := range []string{
+		`{"kind":"result","timestamp":1,"num_turns":1}` + "\n",
+		`{"kind":"result","timestamp":2,"text":42,"num_turns":1}` + "\n",
+	} {
+		var out, errOut bytes.Buffer
+		text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut))
+		if !sawResult {
+			t.Errorf("sawResult = false, want true: the child did finish with a result event (%s)", stream)
+		}
+		if !strings.HasPrefix(text, "error:") {
+			t.Errorf("relay returned text %q, want an error:-prefixed message (%s)", text, stream)
+		}
+		if events := stdoutEvents(t, out.String()); len(events) != 1 || events[0]["kind"] != "result" {
+			t.Errorf("parent stdout = %q, want the child's result event relayed", out.String())
+		}
+	}
+}
+
+// TestSubagentRelayDrainsAfterOverLongLine: the scan stops at a line larger than
+// sseMaxLineBytes, but the child is still writing into a pipe nobody reads and
+// there is deliberately no child-side timeout, so the relay has to drain what is
+// left or runSubagentTool's cmd.Wait can block forever. The lines after the break
+// are the accepted loss: the run ends as "emitted no result event".
+func TestSubagentRelayDrainsAfterOverLongLine(t *testing.T) {
+	chunk := strings.Repeat("x", 64*1024)
+	// Assembled from repeats rather than one oversized literal, so the test stays
+	// quick and never holds the whole over-long line in memory at once.
+	var parts []io.Reader
+	for i := 0; i < sseMaxLineBytes/len(chunk)+16; i++ {
+		parts = append(parts, strings.NewReader(chunk))
+	}
+	stream := io.MultiReader(append(parts, strings.NewReader("\n"+`{"kind":"result","timestamp":1,"text":"late answer"}`+"\n"))...)
+
+	var out, errOut bytes.Buffer
+	text, sawResult := relaySubagentOutput(stream, "reviewer", relaySession(&out, &errOut))
+	if sawResult || text != "" {
+		t.Errorf("relay returned text %q sawResult %v, want the result after the broken line to be lost", text, sawResult)
+	}
+	if !strings.Contains(errOut.String(), fmt.Sprint(sseMaxLineBytes)) {
+		t.Errorf("stderr does not name the byte bound: %q", errOut.String())
+	}
+	if out.Len() != 0 || strings.Contains(out.String(), "xxxx") {
+		t.Errorf("over-long line reached the parent's stdout: %q", boundBody(out.Bytes()))
+	}
+	// The reader sitting at EOF is the whole point: a real pipe left half-read is a
+	// child blocked in Write.
+	if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("read after the relay returned %v, want io.EOF: the relay left output undrained", err)
+	}
+}
+
+// relaySession builds the session a test needs when it calls the relay directly
+// rather than through a whole run.
+func relaySession(out, errOut io.Writer) session {
+	return session{events: eventWriter{w: out}, stderr: errOut, delegated: &tokenTotals{}, models: map[string]struct{}{}}
+}
+
+// withUsage attaches a model id and one Model call's usage to a scripted
+// completion that carries neither: a roll-up test can only tell the parent's
+// tokens from the child's if each is stamped with its own numbers.
+func withUsage(response, model string, input, output int) string {
+	return strings.Replace(response, `{"choices"`, fmt.Sprintf(`{"model":%q,"usage":{"prompt_tokens":%d,"completion_tokens":%d},"choices"`, model, input, output), 1)
+}
+
+// usageCompletion scripts a final answer that answers as a given model id and
+// spends given tokens.
+func usageCompletion(model, text string, input, output int) string {
+	return withUsage(completion(text), model, input, output)
+}
+
+// resultTokenFields reads a result event's token object as numbers. A value that
+// is not a number fails the test rather than reading as zero, so a rewritten
+// field cannot hide as a missing one.
+func resultTokenFields(t *testing.T, ev map[string]any) map[string]float64 {
+	t.Helper()
+	raw, ok := ev["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("result event carries no token object: %#v", ev["tokens"])
+	}
+	out := make(map[string]float64, len(raw))
+	for field, v := range raw {
+		n, ok := v.(float64)
+		if !ok {
+			t.Fatalf("result token %s = %#v, want a JSON number", field, v)
+		}
+		out[field] = n
+	}
+	return out
+}
+
+// resultStrings reads one of a result event's string-array fields as strings.
+func resultStrings(t *testing.T, ev map[string]any, field string) []string {
+	t.Helper()
+	raw, ok := ev[field].([]any)
+	if !ok {
+		t.Fatalf("result event field %s = %#v, want a JSON array", field, ev[field])
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("result event %s entry = %#v, want a string", field, v)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// TestSubagentChildUsageRollsIntoParentResultTotals is the issue's accounting
+// criterion: the parent's result states what the whole session cost, child
+// Model calls included.
+func TestSubagentChildUsageRollsIntoParentResultTotals(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		withUsage(parentToolCallResponse, "m-parent", 100, 20),
+		usageCompletion("m-reviewer", "child answer", 7, 1),
+		usageCompletion("m-parent", "parent answer", 30, 5),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	got := resultTokenFields(t, parentResult(t, stdout.String()))
+	want := map[string]float64{"input": 137, "output": 26, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0, "cost_usd": 0}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parent result tokens = %v, want parent 130/25 plus child 7/1 = %v", got, want)
+	}
+	if got["input"] == 130 && got["output"] == 25 {
+		t.Errorf("parent result tokens are the parent's own %v; the child's spend is missing", got)
+	}
+}
+
+// TestSubagentChildModelRollsIntoParentResultModels: a model that answered the
+// session answered it, whoever delegated the call to it.
+func TestSubagentChildModelRollsIntoParentResultModels(t *testing.T) {
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		withUsage(parentToolCallResponse, "m-parent", 100, 20),
+		usageCompletion("m-reviewer", "child answer", 7, 1),
+		usageCompletion("m-parent", "parent answer", 30, 5),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	// Sorted, because sortedModelIDs is the only order the result contract has.
+	if got := resultStrings(t, parentResult(t, stdout.String()), "models"); !reflect.DeepEqual(got, []string{"m-parent", "m-reviewer"}) {
+		t.Errorf("parent result models = %v, want both model ids sorted", got)
 	}
 }
