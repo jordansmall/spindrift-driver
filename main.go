@@ -140,6 +140,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// would carry across every run() in one process, and the state is per run.
 	var lastKey string
 	repeat := 0
+	// refusals counts how many calls in a row the breaker refused: a call that
+	// actually ran means the Model changed course, so the count starts over.
+	refusals := 0
 	for turn := 0; turn < cfg.maxTurns; turn++ {
 		call++
 		messageID := fmt.Sprintf("msg-%d", call)
@@ -221,8 +224,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			var output string
 			refused := repeat >= repeatedCallRefuseLimit
 			if refused {
+				refusals++
 				output = repeatedCallRefusal(tc.Function.Name, repeat)
 			} else {
+				// Only the breaker's own refusals chain. A call a Guard Hook blocked comes
+				// back through plan.run() like any other result, and the Model does get to
+				// react to it, so it breaks the streak rather than feeding the counter.
+				refusals = 0
 				output = plan.run()
 			}
 			result := toolResultEvent(messageID, toolID, tc.Function.Name, plan, output)
@@ -232,6 +240,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				result.IsError = true
 			}
 			_ = events.emit(result)
+			if refusals >= repeatedCallEndLimit {
+				// Returning before the replay leaves the refusal out of the conversation
+				// the run is ending over, and any later call of this batch never got a
+				// tool_call, so no pair is left open by the early exit.
+				breaker := fmt.Errorf("repeated the same %s call so often it was refused %d times in a row, so the run ended", tc.Function.Name, refusals)
+				fmt.Fprintf(stderr, "spindrift-driver: %v\n", breaker)
+				return errorExit(events, 1, breaker)
+			}
 			// The replayed Tool Result message is unchanged, idless calls included:
 			// the synthesised tool id belongs to the event stream, not to the Model.
 			messages = append(messages, chatMessage{Role: "tool", Content: output, ToolCallID: tc.ID})
@@ -334,6 +350,11 @@ func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output s
 // refusals — so each gets its own name rather than one shared literal that would
 // tie two independent limits together.
 const repeatedCallRefuseLimit = 3
+
+// repeatedCallEndLimit is how many refusals in a row the breaker hands out
+// before it ends the run: past that many identical calls the refusal is clearly
+// not being heeded, and spending turns on it only repeats itself.
+const repeatedCallEndLimit = 3
 
 // repeatedCallRefusal is the synthetic Tool Result a refused call gets in place
 // of running. It carries the "error: " prefix the Guard Hook refusal established

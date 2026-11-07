@@ -1763,6 +1763,55 @@ func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
 	}
 }
 
+// TestRunThreeConsecutiveRefusalsEndTheRun is the stop half of the breaker: a
+// Model refused once keeps sending the identical call, so the refusal is not
+// steering it and the run ends non-zero rather than spending turns on it.
+func TestRunThreeConsecutiveRefusalsEndTheRun(t *testing.T) {
+	const wantErr = "repeated the same bash call so often it was refused 3 times in a row, so the run ended"
+	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
+	srv := newScriptedChatServer(t, forever, forever, forever, forever, forever)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 after three refusals in a row; stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	if got := oneErrorEvent(t, raw); got != wantErr {
+		t.Errorf("error event text = %q, want %q", got, wantErr)
+	}
+	if !strings.Contains(stderr.String(), wantErr) {
+		t.Errorf("stderr = %q, want the breaker sentence the error event carries", stderr.String())
+	}
+	events := stdoutEvents(t, raw)
+	var results []map[string]any
+	for i, ev := range events {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		if i == 0 || events[i-1]["kind"] != "tool_call" {
+			t.Errorf("tool_result at %d has no tool_call immediately before it: %q", i, raw)
+		}
+		results = append(results, ev)
+	}
+	if len(results) != 5 {
+		t.Fatalf("tool_result events = %d, want one per scripted call: %q", len(results), raw)
+	}
+	last := results[len(results)-1]
+	output, _ := last["tool_output"].(string)
+	// No exit-code line is the proof the third refusal is the refused call's own
+	// result and that it never started a command.
+	if strings.Contains(output, "exit code:") {
+		t.Errorf("last tool_output = %q, want the refusal with no exit-code line", output)
+	}
+	if last["is_error"] != true {
+		t.Errorf("last tool_result is_error = %v, want true: %v", last["is_error"], last)
+	}
+	if bodies := srv.requestBodies(t); len(bodies) != 5 {
+		t.Errorf("POSTs = %d, want 5: the run stopped on the third refusal, not at the turn cap", len(bodies))
+	}
+}
+
 func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
 	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
 	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
