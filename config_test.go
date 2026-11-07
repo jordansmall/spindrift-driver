@@ -163,7 +163,7 @@ func TestDriverConfigPath(t *testing.T) {
 }
 
 func TestLoadDriverConfigWellFormed(t *testing.T) {
-	path := writeDriverConfig(t, `{"base_url":"http://model.test:9/v1","api_key":"sk-test","timeout":"90s","agents_dir":"/srv/agents"}`)
+	path := writeDriverConfig(t, `{"base_url":"http://model.test:9/v1","api_key":"sk-test","timeout":"90s","agents_dir":"/srv/agents","hook_manifest":"/srv/hooks.json"}`)
 
 	cfg, err := loadDriverConfig(path)
 	if err != nil {
@@ -174,6 +174,10 @@ func TestLoadDriverConfigWellFormed(t *testing.T) {
 	}
 	if cfg.agentsDir != "/srv/agents" {
 		t.Errorf("agentsDir = %q, want %q", cfg.agentsDir, "/srv/agents")
+	}
+	// verbatim: no Clean, no tilde expansion, so a later error names what the operator wrote
+	if cfg.hookManifest != "/srv/hooks.json" {
+		t.Errorf("hookManifest = %q, want %q", cfg.hookManifest, "/srv/hooks.json")
 	}
 	if cfg.apiKey != "sk-test" {
 		t.Errorf("apiKey = %q, want %q", cfg.apiKey, "sk-test")
@@ -190,7 +194,7 @@ func TestLoadDriverConfigPartialFileLeavesRestZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadDriverConfig(%q) error = %v, want nil", path, err)
 	}
-	if cfg.baseURL != "" || cfg.timeout != 0 || cfg.agentsDir != "" {
+	if cfg.baseURL != "" || cfg.timeout != 0 || cfg.agentsDir != "" || cfg.hookManifest != "" {
 		t.Errorf("cfg = %+v, want only apiKey set", cfg)
 	}
 	if cfg.apiKey != "sk-only" {
@@ -273,6 +277,9 @@ func TestLoadDriverConfigWrongType(t *testing.T) {
 		{"agents_dir number", `{"agents_dir":8080}`, `field "agents_dir" must be a string, got number`},
 		{"agents_dir null", `{"agents_dir":null}`, `field "agents_dir" must be a string, got null`},
 		{"agents_dir object", `{"agents_dir":{"d":1}}`, `field "agents_dir" must be a string, got object`},
+		{"hook_manifest number", `{"hook_manifest":8080}`, `field "hook_manifest" must be a string, got number`},
+		{"hook_manifest null", `{"hook_manifest":null}`, `field "hook_manifest" must be a string, got null`},
+		{"hook_manifest array", `{"hook_manifest":["a"]}`, `field "hook_manifest" must be a string, got array`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeDriverConfig(t, tc.contents)
