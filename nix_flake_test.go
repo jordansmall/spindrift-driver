@@ -184,10 +184,14 @@ func TestFlakeCheckRunsGoTestSuite(t *testing.T) {
 
 	// The suite looks `sleep` up on PATH and creates an exclusive probe file in
 	// the process cwd, so the check needs coreutils/bash present and a writable
-	// build dir; a checkPhase running only `go test` would fail on PATH.
+	// build dir; a checkPhase running only `go test` would fail on PATH. It also
+	// needs jq: since d26b785 every guarded Bash call is refused unless jq is on
+	// PATH, so without it the hook tests cannot run at all. The window is the
+	// squashed (whitespace-free) text, so 160 chars spans the whole list; widen
+	// it if the list grows past that.
 	if i := strings.Index(flat, "nativeCheckInputs"); i >= 0 {
 		scope := flat[i:min(i+160, len(flat))]
-		for _, tool := range []string{"bash", "coreutils"} {
+		for _, tool := range []string{"bash", "coreutils", "jq"} {
 			if !strings.Contains(scope, tool) {
 				t.Errorf("flake.nix nativeCheckInputs is missing %s, which the test suite shells out to", tool)
 			}
