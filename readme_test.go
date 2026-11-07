@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -389,6 +390,20 @@ func TestReadmeDocumentsDriverConfig(t *testing.T) {
 	if !strings.Contains(sec, "agents_dir") {
 		t.Error("the Driver Config section does not name the agents_dir field that relocates the Agent File roster")
 	}
+	if !strings.Contains(sec, "hook_manifest") {
+		t.Error("the Driver Config section does not name the hook_manifest field that points at the Hook Manifest")
+	}
+	// The field set is closed, and the page states how many fields it holds: the
+	// number is what makes "nothing else belongs in it" a checkable claim rather
+	// than a vibe, and a reader counting fields is the one who spots a sixth.
+	if !regexp.MustCompile(`holds five fields`).MatchString(sec) {
+		t.Error("the Driver Config section does not say the file holds five fields")
+	}
+	for _, want := range []string{"base_url", "api_key", "timeout", "agents_dir", "hook_manifest"} {
+		if !near(sec, "five fields", want, 400) {
+			t.Errorf("the Driver Config section's five-field sentence does not name %s", want)
+		}
+	}
 	// Where the key may and may not travel.
 	if !near(sec, "api key", "process listing", 240) {
 		t.Error("the Driver Config section does not say the api key never appears in a process listing")
@@ -405,6 +420,106 @@ func TestReadmeDocumentsDriverConfig(t *testing.T) {
 		if !strings.Contains(sec, want) {
 			t.Errorf("the Driver Config section does not tie the file to %s", want)
 		}
+	}
+}
+
+// TestReadmeDocumentsGuardHooks pins the operator-facing half of the pre-call
+// Guard Hook chain: where the manifest lives and what it looks like, in what order
+// it runs, what a hook is handed and answers with, what a refusal looks like, what
+// happens when a hook cannot answer, and — because only half the protocol is built
+// — what is still #22's. A host that bakes a hook from wrong prose bakes one whose
+// verdict is never read, or expects a rewrite this step does not apply.
+func TestReadmeDocumentsGuardHooks(t *testing.T) {
+	const file = "README.md"
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	sec := markdownSectionBody(string(raw), "guard hooks")
+	if sec == "" {
+		t.Fatal("README.md has no ## Guard Hooks section")
+	}
+	// Placement is part of the doc: the manifest is a Driver Config field and the
+	// guards are what a Subagent inherits, so the section sits between the two.
+	if !indexOrder(norm, "## driver config", "## guard hooks", "## subagents") {
+		t.Error("## Guard Hooks does not sit between ## Driver Config and ## Subagents")
+	}
+	// The manifest's schema, top level and per entry, plus the one place its path
+	// comes from — a host writes this file and cannot guess its way to the key.
+	for _, want := range []string{"json", "pre", "path", "tools", "rewrites", "hook_manifest", "driver config"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Guard Hooks section does not name the manifest field or source %s", want)
+		}
+	}
+	// Run order and scope, stated together: the file order is the run order, and an
+	// entry applies only to the tools it names.
+	if !strings.Contains(sec, "manifest order") {
+		t.Error("the Guard Hooks section does not say the hooks run in manifest order")
+	}
+	if !near(sec, "order", "tools", 300) {
+		t.Error("the Guard Hooks section does not say hooks run only for the tools their entry names")
+	}
+	// The protocol, by field name: these are the tokens a hook author types.
+	for _, want := range []string{"stdin", "tool_name", "tool_input", "hookspecificoutput", "permissiondecision", "permissiondecisionreason"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Guard Hooks section does not document the hook protocol field or channel %s", want)
+		}
+	}
+	// A deny has to reach the Model as an error Tool Result, and the command has to
+	// be gone rather than merely disapproved.
+	var denyLines []string
+	for _, s := range sentencesContaining(sec, "deny") {
+		if strings.Contains(s, "error") && strings.Contains(s, "never run") {
+			denyLines = append(denyLines, s)
+		}
+	}
+	if len(denyLines) == 0 {
+		t.Error("no sentence says a deny blocks the call as an error Tool Result with the command never run")
+	}
+	// Fail closed, case by case — the Driver cannot tell a broken hook from an
+	// approving one, so each of these blocks.
+	for _, want := range []string{"cannot be run", "overrun", "writes more than", "non-zero", "nothing readable"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Guard Hooks section does not state one of the fail-closed cases (missing %q)", want)
+		}
+	}
+	// The bound is read from the code, so raising it fails here until the page says
+	// the new value — the same rule --timeout is pinned under.
+	if want := guardHookTimeout.String(); !strings.Contains(sec, want) {
+		t.Errorf("the Guard Hooks section does not state the per-hook bound %s", want)
+	}
+	// Likewise the stdout bound. Read as MiB and lowercased to match the normalised
+	// page, so a cap that stops being a whole number of MiB fails here too.
+	if want := strings.ToLower(fmt.Sprintf("%d MiB", guardHookOutputLimit/(1<<20))); !strings.Contains(sec, want) {
+		t.Errorf("the Guard Hooks section does not state the stdout bound %s (%d bytes)", want, guardHookOutputLimit)
+	}
+	// Silence passing is what keeps a manifest from refusing everything.
+	if !near(sec, "silence", "pass", 200) {
+		t.Error("the Guard Hooks section does not say silence on a clean exit passes")
+	}
+	// The two states of the config key, told apart: nothing named, so nothing is
+	// guarded, versus something named that cannot be read.
+	if !regexp.MustCompile(`no hook_manifest|without a manifest|unconfigured`).MatchString(sec) {
+		t.Error("the Guard Hooks section does not say an unconfigured manifest means no hooks run")
+	}
+	if !near(sec, "hook_manifest", "exit 2", 300) {
+		t.Error("the Guard Hooks section does not make a configured-but-unreadable manifest an exit 2 startup error")
+	}
+	// Delegation is not an escape hatch: the child inherits the manifest.
+	if !near(sec, "child", "inherit", 240) {
+		t.Error("the Guard Hooks section does not say a spawned child inherits the manifest")
+	}
+	// What #22 owns, stated as not implemented rather than left to inference: a
+	// reader who believes rewrites work ships a manifest that lies.
+	for _, want := range []string{"#22", "rewrite", "post-call", "jq"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Guard Hooks section does not state that %s belongs to #22 and is not implemented here", want)
+		}
+	}
+	if !regexp.MustCompile(`not implemented|does not apply|no effect here`).MatchString(sec) {
+		t.Error("the Guard Hooks section does not say plainly that #22's half is not implemented here")
 	}
 }
 
@@ -474,6 +589,11 @@ func TestReadmeDocumentsSubagents(t *testing.T) {
 	}
 	if !near(sec, "inherit", "driver config", 240) {
 		t.Error("the Subagents section does not say the child reads the same Driver Config as the parent")
+	}
+	// The guards have to cross the delegation boundary with the config, or a Model
+	// refused a command delegates to a child that runs it.
+	if !near(sec, "inherit", "hook manifest", 240) {
+		t.Error("the Subagents section does not say the child inherits the Hook Manifest, and so the parent's Guard Hooks")
 	}
 	// Relay and accounting: a host decoding the parent's Pass log sees the child's
 	// events attributed, and the parent's totals include the delegated spend.
