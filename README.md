@@ -11,7 +11,7 @@ usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns
 ```
 
 The prompt is positional or on stdin; `--model` is required; `--max-turns` caps the
-agent loop (default 50). `--timeout` is an idle bound on each chat attempt — the dial,
+agent loop (default 300). `--timeout` is an idle bound on each chat attempt — the dial,
 the response headers and the gap between received bytes of the streamed response —
 and defaults to 5m0s, so a stream that keeps arriving may run far past it. Raise it
 (`--timeout 15m`) only when the server thinks for a long time before its first token, or

@@ -2771,13 +2771,15 @@ func TestParseArgsStdinReadError(t *testing.T) {
 }
 
 func TestParseArgsMaxTurns(t *testing.T) {
-	// default when the flag is absent
+	// default when the flag is absent: pinned literally, so raising the built-in
+	// is a deliberate change that TestUsageStatesMaxTurnsDefault then drags the
+	// usage prose along with
 	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
 	if err != nil {
 		t.Fatalf("parseArgs returned error: %v", err)
 	}
-	if cfg.maxTurns != 50 {
-		t.Errorf("default maxTurns = %d, want 50", cfg.maxTurns)
+	if cfg.maxTurns != 300 {
+		t.Errorf("default maxTurns = %d, want 300", cfg.maxTurns)
 	}
 
 	// prompt before flags: the issue's argv shape
@@ -2796,6 +2798,22 @@ func TestParseArgsMaxTurns(t *testing.T) {
 	}
 	if cfg.maxTurns != 3 {
 		t.Errorf("maxTurns = %d, want 3", cfg.maxTurns)
+	}
+}
+
+// -h is the manual an operator running the Driver actually reads, so the number
+// it prints for --max-turns has to be the number the flag runs with. Naming
+// defaultMaxTurns rather than typing the digits means raising the built-in fails
+// here until the sentence is updated too.
+func TestUsageStatesMaxTurnsDefault(t *testing.T) {
+	if !strings.Contains(usage, "--max-turns") {
+		t.Errorf("usage does not document the --max-turns flag:\n%s", usage)
+	}
+	// The default belongs on the flag's own line, not just somewhere in the
+	// blurb: an operator scanning for --max-turns reads that line and nothing else.
+	want := `(?m)^--max-turns[^\n]*\(default ` + fmt.Sprint(defaultMaxTurns) + `\)`
+	if !regexp.MustCompile(want).MatchString(usage) {
+		t.Errorf("the --max-turns line does not state the default %d (%s):\n%s", defaultMaxTurns, want, usage)
 	}
 }
 
