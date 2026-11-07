@@ -2,11 +2,12 @@
 
 A **Driver** for the spindrift coordinator: one prompt in, one final answer out — and
 the answer arrives as a `result` event on stdout's event stream, not as loose text.
-It talks to an OpenAI-compatible **Model** server, offers that Model a single Bash
-**Tool**, runs the Tool Calls the Model asks for, and loops until the Model answers.
+It talks to an OpenAI-compatible **Model** server, offers that Model a Bash **Tool**
+— and a Subagent **Tool** whenever Agent Files are present — runs the Tool Calls the
+Model asks for, and loops until the Model answers.
 
 ```
-usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>]
+usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>] [--agent <name>]
 ```
 
 The prompt is positional or on stdin; `--model` is required; `--max-turns` caps the
@@ -125,13 +126,15 @@ line ([ADR-0005](docs/adr/0005-driver-config.md)). spindrift writes the file thr
 is why the file exists at all.
 
 ```
-{"base_url": "http://model.example:8080/v1", "api_key": "sk-...", "timeout": "90s"}
+{"base_url": "http://model.example:8080/v1", "api_key": "sk-...", "timeout": "90s", "agents_dir": "/srv/agents"}
 ```
 
-The file holds exactly three fields: `base_url`, an optional `api_key`, and `timeout` —
-the idle bound `--timeout` sets, written as a Go duration string such as `"90s"`. Nothing
-else belongs in it: the Model name and `--max-turns` stay flags, so a file can move a
-run's traffic but never change what a run does. It lives at
+The file holds four fields: `base_url`, an optional `api_key`, `timeout` — the idle bound
+`--timeout` sets, written as a Go duration string such as `"90s"` — and `agents_dir`, the
+directory Agent Files are read from instead of the home-relative default (see
+[Subagents](#subagents)). Nothing else belongs in it: the Model name and `--max-turns`
+stay flags, so a file can move a run's traffic and point it at a roster but never change
+what a run does. It lives at
 `$HOME/.config/spindrift-driver/config.json`, or at the path `$SPINDRIFT_CONFIG` names,
 which is used verbatim.
 
@@ -154,6 +157,54 @@ never travels on the command line, so it never appears in a process listing wher
 user of the host could read it. Nothing is read from the working directory or from the
 Target repo — no `spindrift.json`, no `config.json` in the checkout, no dotenv file —
 because the repository under repair does not get to configure the run that repairs it.
+
+## Subagents
+
+A subagent is a roster entry the Model delegates to, and the roster is a directory of
+Agent Files: one file per entry, `*.md` files only, at `$HOME/.config/spindrift-driver/agents`
+or at the directory the Driver Config's `agents_dir` names. An absent directory at the
+default path is not an error — it is a run with no subagents — but a directory an
+`agents_dir` names has to exist, and an Agent File that will not parse is a startup error
+naming it, the way a file the operator wrote always is — as is a repeated frontmatter key,
+or two Agent Files claiming the same `name:`, which the driver refuses rather than
+resolving to whichever file sorts first. Entry order is the directory's lexical order, so
+the offer a Model sees is reproducible.
+
+An Agent File is frontmatter over a body:
+
+```
+---
+name: scout
+description: Maps a repository and reports where a change belongs.
+model: vendor/model-x
+tools: bash
+spawns:
+- worker
+---
+You are a scout. Read, and report paths; never edit.
+```
+
+`name` and `model` are required. `model` is the child's Model id, used verbatim — no
+effort suffix is parsed off it — and `--model` still overrides it for a run started with
+`--agent`, as it does for any run. The body below the frontmatter is the child's system
+prompt. `tools` and `spawns` are read and recorded, not enforced: every run gets the Bash
+Tool whatever its roster says, and no roster limits whom a run may delegate to.
+
+The Subagent Tool is offered only when the roster holds at least one Agent File — with
+none there is nobody for a call to name — and a call takes the `agent` to delegate to and
+the `task` to hand it. The child is this same binary re-executed with `--agent <name>` and
+the task as its prompt; it inherits the working directory, the environment and the Driver
+Config, which is how it reaches the same Model server and the same roster as its parent.
+A child is never offered the Subagent Tool, so delegation goes one level deep.
+
+Every event the child writes is relayed onto the parent's stdout as it arrives, with
+`role` set to the agent's name and `in_subagent` true, and the child's `usage` events roll
+into the parent's `result` token totals — a run's totals include what it delegated. The
+task's answer comes back as the Subagent Tool Result, a `tool_result` whose `subagent`
+names the agent that produced it. A child that fails — non-zero exit, or no `result` event
+at all — yields an error Tool Result and the parent continues: the Model decides whether to
+retry, delegate elsewhere, or answer. Spawns run one at a time, so a Model that asks for
+three subagents in one turn is served them in order.
 
 ## Manual live smoke test
 

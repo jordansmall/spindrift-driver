@@ -383,6 +383,12 @@ func TestReadmeDocumentsDriverConfig(t *testing.T) {
 			t.Errorf("the Driver Config section does not make %s a startup error that exits 2 naming the file and the problem", want)
 		}
 	}
+	// agents_dir belongs in this section although the roster is not about traffic:
+	// this is where a reader looks for what a file may redirect, and an entry-less
+	// section would leave the Agent File directory looking immovable.
+	if !strings.Contains(sec, "agents_dir") {
+		t.Error("the Driver Config section does not name the agents_dir field that relocates the Agent File roster")
+	}
 	// Where the key may and may not travel.
 	if !near(sec, "api key", "process listing", 240) {
 		t.Error("the Driver Config section does not say the api key never appears in a process listing")
@@ -399,5 +405,127 @@ func TestReadmeDocumentsDriverConfig(t *testing.T) {
 		if !strings.Contains(sec, want) {
 			t.Errorf("the Driver Config section does not tie the file to %s", want)
 		}
+	}
+}
+
+// TestReadmeDocumentsSubagents pins the operator-facing half of the roster: where
+// the files go and what may redirect the directory, what one file holds, when the
+// Model is offered the Subagent Tool, what the child process actually is, and how
+// its output reaches the parent's stream. A roster written from wrong prose yields
+// a child running another model from another prompt, and no event on stdout says
+// so — the reader's only check is the page.
+func TestReadmeDocumentsSubagents(t *testing.T) {
+	const file = "README.md"
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	sec := markdownSectionBody(string(raw), "subagents")
+	if sec == "" {
+		t.Fatal("README.md has no ## Subagents section")
+	}
+	// The roster is a directory with a home-relative default, not one file at a
+	// fixed path — the same shape the Driver Config established.
+	for _, want := range []string{".config/spindrift-driver/agents", "agents_dir", "driver config"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Subagents section does not name %s", want)
+		}
+	}
+	// What one Agent File holds: the frontmatter fields, and the body as the
+	// child's system prompt rather than as its prompt for one run.
+	for _, want := range []string{"frontmatter", "name", "description", "model", "tools", "spawns", "system prompt"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Subagents section does not document the Agent File field or field role %s", want)
+		}
+	}
+	// Both roster strictness rules are startup errors, not silent resolutions: a
+	// key written twice and a handle two files both claim each leave the run doing
+	// something other than what the operator wrote, and file order is no tiebreak.
+	var strictLines []string
+	for _, s := range sentencesContaining(sec, "`name:") {
+		if strings.Contains(s, "startup error") && strings.Contains(s, "repeated frontmatter key") {
+			strictLines = append(strictLines, s)
+		}
+	}
+	if len(strictLines) == 0 {
+		t.Error("no sentence makes a repeated frontmatter key or two Agent Files claiming the same name a startup error the driver refuses rather than resolves by file order")
+	}
+
+	// The offer is conditional: with no Agent Files there is nobody for a call to
+	// name, so prose that offers the Tool always describes calls that can only
+	// come back errors.
+	if !regexp.MustCompile(`only when[^.]*agent file|only when[^.]*roster|not offered[^.]*no agent`).MatchString(sec) {
+		t.Error("the Subagents section does not say the Subagent Tool is offered only when Agent Files are present")
+	}
+	// Both halves of a call: the entry to delegate to, and the task to delegate.
+	if !near(sec, "agent", "task", 200) {
+		t.Error("the Subagents section does not say a Subagent Tool call names the agent and states the task")
+	}
+	// The child is this binary re-executed with the selection flag, and it inherits
+	// the run around it — which is how it resolves the same Driver Config, and so
+	// the same roster, as its parent.
+	if !strings.Contains(sec, "--agent") {
+		t.Error("the Subagents section does not name the --agent flag the child process is re-executed with")
+	}
+	if !near(sec, "working directory", "environment", 240) {
+		t.Error("the Subagents section does not say the child inherits the working directory and the environment")
+	}
+	if !near(sec, "inherit", "driver config", 240) {
+		t.Error("the Subagents section does not say the child reads the same Driver Config as the parent")
+	}
+	// Relay and accounting: a host decoding the parent's Pass log sees the child's
+	// events attributed, and the parent's totals include the delegated spend.
+	for _, want := range []string{"role", "in_subagent"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the Subagents section does not state that relayed child events carry %s", want)
+		}
+	}
+	if !near(sec, "usage", "total", 240) {
+		t.Error("the Subagents section does not say a child's usage rolls into the parent's result totals")
+	}
+	// The answer returns as a Tool Result naming the agent it came from: the log
+	// has to distinguish a delegated result from a Bash one.
+	var answerLines []string
+	for _, s := range sentencesContaining(sec, "tool result") {
+		if strings.Contains(s, "answer") && strings.Contains(s, "subagent") {
+			answerLines = append(answerLines, s)
+		}
+	}
+	if len(answerLines) == 0 {
+		t.Error("no sentence says the child's answer comes back as the Subagent Tool Result naming the agent in subagent")
+	}
+	// A child that fails is the Model's problem to handle, not the run's: without
+	// this a reader writes a roster expecting a delegated failure to stop the run.
+	var failureLines []string
+	for _, s := range sentencesContaining(sec, "fail") {
+		if strings.Contains(s, "error") && (strings.Contains(s, "parent") || strings.Contains(s, "continues")) {
+			failureLines = append(failureLines, s)
+		}
+	}
+	if len(failureLines) == 0 {
+		t.Error("no sentence says a failing child yields an error Tool Result and the parent continues")
+	}
+	// Spawns serialize, so a Model asking for three subagents gets three answers in
+	// order rather than three processes contending for one server.
+	if !regexp.MustCompile(`one at a time|sequentially|never in parallel`).MatchString(sec) {
+		t.Error("the Subagents section does not say spawns run one at a time")
+	}
+	// The tools and spawns fields are recorded, not enforced: per-entry tool grants
+	// are not implemented, and a reader who believes otherwise ships a roster whose
+	// limits hold nothing.
+	if !regexp.MustCompile(`not (enforced|applied)`).MatchString(sec) {
+		t.Error("the Subagents section does not say the roster's tools and spawns fields are read but not enforced")
+	}
+
+	// The flag has to appear in the fenced usage line a reader copies, not only in
+	// the section below it.
+	usageBlock := markdownSectionAround(norm, "usage: spindrift-driver")
+	if usageBlock == "" {
+		t.Fatal("no usage block in " + file)
+	}
+	if !regexp.MustCompile(`usage: spindrift-driver.*\[--agent <name>\]`).MatchString(usageBlock) {
+		t.Error("the usage line does not list [--agent <name>] next to [--timeout <dur>]")
 	}
 }
