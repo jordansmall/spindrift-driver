@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -849,5 +850,183 @@ func TestSubagentChildModelRollsIntoParentResultModels(t *testing.T) {
 	// Sorted, because sortedModelIDs is the only order the result contract has.
 	if got := resultStrings(t, parentResult(t, stdout.String()), "models"); !reflect.DeepEqual(got, []string{"m-parent", "m-reviewer"}) {
 		t.Errorf("parent result models = %v, want both model ids sorted", got)
+	}
+}
+
+// denyHookRosterFixture writes the three files a guarded roster needs — one Agent
+// File for reviewer, a real Guard Hook script that denies only a command
+// containing the word "denied" for a reason naming a credential path, and the
+// Hook Manifest naming that script for Bash — and hands back the paths so each
+// test composes its own Driver Config. Only the config joins them, which is what
+// lets the contrast test below drop one key and nothing else.
+func denyHookRosterFixture(t *testing.T, reason string) (agentsDir, hookPath, manifestPath string) {
+	t.Helper()
+	agentsDir = t.TempDir()
+	writeAgentFile(t, agentsDir, "reviewer.md", "---\nname: reviewer\nmodel: m-reviewer\n---\nreview things\n")
+	// The hook reads the protocol payload on stdin, so the match is on the command
+	// text the child asked for and not on anything the shell would expand.
+	hookPath = writeGuardHookScript(t, "deny-credential-path.sh",
+		`input=$(cat)
+	case "$input" in
+	  *denied*) echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"`+reason+`"}}' ;;
+	esac`)
+	manifestPath = writeHookManifest(t, `{"pre":[{"path":"`+hookPath+`","tools":["Bash"]}]}`)
+	return agentsDir, hookPath, manifestPath
+}
+
+// childGuardTurnResponse scripts the child's one turn as a single assistant
+// message carrying two bash Tool Calls — the two-calls-in-one-message shape
+// TestRunStreamReassemblesInterleavedToolCallFragments pins — so the Guard chain
+// has to judge each call on its own and the refusal of one cannot spill onto the
+// other. The arguments are escaped by hand for the same reason
+// parentToolCallResponse is: a JSON object nested inside a JSON string.
+func childGuardTurnResponse(denied, clean string) string {
+	bashCall := func(id, command string) string {
+		return `{"id":"` + id + `","type":"function","function":{"name":"bash","arguments":"{\"command\":\"` + command + `\"}"}}`
+	}
+	return `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[` +
+		bashCall("call_denied", denied) + "," + bashCall("call_clean", clean) + `]}}]}`
+}
+
+// relayedToolResults indexes a relaying run's Tool Result lines by tool_id, the
+// only handle a test has on which of a child's calls a line reports.
+func relayedToolResults(t *testing.T, raw string) map[string]map[string]any {
+	t.Helper()
+	out := map[string]map[string]any{}
+	for _, ev := range relayedEvents(t, raw) {
+		if ev["kind"] == "tool_result" {
+			out[fmt.Sprint(ev["tool_id"])] = ev
+		}
+	}
+	return out
+}
+
+// TestSubagentChildHonoursTheConfiguredDenyHook is the criterion issue #25 was
+// blocked on: the child inherits the Driver Config, and a configured deny hook
+// blocks a denied command inside the child. The child resolves the config through
+// the environment it inherits, so nothing here hands the manifest to the child by
+// any channel of its own.
+func TestSubagentChildHonoursTheConfiguredDenyHook(t *testing.T) {
+	agentsDir, hookPath, manifestPath := denyHookRosterFixture(t, "reads the credential path /run/secrets/spindrift/token")
+	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`","hook_manifest":"`+manifestPath+`"}`)
+
+	dir := t.TempDir()
+	deniedMarker := filepath.Join(dir, "denied-credential-read.marker")
+	cleanMarker := filepath.Join(dir, "clean-ran.marker")
+	deniedCmd := "printf nope > " + deniedMarker
+	cleanCmd := "printf clean-ran | tee " + cleanMarker
+
+	srv := newScriptedChatServer(t,
+		parentToolCallResponse,
+		childGuardTurnResponse(deniedCmd, cleanCmd),
+		completion("child answer"),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a refusal inside a child is a Tool Result, not a failed run; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+
+	// The side effects are the verdict that matters: the guard stopped the denied
+	// command and only the denied command.
+	if hookMarkerExists(t, deniedMarker) {
+		t.Errorf("marker %s exists: the child ran the command its configured hook denies", deniedMarker)
+	}
+	if !hookMarkerExists(t, cleanMarker) {
+		t.Errorf("marker %s does not exist: the child's clean call was blocked too", cleanMarker)
+	}
+
+	results := relayedToolResults(t, raw)
+	denied, ok := results["call_denied"]
+	if !ok {
+		t.Fatalf("relayed stream carries no tool_result for the denied call: %q", raw)
+	}
+	if denied["role"] != "reviewer" {
+		t.Errorf("denied call tool_result role = %v, want the agent name", denied["role"])
+	}
+	if denied["is_error"] != true {
+		t.Errorf("denied call tool_result is_error = %v, want true: %v", denied["is_error"], denied)
+	}
+	// The call event still names the command, and the refusal names the script to
+	// go ask and why — the same contract a refusal in the parent has.
+	if denied["tool_target"] != deniedCmd {
+		t.Errorf("denied call tool_target = %v, want %q", denied["tool_target"], deniedCmd)
+	}
+	out, _ := denied["tool_output"].(string)
+	for _, want := range []string{"error: ", hookPath, "credential path /run/secrets/spindrift/token"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("denied call tool_output = %q, want it to contain %q", out, want)
+		}
+	}
+
+	clean, ok := results["call_clean"]
+	if !ok {
+		t.Fatalf("relayed stream carries no tool_result for the clean call: %q", raw)
+	}
+	if v, present := clean["is_error"]; present {
+		t.Errorf("clean call tool_result carries is_error = %v, want a command that ran and succeeded", v)
+	}
+	cleanOut, _ := clean["tool_output"].(string)
+	if !strings.Contains(cleanOut, "clean-ran") {
+		t.Errorf("clean call tool_output = %q, want the command's own output", cleanOut)
+	}
+
+	// The child's run is otherwise an ordinary one: the refusal is a Tool Result it
+	// answers past, its answer still reaches the parent, and the parent's result is
+	// its own.
+	if len(results) != 2 {
+		t.Errorf("relayed stream carries %d tool_result events, want one per child call", len(results))
+	}
+	_, subagentResult := spawnPair(t, raw)
+	if got := subagentResult["tool_output"]; got != "child answer" {
+		t.Errorf("Subagent Tool Result tool_output = %v, want the child's final answer past the refusal", got)
+	}
+	if got := parentResult(t, raw)["text"]; got != "parent answer" {
+		t.Errorf("parent result text = %v, want the parent's own final answer", got)
+	}
+}
+
+// TestSubagentChildGuardComesFromTheConfiguredManifest is the config half of the
+// criterion: with the same roster, the same hook script and manifest still on
+// disk, and the same scripted child turn, a Driver Config that names no
+// hook_manifest leaves the child unguarded. Since the parent hands the child
+// nothing but argv and the environment, the key the two runs differ by is the
+// only thing that can have guarded the child in the test above.
+func TestSubagentChildGuardComesFromTheConfiguredManifest(t *testing.T) {
+	agentsDir, hookPath, _ := denyHookRosterFixture(t, "credential path")
+	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`"}`)
+
+	marker := filepath.Join(t.TempDir(), "unguarded-denied-ran.marker")
+	deniedCmd := "printf ran > " + marker
+
+	srv := newScriptedChatServer(t,
+		parentToolCallResponse,
+		childGuardTurnResponse(deniedCmd, deniedCmd),
+		completion("child answer"),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+
+	if !hookMarkerExists(t, marker) {
+		t.Errorf("marker %s does not exist: a child guarded with no hook_manifest configured is a guard that does not come from the config", marker)
+	}
+	for id, ev := range relayedToolResults(t, raw) {
+		if v, present := ev["is_error"]; present {
+			t.Errorf("%s tool_result is_error = %v, want no refusal without a manifest: %v", id, v, ev)
+		}
+		if out, _ := ev["tool_output"].(string); strings.Contains(out, hookPath) {
+			t.Errorf("%s tool_output = %q, want no refusal by the unconfigured hook %q", id, out, hookPath)
+		}
 	}
 }
