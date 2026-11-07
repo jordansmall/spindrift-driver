@@ -233,6 +233,119 @@ func TestSubagentSpawnRunsTheAgentFileEntry(t *testing.T) {
 	}
 }
 
+// TestSubagentSpawnServesTwoCallsInOneTurnSequentially pins the documented claim
+// that spawns run one at a time: one assistant message asking for two subagents is
+// served them in call order. The ordering is read off the recorded request bodies
+// because the model id goes out verbatim and so names which child sent each
+// request, while usage and result events look alike on both children. The roster
+// file names sort opposite to the call order, so walking the roster cannot produce
+// the recorded sequence; and the first child is scripted to take two Model calls,
+// so a pair that ran side by side could not hide behind one request each.
+func TestSubagentSpawnServesTwoCallsInOneTurnSequentially(t *testing.T) {
+	agentsDir := t.TempDir()
+	writeAgentFile(t, agentsDir, "a-planner.md", "---\nname: planner\nmodel: m-planner\n---\nplan things\n")
+	writeAgentFile(t, agentsDir, "z-reviewer.md", "---\nname: reviewer\nmodel: m-reviewer\n---\nreview things\n")
+	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`"}`)
+
+	spawnCall := func(id, agent, task string) string {
+		return `{"id":"` + id + `","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"` + agent + `\",\"task\":\"` + task + `\"}"}}`
+	}
+	childShellTurn := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_shell","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf reviewer-step\"}"}}]}}]}`
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[`+
+			spawnCall("call_first", "reviewer", "review the diff")+","+
+			spawnCall("call_second", "planner", "plan the release")+`]}}]}`,
+		childShellTurn,
+		completion("first child answer"),
+		completion("second child answer"),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+
+	bodies := srv.requestBodies(t)
+	var order []string
+	for _, body := range bodies {
+		order = append(order, postedSpawn(t, body).Model)
+	}
+	if want := []string{"m-parent", "m-reviewer", "m-reviewer", "m-planner", "m-parent"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("POST order = %v, want the parent, then every request of the first child, then every request of the second, then the parent's final turn; stdout = %q", order, raw)
+	}
+	for i, body := range bodies {
+		req := postedSpawn(t, body)
+		entry, named := map[string]string{"m-reviewer": "review things", "m-planner": "plan things"}[req.Model]
+		if !named {
+			continue
+		}
+		if got := req.Messages[0]; got.Role != "system" || got.Content != entry {
+			t.Errorf("POST %d sent model %q opens with %+v, want that entry's Agent File body", i, req.Model, got)
+		}
+	}
+
+	var seq []string
+	callAgent := map[string]string{}
+	type answered struct{ agent, output string }
+	answers := map[string]answered{}
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["in_subagent"] == true || ev["tool_name"] != "subagent" {
+			continue
+		}
+		id, _ := ev["tool_id"].(string)
+		switch ev["kind"] {
+		case "tool_call":
+			seq = append(seq, "call "+id)
+			if input, ok := ev["tool_input"].(map[string]any); ok {
+				callAgent[id], _ = input["agent"].(string)
+			}
+		case "tool_result":
+			seq = append(seq, "result "+id)
+			agent, _ := ev["subagent"].(string)
+			output, _ := ev["tool_output"].(string)
+			answers[id] = answered{agent: agent, output: output}
+		}
+	}
+	if want := []string{"call call_first", "result call_first", "call call_second", "result call_second"}; !reflect.DeepEqual(seq, want) {
+		t.Errorf("parent subagent events = %v, want both pairs in the order the calls were asked for; stdout = %q", seq, raw)
+	}
+	if want := map[string]string{"call_first": "reviewer", "call_second": "planner"}; !reflect.DeepEqual(callAgent, want) {
+		t.Errorf("subagent tool_call agents = %v, want the roster entry each call named: %v", callAgent, want)
+	}
+	for _, want := range []struct{ id, agent, output string }{
+		{"call_first", "reviewer", "first child answer"},
+		{"call_second", "planner", "second child answer"},
+	} {
+		if got := answers[want.id]; got.agent != want.agent || got.output != want.output {
+			t.Errorf("subagent tool_result %s = %+v, want %q", want.id, got, want.agent+"/"+want.output)
+		}
+	}
+
+	lastReviewer, firstPlanner := -1, -1
+	for i, ev := range relayedEvents(t, raw) {
+		switch ev["role"] {
+		case "reviewer":
+			lastReviewer = i
+		case "planner":
+			if firstPlanner < 0 {
+				firstPlanner = i
+			}
+		}
+	}
+	if lastReviewer < 0 || firstPlanner < 0 || lastReviewer > firstPlanner {
+		t.Errorf("relayed child lines interleave (last reviewer line %d, first planner line %d) in %q", lastReviewer, firstPlanner, raw)
+	}
+
+	if got := parentResult(t, raw)["text"]; got != "parent answer" {
+		t.Errorf("parent result text = %v, want the parent's own final answer after both children", got)
+	}
+}
+
 // TestSubagentRelaysChildEventsIntoParentStream pins where a child's events go:
 // inside the parent's tool_call/tool_result pair, attributed by role, and never
 // stamped as the parent's own.
