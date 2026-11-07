@@ -151,6 +151,102 @@ func TestContextDefinesDriverConfig(t *testing.T) {
 	}
 }
 
+// TestContextDefinesAgentFile pins the glossary entry for the subagent roster's
+// unit file. The Agent File is where a child's model id and system prompt come
+// from, so a reader who calls it a "profile" or a "persona" expects a document
+// richer than the one the Driver parses — one whose tools and spawns lists bind
+// something — and writes a roster whose restrictions bind nothing.
+func TestContextDefinesAgentFile(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the agent file vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "agent file")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Agent File** glossary entry")
+	}
+	for _, want := range []string{"frontmatter", "name", "description", "model", "tools", "spawns", "system prompt", "directory", "home", ".config/spindrift-driver/agents", "agents_dir"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Agent File** entry does not state that it is one roster entry as a file — frontmatter of name, description, model, tools and spawns over a system-prompt body, in a directory defaulting to $HOME/.config/spindrift-driver/agents and redirected by the Driver Config's agents_dir (missing %q)", want)
+		}
+	}
+	// The id is a router's key, not something the Driver composes: an author who
+	// expects an effort suffix to be split off writes "model: x:high" and hands the
+	// endpoint a model nobody serves.
+	if !strings.Contains(entry, "verbatim") {
+		t.Error("the **Agent File** entry does not say the model id is used verbatim, with no effort parsed out of it")
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Agent File** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "profile", "persona", "yaml config", "subagent definition"); n < 2 {
+		t.Errorf("the **Agent File** entry retires %d of the old words (profile, persona, yaml config, subagent definition); want at least 2", n)
+	}
+}
+
+// TestContextDefinesSubagentTool pins the glossary entry for the Tool that
+// delegates to a roster entry. The entry is the one place the delegation's whole
+// shape is stated: that the child is this same binary re-executed rather than a
+// bespoke call the parent builds, that a child's events are the parent's events
+// with attribution, that a failing child is a Tool Result rather than a failed
+// run, and that a child cannot spawn in turn.
+func TestContextDefinesSubagentTool(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the subagent tool vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "subagent tool")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Subagent Tool** glossary entry")
+	}
+	for _, want := range []string{"delegate", "named", "re-execut", "role", "in_subagent", "usage", "result", "subagent", "one at a time"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Subagent Tool** entry does not state that it delegates one task to a named roster entry by re-executing this same binary, relaying the child's events with role and in_subagent, rolling its usage into the parent's totals, returning its answer as the Tool Result that names the agent in subagent, and spawning one at a time (missing %q)", want)
+		}
+	}
+	// A child that dies must not take the run down with it, or the Model has no
+	// turn left in which to pick another approach.
+	if !near(entry, "error", "parent", 240) {
+		t.Error("the **Subagent Tool** entry does not state that a child failure is an error Tool Result the parent goes on with")
+	}
+	// Recursion is bounded by the offer, not by the roster's spawns field.
+	if !near(entry, "child", "never", 240) {
+		t.Error("the **Subagent Tool** entry does not state that a child is never offered the Tool itself")
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Subagent Tool** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "subprocess", "fork", "nested agent", "mcp"); n < 2 {
+		t.Errorf("the **Subagent Tool** entry retires %d of the old words (subprocess, fork, nested agent, MCP); want at least 2", n)
+	}
+}
+
+// TestContextRetiresBashToolAsOnlyTool pins the retirement of the pre-subagent
+// line: #25 adds a second Tool, so an entry still calling the Bash Tool the one in
+// scope is a definition of the offering that no longer matches the schema sent to
+// the Model.
+func TestContextRetiresBashToolAsOnlyTool(t *testing.T) {
+	const file = "CONTEXT.md"
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "bash tool")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Bash Tool** glossary entry")
+	}
+	if n := countAny(entry, "one tool in scope", "only tool", "single tool", "only one tool", "the one tool"); n > 0 {
+		t.Errorf("the **Bash Tool** entry still claims exclusivity (%d matches): the Subagent Tool is offered whenever Agent Files are present", n)
+	}
+	for _, want := range []string{"shell", "output"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Bash Tool** entry does not say what the Tool does — run a shell command and return its output (missing %q)", want)
+		}
+	}
+}
+
 // readADRs loads every ADR from disk keyed by file name, mapping to its raw text:
 // which decision supersedes which is a property of the record set, not of a file
 // name somebody chose, so the directory is read rather than its names assumed.
