@@ -115,7 +115,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	runStart := nowMS()
 	var apiMS int64
 	var totals tokenTotals
+	// delegated sums what the child Drivers this run spawns spend, kept apart from
+	// the parent's own tally so its usage events stay one per own Model call.
+	var delegated tokenTotals
 	seenModels := map[string]struct{}{}
+	sess := session{cfg: cfg, events: events, stderr: stderr, delegated: &delegated, models: seenModels}
 	for turn := 0; turn < cfg.maxTurns; turn++ {
 		call++
 		messageID := fmt.Sprintf("msg-%d", call)
@@ -158,7 +162,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				NumTurns:      call,
 				DurationMs:    nowMS() - runStart,
 				DurationAPIMs: apiMS,
-				Tokens:        totals,
+				Tokens:        totals.add(delegated),
 				Models:        sortedModelIDs(seenModels),
 			})
 			return 0
@@ -172,7 +176,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			if toolID == "" {
 				toolID = fmt.Sprintf("call-%d", toolSeq)
 			}
-			plan := planToolCall(tc, cfg, events, stderr)
+			plan := planToolCall(tc, sess)
 			// tool_call goes out before the command starts: a command can run for
 			// minutes, and a reader has to see the call at the moment the Model made
 			// it. The pair stays adjacent, and both lines carry the message id of the
@@ -245,6 +249,21 @@ type toolPlan struct {
 	run func() string
 }
 
+// session is what a tool call needs from the run that made it. A Subagent Tool
+// call reaches further than the config — it relays onto the run's own event
+// stream and charges the spend it delegates back to the run — so the run hands
+// over one of these instead of another parameter each time.
+type session struct {
+	cfg    config
+	events eventWriter
+	stderr io.Writer
+	// delegated sums child spend behind a pointer because the session travels into
+	// a plan closure by value: a field of its own would add to a copy.
+	delegated *tokenTotals
+	// models is the run's model-id set, which a child's model id joins here.
+	models map[string]struct{}
+}
+
 // toolResultEvent is the tool_result half of the pair. The plan brings its own
 // is_error rule because the exit-code suffix rule describes a command and
 // nothing else: a result with no exit-code line — a subagent's answer — would
@@ -271,12 +290,12 @@ func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output s
 // answers with the very error text the Model has always received.
 //
 // A Subagent Tool call needs the run itself — the roster to resolve the name
-// against, the event writer to relay the child's lines onto, and the stderr the
-// child inherits — so those are passed in rather than read from a global.
-func planToolCall(call toolCall, cfg config, events eventWriter, stderr io.Writer) toolPlan {
+// against, the event writer to relay the child's lines onto, and the tallies to
+// charge its spend to — so the run passes a session rather than a global.
+func planToolCall(call toolCall, s session) toolPlan {
 	input := decodeToolArguments(call.Function.Arguments)
 	if call.Function.Name == "subagent" {
-		return planSubagentCall(call, input, cfg, events, stderr)
+		return planSubagentCall(call, input, s)
 	}
 	if call.Function.Name != "bash" {
 		name := call.Function.Name
