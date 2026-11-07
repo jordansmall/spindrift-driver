@@ -297,6 +297,89 @@ func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
 	}
 }
 
+// TestReadmeDocumentsRepeatedCallBreaker pins the run-limit prose the breaker and the
+// error event's reset_at add. A run stopped for repeating itself and a run that ran out
+// of turns are different failures to whoever reads the exit code, so the README has to
+// name the breaker and state its numbers — which call is refused, how many refusals end
+// the run, where the counter lives — and say what reset_at reports.
+func TestReadmeDocumentsRepeatedCallBreaker(t *testing.T) {
+	const file = "README.md"
+	norm := normalizeMarkdown(t, file)
+
+	usage := markdownSectionAround(norm, "usage: spindrift-driver")
+	if usage == "" {
+		t.Fatal("no usage block in " + file)
+	}
+	if !strings.Contains(usage, "repeated-call breaker") {
+		t.Error("the run-limit prose does not name the repeated-call breaker beside the --max-turns cap")
+	}
+	// "Identical" only means something with its key stated: two calls that differ in
+	// argument order are different calls to the breaker.
+	if !near(usage, "identical", "arguments", 200) {
+		t.Error("the run-limit prose does not say the repeated-call breaker keys on the exact arguments of the call")
+	}
+	if !regexp.MustCompile(`third[^.]*identical[^.]*(not run|never run|refus)`).MatchString(usage) {
+		t.Error("the run-limit prose does not say the third identical call in a row is refused rather than run")
+	}
+	if !regexp.MustCompile(`different[^.]*call[^.]*(reset|starts over|clears)`).MatchString(usage) {
+		t.Error("the run-limit prose does not say a different call resets the count")
+	}
+	// A Guard Hook denial is a different kind of "no" from a breaker refusal, and which
+	// counter it feeds is the difference between a run that ends early and one that does
+	// not, so the prose has to state it.
+	if !near(usage, "guard hook", "reset", 300) {
+		t.Error("the run-limit prose does not say a call a Guard Hook blocks is not a breaker refusal and resets the streak")
+	}
+	if !regexp.MustCompile(`three (consecutive )?refusals[^.]*(exit 1|non-zero)`).MatchString(usage) {
+		t.Error("the run-limit prose does not say three refusals in a row end the run non-zero")
+	}
+	if !regexp.MustCompile(`per (driver )?process|each driver process`).MatchString(usage) {
+		t.Error("the run-limit prose does not say the count is per Driver process")
+	}
+
+	out := markdownSectionAround(norm, "jsonl")
+	if out == "" {
+		t.Fatal("no section documents the JSONL event stream on stdout")
+	}
+	// A refused call still closes its pair, and what comes back is the Driver's own ask.
+	if !near(out, "refus", "different action", 300) {
+		t.Error("the tool_result bullet does not say a refused repeated call gets the Driver's own synthetic text asking for a different action")
+	}
+	if !near(out, "refus", "pair", 300) {
+		t.Error("the tool_result bullet does not say the tool_call/tool_result pairing still holds for a refused call")
+	}
+	// The rejection body and the reset instant are both facts a host reads off the one
+	// error event, so both belong to the bullet that defines it.
+	if !near(out, "verbatim", "body", 240) {
+		t.Error("the error bullet does not say its text carries a rejected request's response body verbatim")
+	}
+	if !strings.Contains(out, "reset_at") {
+		t.Fatal("the error bullet does not document reset_at")
+	}
+	if !near(out, "reset_at", "epoch millisecond", 200) {
+		t.Error("reset_at is not described as an instant in epoch milliseconds")
+	}
+	if !near(out, "reset_at", "rate-limit", 200) {
+		t.Error("reset_at is not tied to a rate-limiting server naming the reset")
+	}
+	if !near(out, "reset_at", "no reset", 240) {
+		t.Error("the error bullet does not say a rejection that names no reset leaves reset_at off")
+	}
+
+	// The manual smoke test is where an operator meets these failures, so the list of
+	// ways a live run ends has to name both of them.
+	smoke := markdownSectionAround(norm, "smoke test")
+	if smoke == "" {
+		t.Fatal("no section documents the manual live smoke test")
+	}
+	if !near(smoke, "repeated-call breaker", "refus", 240) {
+		t.Error("the smoke-test failure modes do not name the repeated-call breaker ending a run")
+	}
+	if !near(smoke, "rate limit", "reset", 240) {
+		t.Error("the smoke-test failure modes do not name a rate limit that names its reset")
+	}
+}
+
 // markdownSectionBody returns the normalized body under a "Heading" line of the
 // raw markdown, up to the next heading line — the existing helper anchors on a
 // phrase inside a section, which cannot prove a section of its own exists.
