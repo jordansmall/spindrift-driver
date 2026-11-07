@@ -265,10 +265,46 @@ func TestContextDefinesGuardHookAndHookManifest(t *testing.T) {
 			t.Errorf("the **Guard Hook** entry does not fail closed on one of its cases (missing %q)", want)
 		}
 	}
+	// The rewrite half: a hook can hand back the command the run goes on with, and
+	// one the manifest declares a rewriter owes that answer — withholding it is the
+	// same doubt as a hook that stopped answering altogether.
+	if !near(hook, "updatedinput", "replaces", 200) {
+		t.Error("the **Guard Hook** entry does not state that updatedInput.command replaces the command the run goes on with")
+	}
+	if !near(hook, "rewriter", "refus", 200) {
+		t.Error("the **Guard Hook** entry does not state that a hook the manifest declares a rewriter, answering with no rewrite, is refused by name like any other misbehaviour")
+	}
+	// jq belongs to the guarded run rather than to one hook: the baked scripts read
+	// their own request with it, so without it every hook would answer having
+	// inspected nothing and silence would read as a pass.
+	if !strings.Contains(hook, "jq") {
+		t.Error("the **Guard Hook** entry does not state that jq has to be runnable for a guarded run")
+	}
+	if !near(hook, "jq", "refus", 240) {
+		t.Error("the **Guard Hook** entry does not tie a missing jq to refusing the guarded calls")
+	}
 	// Silence passing is what separates a guard from a gate: a hook with no opinion
 	// must let the call through, or every command an entry does not name is refused.
 	if !near(hook, "silence", "no objection", 160) {
 		t.Error("the **Guard Hook** entry does not state that silence on a clean exit raises no objection")
+	}
+	// The post-call variant, and the contrast that is the point of naming it: the
+	// same hook mechanics, the opposite default, because there the Driver guards a
+	// command that has not run and here it holds a result already earned.
+	if !strings.Contains(hook, "tool_response") {
+		t.Error("the **Guard Hook** entry does not state that the summary hook is handed the finished Tool Result as tool_response")
+	}
+	if !near(hook, "updatedtooloutput", "replaces", 200) {
+		t.Error("the **Guard Hook** entry does not state that updatedToolOutput replaces the finished Tool Result")
+	}
+	if !near(hook, "summary hook", "fail", 200) || !near(hook, "summary hook", "open", 200) {
+		t.Error("the **Guard Hook** entry does not state that the post-call summary hook fails open")
+	}
+	if !near(hook, "unchanged", "open", 320) {
+		t.Error("the **Guard Hook** entry does not state that a summary which cannot run leaves the Tool Result unchanged")
+	}
+	if !near(hook, "pre-call", "closed", 240) {
+		t.Error("the **Guard Hook** entry does not contrast the pre-call chain, which fails closed")
 	}
 	// What it is for, and that none of the policy lives in the Driver.
 	for _, want := range []string{"credential", "background"} {
@@ -294,6 +330,20 @@ func TestContextDefinesGuardHookAndHookManifest(t *testing.T) {
 		if !strings.Contains(manifest, want) {
 			t.Errorf("the **Hook Manifest** entry does not state that it is the JSON file listing the pre-call Guard Hooks in run order — script path, hook-protocol tool names, whether it rewrites — named only by the Driver Config's hook_manifest with no default path (missing %q)", want)
 		}
+	}
+	// The post-call side of the file: one summary hook rather than a second chain,
+	// and an entry with no rewrites flag to carry, the input being long gone.
+	if !strings.Contains(manifest, "post") {
+		t.Error("the **Hook Manifest** entry does not name the post-call summary hook's post key")
+	}
+	if !near(manifest, "post", "one", 160) {
+		t.Error("the **Hook Manifest** entry does not state that post is one entry rather than a list")
+	}
+	if !near(manifest, "post", "pre", 200) {
+		t.Error("the **Hook Manifest** entry does not place the post summary hook alongside the pre list")
+	}
+	if !near(manifest, "post", "rewrites", 240) {
+		t.Error("the **Hook Manifest** entry does not state that a post entry names the script and the tool names only, there being no rewrites to declare after the call")
 	}
 	// The two states a reader has to be able to tell apart: nothing configured, so
 	// nothing is guarded, versus something configured and unreadable.
