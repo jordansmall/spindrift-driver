@@ -31,12 +31,20 @@ _Avoid_: observation, output
 **Bash Tool**:
 Runs a shell command in the run's working directory and returns its output as the Tool Result.
 
+**Guard Hook**:
+A script the host bakes into the Box that the Driver runs before a Tool Call it guards. The Driver hands it `{tool_name, tool_input}` on stdin and reads its stdout for `hookSpecificOutput`, whose `permissionDecision` is the verdict and whose `permissionDecisionReason` is the text handed back to the Model. A `deny` blocks the call with an error Tool Result naming the script and the reason, and so does any hook that misbehaves — one that cannot be run, one that overruns its bound, one that exits non-zero, one that answers with nothing readable — the Driver cannot tell a broken hook from an approving one. Silence on a clean exit raises no objection: a hook with no opinion lets the call through. The seam exists for policy the Driver must not hold itself, a credential the Model would otherwise read straight out of the environment and the refusal of a backgrounded `bash` call among them; the Driver hardcodes no hook names and no policy, it runs whatever the Hook Manifest lists.
+_Avoid_: middleware, interceptor, permission prompt, guardrail, filter
+
+**Hook Manifest**:
+The JSON file that lists the pre-call Guard Hooks in run order, the file order being the run order: each entry names the script to run, the hook-protocol tool names it applies to, and whether it rewrites the tool input. Its path comes only from the Driver Config's `hook_manifest` and there is no default path, so an unconfigured run is simply unguarded — no hooks, nothing inspected; a manifest that is configured but cannot be read or parsed stops the run at startup rather than starting it unguarded. A spawned child inherits it the way it inherits the Driver Config, so delegation cannot step outside the guards.
+_Avoid_: hook config, plugin list, policy file, pre-flight checklist
+
 **Agent File**:
 One entry in the subagent roster, kept as a markdown file in a directory that defaults to `$HOME/.config/spindrift-driver/agents` and is redirected only by the Driver Config's `agents_dir` — one file per entry, every `*.md` file in it an entry. Its frontmatter carries `name`, `description`, `model`, `tools` and `spawns`; `name` and `model` are required, and the `model` id is used verbatim as the child's Model, with no effort or vendor suffix parsed out of it. The body below the frontmatter is the child's system prompt. `tools` and `spawns` are read and recorded, not enforced.
 _Avoid_: profile, persona, yaml config, subagent definition, agent card
 
 **Subagent Tool**:
-The Tool that delegates one task to a roster entry named in the call: the Driver re-executes this same binary as a child run with `--agent <name>`, so the child runs on its own context from the Agent File's model id and system prompt, and inherits the working directory, the environment and the Driver Config. The child's events are relayed into the parent's stream with `role` set to the agent's name and `in_subagent` true, and its usage rolls into the parent's result totals. The child's final answer is the Tool Result, which names the agent in `subagent`; a child that fails is an error Tool Result and the parent goes on. Spawns run one at a time, and a child run is never offered this Tool, so delegation stops at one level.
+The Tool that delegates one task to a roster entry named in the call: the Driver re-executes this same binary as a child run with `--agent <name>`, so the child runs on its own context from the Agent File's model id and system prompt, and inherits the working directory, the environment, the Driver Config and the Hook Manifest. The child's events are relayed into the parent's stream with `role` set to the agent's name and `in_subagent` true, and its usage rolls into the parent's result totals. The child's final answer is the Tool Result, which names the agent in `subagent`; a child that fails is an error Tool Result and the parent goes on. Spawns run one at a time, and a child run is never offered this Tool, so delegation stops at one level.
 _Avoid_: subprocess, fork, nested agent, MCP agent, tool forwarding
 
 **Event**:
