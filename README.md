@@ -17,6 +17,16 @@ and defaults to 5m0s, so a stream that keeps arriving may run far past it. Raise
 (`--timeout 15m`) only when the server thinks for a long time before its first token, or
 when a proxy buffers the response.
 
+Two limits end a run before the Model answers. `--max-turns` caps the loop, as above. The
+**Repeated-Call Breaker** watches the calls inside it, keyed on the tool name and the
+exact arguments string the Model sent: the third identical call in a row is not run, and
+the Model gets a Tool Result back asking it to take a different action instead. Any
+different call resets the count; three refusals in a row end the run with an `error` event
+and exit 1, which says what happened rather than spending the remaining turns repeating
+one call. The count is per Driver process, so a child a Subagent Tool spawns starts at
+zero. A call a Guard Hook blocks is not a refusal by the breaker: the call ran and the
+Model got an answer back, so it resets the streak like any other call.
+
 ## Output: stdout is a JSONL event stream
 
 stdout is a JSONL event stream — one JSON object per line, and nothing else, on every
@@ -42,14 +52,20 @@ exit.
 - `tool_call` — the Model invoking a Tool: `tool_name`, `tool_input` (the arguments
   decoded as JSON) and `tool_target` (the command, for the Bash Tool).
 - `tool_result` — that call's output on its way back to the Model, `is_error` set when
-  the command failed. `tool_call` and `tool_result` pair by `tool_id`.
+  the command failed. `tool_call` and `tool_result` pair by `tool_id`. A call the
+  Repeated-Call Breaker refused never ran, so its `tool_result` is the Driver's own text
+  asking the Model to take a different action, and it pairs with its `tool_call` like any
+  result does.
 - `result` — the final answer, in `text`, plus `num_turns`, `duration_ms`,
   `duration_api_ms`, the session token totals in `tokens` and the `models` that
   answered. The answer is this event's `text`; it is also emitted as a `text` event,
   because it is assistant prose.
 - `error` — every non-zero exit is preceded by one `error` event carrying the raw error
-  text, verbatim and unbounded. Exit codes stay authoritative beside it: 0 for a
-  `result` (and for `-h`), 1 for a failed run, 2 for a usage error.
+  text, verbatim and unbounded — for a rejected request, that text is the server's
+  response body exactly as it arrived. `reset_at`, when present, names in epoch
+  milliseconds the instant a rate-limiting server said it would take the request again;
+  a rejection that names no reset leaves the key off. Exit codes stay authoritative
+  beside it: 0 for a `result` (and for `-h`), 1 for a failed run, 2 for a usage error.
 
 Pull the answer out with `jq`, and the failure text the same way:
 
@@ -310,10 +326,12 @@ Expected: exit status 0 and a Pass log on stdout, with the Model's final answer 
 `result` event's `text` — `jq -r 'select(.kind=="result") | .text'` is how you read it.
 Progress — each `POST`, each retry — goes to stderr, so stdout stays parseable end to
 end. A failure prints one line to stderr, emits an `error` event on stdout, and exits
-non-zero: unreachable server, rejected request, a stream that goes silent for longer than
-`--timeout` (default 5m0s — a stalled stream, not a long generation: raise it when the
-server thinks for a long time before its first token), or the `--max-turns` cap reached
-without an answer.
+non-zero: unreachable server, rejected request — its response body verbatim in the error
+event, and a rate limit that names a reset puts it in `reset_at` — a stream that goes
+silent for longer than `--timeout` (default 5m0s — a stalled stream, not a long
+generation: raise it when the server thinks for a long time before its first token), the
+Repeated-Call Breaker refusing one call three times in a row, or the `--max-turns` cap
+reached without an answer.
 
 ## Not packaged
 

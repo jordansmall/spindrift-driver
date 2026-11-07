@@ -365,6 +365,58 @@ func TestContextDefinesGuardHookAndHookManifest(t *testing.T) {
 	}
 }
 
+// TestContextDefinesRepeatedCallBreaker pins the glossary entry the run-limit work
+// adds. The name is the one the README and the error text both use for a stop a host
+// has to tell apart from the turn cap, and the entry is the only place that states what
+// a refusal is keyed on: an author who keys it on the decoded arguments instead collides
+// two calls the Model sent with different argument order.
+func TestContextDefinesRepeatedCallBreaker(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the repeated-call breaker vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	breaker := glossarySection(norm, "repeated-call breaker")
+	if breaker == "" {
+		t.Fatal("CONTEXT.md has no **Repeated-Call Breaker** glossary entry")
+	}
+	for _, want := range []string{"tool name", "exact arguments", "third", "in a row"} {
+		if !strings.Contains(breaker, want) {
+			t.Errorf("the **Repeated-Call Breaker** entry does not state that it keys on the tool name and the exact arguments the Model sent and refuses the third identical call in a row (missing %q)", want)
+		}
+	}
+	// The refused call is not run, and what it gets back is something the Model can act
+	// on rather than a bare failure.
+	if !near(breaker, "refus", "not run", 240) {
+		t.Error("the **Repeated-Call Breaker** entry does not state that a refused call is not run")
+	}
+	if !near(breaker, "tool result", "different action", 240) {
+		t.Error("the **Repeated-Call Breaker** entry does not state that a refused call gets a synthetic Tool Result asking for a different action")
+	}
+	if !near(breaker, "different call", "reset", 200) {
+		t.Error("the **Repeated-Call Breaker** entry does not state that any different call resets the count")
+	}
+	// Three refusals end the run, and the reason that is the stop rather than the
+	// timeout turning up first is the point of the entry.
+	if !near(breaker, "three refusals", "error", 240) || !near(breaker, "three refusals", "non-zero", 240) {
+		t.Error("the **Repeated-Call Breaker** entry does not state that three refusals in a row end the run with an error event and a non-zero exit")
+	}
+	if !near(breaker, "three refusals", "pass timeout", 320) {
+		t.Error("the **Repeated-Call Breaker** entry does not contrast the Pass timeout the run stops short of burning")
+	}
+	// The counter's scope, or a reader expects a child to inherit the parent's count.
+	if !near(breaker, "per driver process", "child", 240) {
+		t.Error("the **Repeated-Call Breaker** entry does not state that the count is per Driver process, so a spawned child starts fresh")
+	}
+	if !strings.Contains(breaker, "_avoid_:") {
+		t.Error("the **Repeated-Call Breaker** entry has no _Avoid_ line")
+	}
+	if n := countAny(breaker, "loop detector", "rate limiter", "watchdog", "retry guard"); n < 2 {
+		t.Errorf("the **Repeated-Call Breaker** entry retires %d of the wrong words (loop detector, rate limiter, watchdog, retry guard); want at least 2", n)
+	}
+}
+
 // TestContextRetiresBashToolAsOnlyTool pins the retirement of the pre-subagent
 // line: #25 adds a second Tool, so an entry still calling the Bash Tool the one in
 // scope is a definition of the offering that no longer matches the schema sent to
