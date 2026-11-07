@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"syscall"
 	"time"
 )
 
@@ -308,9 +309,23 @@ type hookToolInput struct {
 	Command string `json:"command"`
 }
 
-// hookResponse is the part of a hook's stdout this step reads. updatedInput is
-// the rewrite path; updatedToolOutput belongs to #22's post-call summary hook,
-// so a hook that supplies that changes nothing here.
+// hookPostRequest is what the one post-call summary hook reads on stdin: the
+// pre-call payload plus tool_response, the finished Tool Result exactly as the
+// Model would receive it (exit-code line included). tool_input carries the
+// command that actually ran, which after a rewrite is not the command the Model
+// asked for — the summary is a step on the way to the Model, not a witness to
+// the host's policy, so it gets the truth about what executed.
+type hookPostRequest struct {
+	ToolName     string        `json:"tool_name"`
+	ToolInput    hookToolInput `json:"tool_input"`
+	ToolResponse string        `json:"tool_response"`
+}
+
+// hookResponse is the part of a hook's stdout this step reads. The pre-call
+// chain reads permissionDecision and updatedInput out of it and ignores
+// updatedToolOutput, which only summarizeToolOutput acts on; the summary side
+// reads updatedToolOutput and ignores the rest. One struct for both because one
+// script can legitimately answer both questions.
 //
 // HookSpecificOutput is a pointer so that JSON null decodes as absent: no
 // verdict is a pass, while a hookSpecificOutput of the wrong shape fails the
@@ -327,6 +342,10 @@ type hookDecision struct {
 	// null reads as "the hook offered no rewrite", not as a rewrite to the empty
 	// command.
 	UpdatedInput *hookToolInput `json:"updatedInput"`
+	// UpdatedToolOutput needs no pointer: an absent one, a JSON null and an empty
+	// string all mean "no summary", and the summary path keeps the original output
+	// for each of them. The pre-call chain never reads it.
+	UpdatedToolOutput string `json:"updatedToolOutput"`
 }
 
 // guardCommand runs command through the pre-call Guard Hooks in manifest order
@@ -383,7 +402,7 @@ func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Write
 		}
 		// The run is judged before the verdict: a hook that never answered blocks
 		// the call on its own, with nothing left to parse.
-		stdout, refusal := runGuardHook(hook, payload, stderr)
+		stdout, refusal := runHookScript(hook.path, payload, stderr)
 		var answer hookResponse
 		if refusal == "" {
 			answer, refusal = hookVerdict(hook, stdout)
@@ -430,21 +449,39 @@ func hookRewrite(hook guardHook, command string, answer hookResponse) (string, s
 // the hook literally instead of as \u003c escapes. Encode's trailing newline is
 // the encoder's doing, not part of the payload, so it comes off here.
 func encodeHookRequest(protocolName, command string) ([]byte, error) {
+	return encodeHookPayload(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}})
+}
+
+// encodeHookPostRequest builds the stdin the summary hook is handed for a
+// finished Tool Result, in the same encoder shape as encodeHookRequest.
+func encodeHookPostRequest(protocolName, command, output string) ([]byte, error) {
+	return encodeHookPayload(hookPostRequest{
+		ToolName:     protocolName,
+		ToolInput:    hookToolInput{Command: command},
+		ToolResponse: output,
+	})
+}
+
+func encodeHookPayload(payload any) ([]byte, error) {
 	var request bytes.Buffer
 	enc := json.NewEncoder(&request)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}}); err != nil {
+	if err := enc.Encode(payload); err != nil {
 		return nil, err
 	}
 	return bytes.TrimSuffix(request.Bytes(), []byte("\n")), nil
 }
 
-// runGuardHook executes one hook and returns its stdout, or, when the run
-// itself failed, the refusal that blocks the call in place of an answer.
-func runGuardHook(hook guardHook, payload []byte, stderr io.Writer) (stdout []byte, refusal string) {
+// runHookScript executes one manifest script and returns its stdout, or, when
+// the run itself failed, the refusal that blocks the call in place of an answer
+// — which is how the pre-call chain reads it. The summary path ignores that
+// string and keeps its original output instead: the same run mechanics, the
+// opposite verdict on a failed run, because the two callers have different
+// defaults to fall back on.
+func runHookScript(path string, payload []byte, stderr io.Writer) (stdout []byte, refusal string) {
 	ctx, cancel := context.WithTimeout(context.Background(), guardHookTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, hook.path)
+	cmd := exec.CommandContext(ctx, path)
 	// The script is what the host baked — shebang, mode bits and all — so it is
 	// exec'd directly. A shell in between would add a second quoting layer over
 	// text the hook is handed as data, and a manifest path is not a command.
@@ -463,12 +500,19 @@ func runGuardHook(hook guardHook, payload []byte, stderr io.Writer) (stdout []by
 	}
 	// No cmd.Dir and no cmd.Env, following runBashTool: the hook judges the
 	// command in the same cwd and environment the command is about to run in.
+	// Kill the whole group, not just the hook: a grandchild the hook detached
+	// would outlive a bare kill of the hook and keep the output pipes open, which
+	// is exactly what the WaitDelay below only bounds.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	// WaitDelay for the reason runBashTool gives: a grandchild the hook detached
 	// can survive the kill holding the output pipes, and Wait would block on
 	// their EOF forever — a fired bound that never produces a refusal.
 	cmd.WaitDelay = time.Second
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Sprintf("error: guard hook %s could not be run: %v", hook.path, err)
+		return nil, fmt.Sprintf("error: guard hook %s could not be run: %v", path, err)
 	}
 	err := cmd.Wait()
 	if ctx.Err() != nil {
@@ -476,18 +520,18 @@ func runGuardHook(hook guardHook, payload []byte, stderr io.Writer) (stdout []by
 		// as the signal death it was. The accepted race runBashTool documents
 		// applies here too: a hook that finished between Wait and this check is
 		// reported as timed out.
-		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", hook.path, guardHookTimeout)
+		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", path, guardHookTimeout)
 	}
 	if err != nil {
 		// Includes a death on a signal, which exec words as "signal: …" — the
 		// hook stopped without a verdict either way.
-		return nil, fmt.Sprintf("error: guard hook %s failed: %v", hook.path, err)
+		return nil, fmt.Sprintf("error: guard hook %s failed: %v", path, err)
 	}
 	if out.truncated {
 		// Judged before any verdict is read out of the kept prefix: what was thrown
 		// away may have been a deny, and an answer the Driver only half received is
 		// not an answer.
-		return nil, fmt.Sprintf("error: guard hook %s wrote more than %d bytes of output, so the command is blocked", hook.path, out.limit)
+		return nil, fmt.Sprintf("error: guard hook %s wrote more than %d bytes of output, so the command is blocked", path, out.limit)
 	}
 	return out.buf.Bytes(), ""
 }
@@ -544,6 +588,56 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 		reason = "the hook gave no reason"
 	}
 	return response, fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
+}
+
+// summarizeToolOutput hands a finished Tool Result to the manifest's one
+// post-call summary hook and returns its replacement, or output whenever the
+// summary could not be had.
+//
+// Fail open, where the pre-call chain fails closed — and it is the same
+// hook mechanics underneath, so the shared helper's refusal is dropped
+// on purpose. guardCommand refuses because a hook it cannot hear from is
+// indistinguishable from one that would have approved, and running an unguarded
+// command is the harm. Here the Driver is holding a real Tool Result already: a
+// summary hook that hangs, exits non-zero, floods, or answers with noise costs
+// the run its summary and must not cost it the answer. The same doubt about a
+// hook resolves the other way because the default action differs.
+//
+// So every one of these returns output untouched: no summary hook configured or
+// one whose tools list omits this tool (the script never runs), a script that
+// cannot be started, a run past guardHookTimeout, a non-zero exit, stdout past
+// guardHookOutputLimit, stdout that is not readable JSON, an absent
+// hookSpecificOutput, and an absent or empty updatedToolOutput — a summary of
+// nothing would replace a real result with the empty string, which is the loss
+// this function exists to prevent.
+//
+// A replacement is capped by truncateToolOutput, the very bound runBashTool
+// applies, so a hook that summarises upwards cannot hand the Model a longer
+// result than the command itself was allowed. Nothing re-appends the exit-code
+// line: the replacement is the Tool Result verbatim, and planToolCall keeps the
+// command's own verdict for is_error.
+func summarizeToolOutput(driverTool, command, output string, hook *summaryHook, stderr io.Writer) string {
+	if hook == nil {
+		return output
+	}
+	protocolName := hookToolName(driverTool)
+	if !hook.appliesTo(protocolName) {
+		return output
+	}
+	payload, err := encodeHookPostRequest(protocolName, command, output)
+	if err != nil {
+		return output
+	}
+	stdout, _ := runHookScript(hook.path, payload, stderr)
+	var response hookResponse
+	if err := json.Unmarshal(stdout, &response); err != nil || response.HookSpecificOutput == nil {
+		return output
+	}
+	summary := response.HookSpecificOutput.UpdatedToolOutput
+	if summary == "" {
+		return output
+	}
+	return truncateToolOutput(summary)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

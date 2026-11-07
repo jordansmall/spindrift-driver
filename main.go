@@ -251,8 +251,10 @@ type toolPlan struct {
 	// tool, so the subagent key stays off every ordinary tool_result line.
 	subagent string
 	// isError is the rule that decides is_error for this plan's output; nil means
-	// toolResultIsError, so only a tool whose result is not command output — a
-	// Subagent Tool Result is the child's answer — has to state one.
+	// toolResultIsError, so a tool whose verdict is not that suffix test states its
+	// own: a Subagent Tool Result is the child's answer, and a Bash Tool Result is
+	// judged on what the command exited with, before any summary hook replaces the
+	// text.
 	isError func(output string) bool
 	// run produces the exact Tool Result string that goes back into the
 	// conversation.
@@ -325,13 +327,31 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// grammar, only that runBashTool is never reached. A rewrite is host policy on
 	// what executes, so it replaces the command runBashTool is handed while
 	// tool_target keeps reporting the command the Model asked for.
-	return toolPlan{input: input, target: args.Command, run: func() string {
-		command, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr)
-		if refusal != "" {
-			return refusal
-		}
-		return runBashTool(command)
-	}}
+	// is_error stays the command's own verdict: a summary replaces the Tool Result
+	// text and has no exit-code line of its own, so letting toolResultIsError read
+	// the summary would flip every summarised success to an error. The rule closes
+	// over failed, which run writes from the pre-summary result — an ordering that
+	// is load bearing, because the run loop calls plan.run() before it hands the
+	// output to toolResultEvent.
+	var failed bool
+	return toolPlan{
+		input:   input,
+		target:  args.Command,
+		isError: func(string) bool { return failed },
+		run: func() string {
+			command, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr)
+			if refusal != "" {
+				// Judged by the same rule so a blocked call keeps reporting is_error true
+				// off its "error: " prefix. A refused call never ran, so there is no Tool
+				// Result to summarise and the summary hook is not asked.
+				failed = toolResultIsError(refusal)
+				return refusal
+			}
+			result := runBashTool(command)
+			failed = toolResultIsError(result)
+			return summarizeToolOutput(call.Function.Name, command, result, s.cfg.summary, s.stderr)
+		},
+	}
 }
 
 // decodeToolArguments yields the value the tool_call event carries. Arguments
@@ -586,6 +606,23 @@ var chatRetryBackoff = 100 * time.Millisecond
 // shorter value.
 var chatAttemptTimeout = 5 * time.Minute
 
+// truncateToolOutput is the one output bound: it keeps the last
+// bashToolMaxOutput bytes of a Tool Result, under which it is the identity.
+// Both a command's own output and a summary hook's replacement come through
+// here, so a summariser cannot hand the Model a longer result than the command
+// was allowed — the cap is the floor the Driver holds even when a hook fails.
+func truncateToolOutput(result string) string {
+	if len(result) <= bashToolMaxOutput {
+		return result
+	}
+	tail := result[len(result)-bashToolMaxOutput:]
+	// never split a multi-byte UTF-8 rune: drop continuation bytes at the cut
+	for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
+		tail = tail[1:]
+	}
+	return truncatedOutputMarker(len(tail)) + "\n" + string(tail)
+}
+
 // truncatedOutputMarker precedes the kept tail when output exceeded the cap,
 // naming the real kept byte count (may fall a few bytes under the cap after
 // the UTF-8 guard drops a partial rune).
@@ -623,17 +660,9 @@ func runBashTool(command string) string {
 	// trim exactly one trailing newline so the exit-code line sits directly
 	// after the last output line without collapsing intentional blank lines.
 	result := strings.TrimSuffix(output.String(), "\n")
-	// keep only the tail: a runaway generator must not flood the model's
-	// context, and truncating here — before the exit-code line is appended —
-	// guarantees that line always survives.
-	if len(result) > bashToolMaxOutput {
-		tail := result[len(result)-bashToolMaxOutput:]
-		// never split a multi-byte UTF-8 rune: drop continuation bytes at the cut
-		for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
-			tail = tail[1:]
-		}
-		result = truncatedOutputMarker(len(tail)) + "\n" + string(tail)
-	}
+	// keep only the tail: truncating here — before the exit-code line is appended
+	// — guarantees that line always survives.
+	result = truncateToolOutput(result)
 	if ctx.Err() != nil {
 		// a command finishing in the window between Wait returning and this
 		// check can be misreported as a timeout; accepted race, since avoiding

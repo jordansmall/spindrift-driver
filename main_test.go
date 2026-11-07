@@ -4710,3 +4710,129 @@ esac`)
 		t.Errorf("result event text = %q, want the run's own final answer", got)
 	}
 }
+
+// TestRunSummaryHookReplacesTheToolResultOnTheWireAndInReplay pins where the
+// post-call summary lands: one output value feeds both the tool_result event and
+// the replayed tool message, so both must carry the summary. tool_call keeps
+// reporting the command the Model asked for — the call was already on the wire
+// before the hook ran — and is_error stays the command's verdict, because the
+// summary's prose carries no exit-code line and would read as a failure.
+func TestRunSummaryHookReplacesTheToolResultOnTheWireAndInReplay(t *testing.T) {
+	summary := "SUMMARY: one line listed"
+	hook := writeGuardHookScript(t, "summarize.sh",
+		`echo '{"hookSpecificOutput":{"updatedToolOutput":"`+summary+`"}}'`)
+	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a summary is not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	if got, _ := resultEv["tool_output"].(string); got != summary {
+		t.Errorf("tool_result tool_output = %q, want the summary verbatim", got)
+	}
+	if resultEv["is_error"] == true {
+		t.Errorf("tool_result is_error = %v, want the command's own verdict: a summary with no exit-code line is not a failed command", resultEv["is_error"])
+	}
+	callInput, _ := callEv["tool_input"].(map[string]any)
+	if v, ok := callInput["command"]; !ok || v != "echo listed" {
+		t.Errorf("tool_call tool_input.command = %v, want the command the Model asked for: %v", callEv["tool_input"], callEv)
+	}
+	if callEv["tool_target"] != "echo listed" {
+		t.Errorf("tool_call tool_target = %v, want the command the Model asked for", callEv["tool_target"])
+	}
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "error" {
+			t.Errorf("stdout carries an error event for a summarised call: %q", raw)
+		}
+	}
+
+	msgs := srv.messageBodies(t)
+	if len(msgs) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(msgs))
+	}
+	want := recordedMessage{Role: "tool", Content: summary, ToolCallID: "call_s"}
+	if got := msgs[1][len(msgs[1])-1]; !reflect.DeepEqual(got, want) {
+		t.Errorf("replayed tool message = %+v, want %+v — the Model must read the summary, not the raw output", got, want)
+	}
+}
+
+// TestRunFailingSummaryHookLeavesTheToolResultAlone is the fail-open rule seen
+// from the wire: a summary hook that exits non-zero costs the run its summary
+// and nothing else. The command's own output reaches the Model with its exit-code
+// line intact, the run still succeeds, and no error event is emitted.
+func TestRunFailingSummaryHookLeavesTheToolResultAlone(t *testing.T) {
+	hook := writeGuardHookScript(t, "summarize.sh",
+		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY THAT NEVER LANDS"}}'
+exit 1`)
+	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_f","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a broken summary hook is not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	if got, _ := resultEv["tool_output"].(string); got != "listed\nexit code: 0" {
+		t.Errorf("tool_result tool_output = %q, want the command's own output with its exit-code line", got)
+	}
+	if resultEv["is_error"] == true {
+		t.Errorf("tool_result is_error = %v, want the command's own verdict of success", resultEv["is_error"])
+	}
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "error" {
+			t.Errorf("stdout carries an error event for a hook that merely failed to summarise: %q", raw)
+		}
+	}
+	msgs := srv.messageBodies(t)
+	if got := msgs[1][len(msgs[1])-1].Content; got != "listed\nexit code: 0" {
+		t.Errorf("replayed tool message = %q, want the command's own output", got)
+	}
+}
+
+// TestRunSummaryHookNeverSeesADeniedCall fixes the one question the pre-call
+// chain leaves over: a refused call never ran, so there is no Tool Result to
+// summarise and the summary hook is not asked about the refusal — the Model reads
+// the denial itself, and a summariser never gets to soften it.
+func TestRunSummaryHookNeverSeesADeniedCall(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "summarised")
+	deny := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	summary := writeGuardHookScript(t, "summarize.sh",
+		`cat > `+marker+`
+echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+deny+`"}],"post":{"path":"`+summary+`"}}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_n","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat ~/.ssh/id_ed25519\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath)); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	if got, _ := resultEv["tool_output"].(string); !strings.HasPrefix(got, "error: ") {
+		t.Errorf("tool_result tool_output = %q, want the refusal verbatim", got)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("summary hook %s ran for a call that never ran", summary)
+	}
+}
