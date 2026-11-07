@@ -9,11 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -279,8 +281,55 @@ func sortedModelIDs(seen map[string]struct{}) []string {
 // nowhere to be reported and changes nothing — stderr already carries the
 // operator's copy, and the exit code stays the authoritative signal.
 func errorExit(events eventWriter, code int, err error) int {
-	_ = events.emit(event{Kind: "error", Text: err.Error()})
+	e := event{Kind: "error", Text: err.Error()}
+	// The reset instant rides the error value rather than a parameter so the call
+	// sites that have no reset keep their exact call shape.
+	var rej *rejection
+	if errors.As(err, &rej) {
+		e.ResetAt = rej.resetAt
+	}
+	_ = events.emit(e)
 	return code
+}
+
+// rejection is a non-retryable HTTP rejection captured whole: the status line,
+// the body exactly as it arrived, and the reset instant when the server named
+// one. A plain fmt.Errorf cannot carry the last of those to errorExit, which is
+// the only place that knows how to stamp an event field. Error reproduces the
+// long-standing wording so stderr and the error event read as they always did.
+type rejection struct {
+	status string
+	body   string
+	// resetAt is absolute epoch milliseconds, 0 when the server named no reset.
+	resetAt int64
+}
+
+func (r *rejection) Error() string {
+	return "server returned " + r.status + ": " + r.body
+}
+
+// retryAfterMS turns a Retry-After header into an absolute epoch millisecond:
+// delta-seconds first (the form a rate limiter answers with), then an HTTP-date,
+// which is already absolute and so ignores now. Deltas go through the caller's
+// nowMS reading, never time.Now, or a golden log could never compare byte for
+// byte. A header that is absent, unparsable or negative names no reset, and so
+// does a delta too large to add to now without wrapping: a wrapped instant is
+// indistinguishable from a real one to whatever reads the event.
+func retryAfterMS(h http.Header, now int64) (int64, bool) {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs < 0 || secs > (math.MaxInt64-now)/1000 {
+			return 0, false
+		}
+		return now + secs*1000, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return t.UnixMilli(), true
+	}
+	return 0, false
 }
 
 // toolPlan is one assistant tool call read before it runs. The tool_call event
@@ -1261,7 +1310,18 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 				lastErr = fmt.Errorf("server returned %s: %s", resp.Status, boundBody(body))
 				continue
 			}
-			return chatReply{}, fmt.Errorf("server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			// Verbatim body: no TrimSpace, because a rejection that pads its message
+			// with newlines means the same text to the host as to the operator, and
+			// JSON escaping already keeps the event line whole.
+			rej := &rejection{status: resp.Status, body: string(body)}
+			// Only a 429 names a reset, and only here — a 429 stays a 4xx that
+			// returns without a retry, exactly as it always did.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if ms, ok := retryAfterMS(resp.Header, nowMS()); ok {
+					rej.resetAt = ms
+				}
+			}
+			return chatReply{}, rej
 		}
 
 		src := newIdleBody(resp.Body, timeout)

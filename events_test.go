@@ -323,7 +323,7 @@ func TestEventOmitsFieldsTheKindDoesNotFill(t *testing.T) {
 	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
 	for _, name := range []string{
 		"text", "role", "model", "tool_id", "tool_name", "tool_input", "tool_target",
-		"tool_output", "is_error", "tokens", "models", "duration_ms", "duration_api_ms", "num_turns",
+		"tool_output", "is_error", "tokens", "reset_at", "models", "duration_ms", "duration_api_ms", "num_turns",
 	} {
 		if _, ok := got[name]; ok {
 			t.Errorf("bare start line %q carries %q", buf.String(), name)
