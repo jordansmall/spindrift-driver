@@ -296,7 +296,7 @@ func TestGuardCommandDenies(t *testing.T) {
 	script := writeGuardHookScript(t, "deny.sh",
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
-	got := guardCommand("cat ~/.ssh/id_ed25519", "bash", []guardHook{{path: script}}, nil)
+	_, got := guardCommand("cat ~/.ssh/id_ed25519", "bash", []guardHook{{path: script}}, nil)
 
 	// The "error: " prefix is what makes the Tool Result an error downstream,
 	// and the script path is what the operator has to go read.
@@ -314,7 +314,7 @@ func TestGuardCommandDenyWithoutReasonUsesFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			script := writeGuardHookScript(t, "deny.sh", tc.body)
 
-			got := guardCommand("rm -rf /", "bash", []guardHook{{path: script}}, nil)
+			_, got := guardCommand("rm -rf /", "bash", []guardHook{{path: script}}, nil)
 
 			want := "error: guard hook " + script + " denied this command: the hook gave no reason"
 			if got != want {
@@ -341,7 +341,7 @@ func TestGuardCommandProceedsUnlessTheHookDenies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			script := writeGuardHookScript(t, "hook.sh", tc.body)
 
-			if got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
+			if _, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
 				t.Errorf("guardCommand = %q, want the empty string (proceed)", got)
 			}
 		})
@@ -366,7 +366,7 @@ func TestGuardCommandFailsClosedOnAMisbehavingHook(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			script := writeGuardHookScript(t, "hook.sh", tc.body)
 
-			got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+			_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
 
 			want := "error: guard hook " + script + " " + tc.want
 			if got != want {
@@ -381,7 +381,7 @@ func TestGuardCommandFailsClosedWhenTheHookCannotBeRun(t *testing.T) {
 	// misbehaviour the fixture cannot script, so the path is simply never written.
 	missing := filepath.Join(t.TempDir(), "never-installed.sh")
 
-	got := guardCommand("ls", "bash", []guardHook{{path: missing}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: missing}}, nil)
 
 	if !strings.HasPrefix(got, "error: ") {
 		t.Errorf("guardCommand = %q, want an error: prefixed refusal", got)
@@ -403,7 +403,7 @@ func TestGuardCommandFailsClosedWhenTheHookHangs(t *testing.T) {
 	defer func() { guardHookTimeout = old }()
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
-	got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
 
 	want := "error: guard hook " + script + " timed out after 100ms, so the command is blocked"
 	if got != want {
@@ -421,7 +421,7 @@ func TestGuardCommandAFailingHookStopsTheChain(t *testing.T) {
 		`touch `+secondMarker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
 
-	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
 
 	if want := "error: guard hook " + first + " failed: exit status 3"; got != want {
 		t.Errorf("guardCommand = %q, want %q", got, want)
@@ -433,7 +433,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 
 func TestGuardCommandNoHooksPaysNothing(t *testing.T) {
 	for _, hooks := range [][]guardHook{nil, {}} {
-		if got := guardCommand("ls", "bash", hooks, nil); got != "" {
+		if _, got := guardCommand("ls", "bash", hooks, nil); got != "" {
 			t.Errorf("guardCommand with no hooks = %q, want the empty string", got)
 		}
 	}
@@ -446,7 +446,7 @@ func TestGuardCommandSkipsHookThatDoesNotApply(t *testing.T) {
 		`touch `+marker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"no"}}'`)
 
-	got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{"Write"}}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{"Write"}}}, nil)
 
 	if got != "" {
 		t.Errorf("guardCommand = %q, want the empty string", got)
@@ -463,7 +463,7 @@ func TestGuardCommandEmptyToolsApplies(t *testing.T) {
 		`touch `+marker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"because"}}'`)
 
-	got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{}}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: script, tools: []string{}}}, nil)
 
 	if !hookMarkerExists(t, marker) {
 		t.Errorf("hook %s did not run: an empty tools list guards every tool", script)
@@ -482,7 +482,7 @@ func TestGuardCommandFirstRefusalStopsTheChain(t *testing.T) {
 		`touch `+secondMarker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
 
-	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
 
 	if want := "error: guard hook " + first + " denied this command: first word"; got != want {
 		t.Errorf("guardCommand = %q, want %q", got, want)
@@ -514,7 +514,7 @@ func TestGuardCommandSendsTheProtocolRequest(t *testing.T) {
 			received := filepath.Join(dir, "request.json")
 			script := writeGuardHookScript(t, "record.sh", "cat > "+received)
 
-			if got := guardCommand(tc.command, "bash", []guardHook{{path: script}}, nil); got != "" {
+			if _, got := guardCommand(tc.command, "bash", []guardHook{{path: script}}, nil); got != "" {
 				t.Fatalf("guardCommand = %q, want the empty string", got)
 			}
 			raw, err := os.ReadFile(received)
@@ -545,7 +545,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 				stderr = &out
 			}
 
-			got := guardCommand("ls", "bash", []guardHook{{path: script}}, stderr)
+			_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, stderr)
 
 			if want := "error: guard hook " + script + " denied this command: nope"; got != want {
 				t.Errorf("guardCommand = %q, want %q", got, want)
@@ -576,7 +576,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionRea
 		`touch `+secondMarker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
 
-	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
 
 	if !strings.HasPrefix(got, "error: ") {
 		t.Errorf("guardCommand = %q, want an error: prefixed refusal", got)
@@ -604,7 +604,7 @@ func TestGuardCommandOutputExactlyAtTheCapPasses(t *testing.T) {
 	script := writeGuardHookScript(t, "exact.sh",
 		fmt.Sprintf(`yes '' | head -c %d`, guardHookOutputLimit))
 
-	if got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
+	if _, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
 		t.Errorf("guardCommand = %q, want the empty string (proceed) for output at the cap", got)
 	}
 }
@@ -622,7 +622,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionRea
 	// asks, and the fixture's absolute shebang keeps it startable either way.
 	t.Setenv("PATH", "")
 
-	got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+	_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
 
 	if !strings.HasPrefix(got, "error: ") {
 		t.Errorf("guardCommand = %q, want an error: prefixed refusal when jq is missing", got)
@@ -641,7 +641,129 @@ func TestGuardCommandNoHooksDoesNotNeedJq(t *testing.T) {
 	// asked for.
 	t.Setenv("PATH", "")
 
-	if got := guardCommand("ls", "bash", nil, nil); got != "" {
+	if _, got := guardCommand("ls", "bash", nil, nil); got != "" {
 		t.Errorf("guardCommand with no hooks = %q, want the empty string", got)
+	}
+}
+
+func TestGuardCommandAppliesARewrite(t *testing.T) {
+	// A rewriting hook's whole job is to hand back the command that runs, so the
+	// chain's answer is that command and not the one the caller asked about.
+	script := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`)
+
+	ran, refusal := guardCommand("echo 'secret token abc'", "bash", []guardHook{{path: script, rewrites: true}}, nil)
+
+	if refusal != "" {
+		t.Fatalf("guardCommand refusal = %q, want the empty string", refusal)
+	}
+	if ran != "echo scrubbed" {
+		t.Errorf("command to run = %q, want %q", ran, "echo scrubbed")
+	}
+}
+
+func TestGuardCommandHandsTheRewrittenCommandToTheNextHook(t *testing.T) {
+	// A rewrite is the command the guarded run is about, so the hooks after the
+	// rewriter are asked about the rewritten command: a chain that re-checks the
+	// original text lets a hook approve words nobody is going to execute.
+	dir := t.TempDir()
+	received := filepath.Join(dir, "second-request.json")
+	first := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`)
+	second := writeGuardHookScript(t, "record.sh", "cat > "+received)
+
+	ran, refusal := guardCommand("echo 'secret token abc'", "bash", []guardHook{{path: first, rewrites: true}, {path: second}}, nil)
+
+	if refusal != "" {
+		t.Fatalf("guardCommand refusal = %q, want the empty string", refusal)
+	}
+	if ran != "echo scrubbed" {
+		t.Errorf("command to run = %q, want %q", ran, "echo scrubbed")
+	}
+	raw, err := os.ReadFile(received)
+	if err != nil {
+		t.Fatalf("read what the second hook received: %v", err)
+	}
+	if want := `{"tool_name":"Bash","tool_input":{"command":"echo scrubbed"}}`; string(raw) != want {
+		t.Errorf("second hook received %s, want exactly %s", raw, want)
+	}
+}
+
+func TestGuardCommandRefusesWhenARewritingHookReturnsNoRewrite(t *testing.T) {
+	// A hook the manifest declares a rewriter is the only thing standing between
+	// the Model's text and the shell, so an answer that rewrites nothing is not a
+	// pass: the Driver cannot tell "nothing to sanitize" from a hook that stopped
+	// answering, and it refuses rather than run the original command unguarded.
+	for _, tc := range []struct{ name, body string }{
+		{"silent", `:`},
+		{"allow without a rewrite", `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'`},
+		{"empty updatedInput command", `echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":""}}}'`},
+		{"updatedInput is null", `echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":null}}'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "sanitize.sh", tc.body)
+
+			ran, refusal := guardCommand("ls", "bash", []guardHook{{path: script, rewrites: true}}, nil)
+
+			want := "error: guard hook " + script + " is a rewriting hook and returned no rewrite, so the command is blocked"
+			if refusal != want {
+				t.Errorf("guardCommand refusal = %q, want %q", refusal, want)
+			}
+			if ran != "" {
+				t.Errorf("command to run = %q, want the empty string: a refused call runs nothing", ran)
+			}
+		})
+	}
+}
+
+func TestGuardCommandARewritingHookOwesNothingForAnEmptyCommand(t *testing.T) {
+	// The rewrite debt is owed against a command. There is nothing to sanitize in
+	// the empty string, so a rewriting hook that answers nothing there passes —
+	// refusing would block a call that cannot do anything.
+	for _, body := range []string{`:`, `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'`} {
+		script := writeGuardHookScript(t, "sanitize.sh", body)
+
+		ran, refusal := guardCommand("", "bash", []guardHook{{path: script, rewrites: true}}, nil)
+
+		if refusal != "" {
+			t.Errorf("guardCommand refusal = %q, want the empty string: an empty command owes no rewrite", refusal)
+		}
+		if ran != "" {
+			t.Errorf("command to run = %q, want the empty string", ran)
+		}
+	}
+}
+
+func TestGuardCommandAppliesARewriteFromAHookThatDidNotDeclareIt(t *testing.T) {
+	// rewrites is the promise that an answer arrives, not permission to rewrite:
+	// honouring an updatedInput only from a declared rewriter would throw away a
+	// sanitisation the Driver was actually handed.
+	script := writeGuardHookScript(t, "quiet.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo sanitised"}}}'`)
+
+	ran, refusal := guardCommand("echo 'secret token abc'", "bash", []guardHook{{path: script}}, nil)
+
+	if refusal != "" {
+		t.Fatalf("guardCommand refusal = %q, want the empty string", refusal)
+	}
+	if ran != "echo sanitised" {
+		t.Errorf("command to run = %q, want %q", ran, "echo sanitised")
+	}
+}
+
+func TestGuardCommandDenialBeatsTheRewriteDebt(t *testing.T) {
+	// A rewriting hook that denies has answered the question that matters, so the
+	// refusal is its stated reason and not a complaint about the rewrite it was
+	// never going to supply for a command it blocks.
+	script := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"leave it alone"}}'`)
+
+	ran, refusal := guardCommand("ls", "bash", []guardHook{{path: script, rewrites: true}}, nil)
+
+	if want := "error: guard hook " + script + " denied this command: leave it alone"; refusal != want {
+		t.Errorf("guardCommand refusal = %q, want %q", refusal, want)
+	}
+	if ran != "" {
+		t.Errorf("command to run = %q, want the empty string", ran)
 	}
 }

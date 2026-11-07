@@ -320,7 +320,7 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// already reads as a failed Tool Result — so the refusal needs no new event
 	// grammar, only that runBashTool is never reached.
 	return toolPlan{input: input, target: args.Command, run: func() string {
-		if refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr); refusal != "" {
+		if _, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr); refusal != "" {
 			return refusal
 		}
 		return runBashTool(args.Command)
