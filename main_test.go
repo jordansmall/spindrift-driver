@@ -4289,3 +4289,310 @@ func TestParseArgsReadsNoConfigFromWorkingDirectory(t *testing.T) {
 		t.Errorf("timeout = %v, want the built-in %v: something in the working directory was read", cfg.timeout, chatAttemptTimeout)
 	}
 }
+
+// TestRunGuardHookDenyBlocksBashCommand is the run-visible half of a Hook
+// Manifest: the operator configured a deny rule, so the command the Model asked
+// for never starts and the refusal is what the tool_result reports. The refusal
+// is a Tool Result and not a run failure, so the run still reaches its final
+// answer and exits 0 with its own result event.
+func TestRunGuardHookDenyBlocksBashCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker.txt")
+	hook := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	command := "true > " + marker
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_d","type":"function","function":{"name":"bash","arguments":"{\"command\":\"`+command+`\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	// The call is still reported with the command the Model asked for: the
+	// refusal says what was blocked, so tool_target cannot be blanked.
+	if callEv["tool_target"] != command {
+		t.Errorf("tool_call tool_target = %v, want %q", callEv["tool_target"], command)
+	}
+	output, _ := resultEv["tool_output"].(string)
+	for _, want := range []string{"error: ", hook, "credential path"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("tool_result tool_output = %q, want it to contain %q", output, want)
+		}
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("refusal tool_result is_error = %v, want true: %v", resultEv["is_error"], resultEv)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("marker %s exists: the refused command ran anyway", marker)
+	}
+	if got := resultText(t, raw); got != "told it was refused" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "error" {
+			t.Errorf("stdout carries an error event for a refused call: %q", raw)
+		}
+	}
+}
+
+// TestRunGuardHookFiresAfterToolCallEvent pins which side of the planning seam
+// the Guard chain sits on: a hook is an executed script with up to
+// guardHookTimeout of its own, so it fires when the call runs — after the
+// tool_call event has left — never while the call is still being parsed. The
+// hook is its own witness: it reads the run's stdout file and touches its marker
+// only when the tool_call line is already on it, so the assertion is about
+// ordering and not about timing.
+func TestRunGuardHookFiresAfterToolCallEvent(t *testing.T) {
+	dir := t.TempDir()
+	wire, err := os.Create(filepath.Join(dir, "stdout.jsonl"))
+	if err != nil {
+		t.Fatalf("create stdout file for the run: %v", err)
+	}
+	defer wire.Close()
+	marker := filepath.Join(dir, "saw-tool-call")
+	hook := writeGuardHookScript(t, "deny.sh",
+		`grep -q '"kind":"tool_call"' `+wire.Name()+` && touch `+marker+`
+`+`	echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_o","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"it refused"}}]}`,
+	)
+
+	var stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), wire, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if !hookMarkerExists(t, marker) {
+		t.Errorf("hook fired before the tool_call event reached stdout, so the Guard chain still runs while the call is being planned: %q", readRunStdout(t, wire))
+	}
+
+	raw := readRunStdout(t, wire)
+	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	output, _ := resultEv["tool_output"].(string)
+	if !strings.Contains(output, "error: ") || !strings.Contains(output, "credential path") {
+		t.Errorf("tool_result tool_output = %q, want the refusal of the call that ordered the stream", output)
+	}
+
+	callAt, resultAt := -1, -1
+	for i, ev := range stdoutEvents(t, raw) {
+		switch ev["kind"] {
+		case "tool_call":
+			callAt = i
+		case "tool_result":
+			resultAt = i
+		}
+	}
+	if callAt < 0 || resultAt < 0 || callAt > resultAt {
+		t.Errorf("stdout carries tool_call at %d and tool_result at %d, want the call line first: %q", callAt, resultAt, raw)
+	}
+}
+
+// readRunStdout reads back a run whose stdout was handed to an open file, which
+// is the only way a hook of another test can be shown what the wire held at the
+// moment it fired.
+func readRunStdout(t *testing.T, f *os.File) string {
+	t.Helper()
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read back stdout %s: %v", f.Name(), err)
+	}
+	return string(b)
+}
+
+// TestRunGuardHookRefusalReachesModel pins the other half of the contract: the
+// refusal is not only reported on the wire, it is the very Tool Result the Model
+// reads on the next request, so the Model can stop asking for that command.
+func TestRunGuardHookRefusalReachesModel(t *testing.T) {
+	hook := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	command := "true > " + filepath.Join(t.TempDir(), "marker.txt")
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_d","type":"function","function":{"name":"bash","arguments":"{\"command\":\"`+command+`\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath)); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	want := fmt.Sprintf("error: guard hook %s denied this command: credential path", hook)
+	if got, _ := resultEv["tool_output"].(string); got != want {
+		t.Fatalf("tool_output = %q, want the refusal verbatim %q", got, want)
+	}
+	sent := srv.messageBodies(t)
+	if len(sent) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(sent))
+	}
+	var tool *recordedMessage
+	for i := range sent[1] {
+		if sent[1][i].Role == "tool" {
+			tool = &sent[1][i]
+		}
+	}
+	if tool == nil {
+		t.Fatalf("second request carries no tool message: %+v", sent[1])
+	}
+	if tool.ToolCallID != "call_d" {
+		t.Errorf("tool message tool_call_id = %q, want the refused call's id", tool.ToolCallID)
+	}
+	// Byte-identical to the event: the Model is told exactly what the operator
+	// saw, with nothing appended to soften the refusal.
+	if tool.Content != want {
+		t.Errorf("replayed tool message content = %q, want %q", tool.Content, want)
+	}
+}
+
+// TestRunWithNoHookManifestRunsBashCommand: the guard chain must cost an
+// unconfigured run nothing at all — same command, same output, no error flag.
+// The absence is the Driver Config saying nothing, so this is the case a Hook
+// Manifest migration has to leave untouched.
+func TestRunWithNoHookManifestRunsBashCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker.txt")
+	cfgPath := writeDriverConfig(t, `{}`)
+	command := "echo written > " + marker + "; echo done"
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_n","type":"function","function":{"name":"bash","arguments":"{\"command\":\"`+command+`\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"ran it"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath)); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	output, _ := resultEv["tool_output"].(string)
+	if !strings.Contains(output, "done") || !strings.HasSuffix(output, "exit code: 0") {
+		t.Errorf("tool_result tool_output = %q, want the command's own output", output)
+	}
+	if _, onWire := resultEv["is_error"]; onWire {
+		t.Errorf("tool_result states is_error = %v, want the key absent (absence is false): %v", resultEv["is_error"], resultEv)
+	}
+	if !hookMarkerExists(t, marker) {
+		t.Errorf("marker %s was not written: an unguarded command did not run", marker)
+	}
+}
+
+// TestRunGuardHookForAnotherToolLeavesBashAlone pins appliesTo at the dispatch
+// seam: a manifest that guards only Write must not speak for Bash, and the hook
+// is never even exec'd for a call it does not cover.
+func TestRunGuardHookForAnotherToolLeavesBashAlone(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker.txt")
+	// A deny script that would refuse anything it were asked about: only a hook
+	// that skipped the tool check could leave the command running.
+	hook := writeGuardHookScript(t, "deny-write.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"write tool only"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`","tools":["Write"]}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	command := "echo written > " + marker + "; echo done"
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"bash","arguments":"{\"command\":\"`+command+`\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"ran it"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath)); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	output, _ := resultEv["tool_output"].(string)
+	if !strings.HasSuffix(output, "exit code: 0") {
+		t.Errorf("tool_result tool_output = %q, want the command's own output: a Write-only hook refused a Bash call", output)
+	}
+	if !hookMarkerExists(t, marker) {
+		t.Errorf("marker %s was not written: a Write-only hook blocked a Bash command", marker)
+	}
+}
+
+// TestRunGuardHookDenialDoesNotStopTheTurn: a refusal answers one call, it does
+// not end the run. Two calls share one turn and the hook denies only the first,
+// so the second must reach bash and report its own output on the same turn — a
+// denial that aborted the turn would be a run failure wearing a Tool Result.
+func TestRunGuardHookDenialDoesNotStopTheTurn(t *testing.T) {
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "blocked.txt")
+	kept := filepath.Join(dir, "kept.txt")
+	// A real hook judging the payload it is handed on stdin, not a stub that
+	// denies unconditionally: only the command carrying the forbidden word is
+	// refused, so the second call proves the chain kept going.
+	hook := writeGuardHookScript(t, "word.sh", `input=$(cat)
+case "$input" in
+  *forbidden*) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"forbidden word"}}' ;;
+esac`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	argsJSON := func(command string) string {
+		t.Helper()
+		raw, err := json.Marshal(map[string]string{"command": command})
+		if err != nil {
+			t.Fatalf("marshal scripted arguments: %v", err)
+		}
+		// arguments is a JSON string on the wire, so the encoded object is encoded
+		// a second time rather than embedded as a value.
+		quoted, err := json.Marshal(string(raw))
+		if err != nil {
+			t.Fatalf("marshal scripted arguments string: %v", err)
+		}
+		return string(quoted)
+	}
+	turn := fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":%s}},{"id":"call_2","type":"function","function":{"name":"bash","arguments":%s}}]}}]}`,
+		argsJSON("echo forbidden > "+blocked),
+		argsJSON("echo kept > "+kept+"; echo done"),
+	)
+	srv := newScriptedChatServer(t, turn, `{"choices":[{"message":{"role":"assistant","content":"one refused, one ran"}}]}`)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	results := map[string]map[string]any{}
+	var order []string
+	for _, ev := range stdoutEvents(t, stdout.String()) {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		id, _ := ev["tool_id"].(string)
+		results[id] = ev
+		order = append(order, id)
+	}
+	if !reflect.DeepEqual(order, []string{"call_1", "call_2"}) {
+		t.Fatalf("tool_result order = %v, want both calls of the turn: %q", order, stdout.String())
+	}
+	if got, _ := results["call_1"]["tool_output"].(string); !strings.Contains(got, "forbidden word") || results["call_1"]["is_error"] != true {
+		t.Errorf("first tool_result = %v, want the refusal marked as an error", results["call_1"])
+	}
+	output, _ := results["call_2"]["tool_output"].(string)
+	if !strings.Contains(output, "done") || !strings.HasSuffix(output, "exit code: 0") {
+		t.Errorf("second tool_result tool_output = %q, want the second command's own output", output)
+	}
+	if _, onWire := results["call_2"]["is_error"]; onWire {
+		t.Errorf("second tool_result states is_error = %v, want the key absent: %v", results["call_2"]["is_error"], results["call_2"])
+	}
+	if hookMarkerExists(t, blocked) {
+		t.Errorf("marker %s exists: the denied command ran", blocked)
+	}
+	if !hookMarkerExists(t, kept) {
+		t.Errorf("marker %s was not written: the second call never ran", kept)
+	}
+	if got := resultText(t, stdout.String()); got != "one refused, one ran" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+}

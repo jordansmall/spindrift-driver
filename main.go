@@ -312,7 +312,18 @@ func planToolCall(call toolCall, s session) toolPlan {
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: cannot parse tool arguments: %v", err) }}
 	}
-	return toolPlan{input: input, target: args.Command, run: func() string { return runBashTool(args.Command) }}
+	// The Guard chain runs when the call runs, not when it is planned: a hook is a
+	// script bounded by guardHookTimeout, and planning must stay parsing so the
+	// tool_call event is already on the wire before any hook fires. The refusal is
+	// what the Model is told, and its "error: " prefix is what toolResultIsError
+	// already reads as a failed Tool Result — so the refusal needs no new event
+	// grammar, only that runBashTool is never reached.
+	return toolPlan{input: input, target: args.Command, run: func() string {
+		if refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr); refusal != "" {
+			return refusal
+		}
+		return runBashTool(args.Command)
+	}}
 }
 
 // decodeToolArguments yields the value the tool_call event carries. Arguments
