@@ -126,14 +126,16 @@ line ([ADR-0005](docs/adr/0005-driver-config.md)). spindrift writes the file thr
 is why the file exists at all.
 
 ```
-{"base_url": "http://model.example:8080/v1", "api_key": "sk-...", "timeout": "90s", "agents_dir": "/srv/agents"}
+{"base_url": "http://model.example:8080/v1", "api_key": "sk-...", "timeout": "90s", "agents_dir": "/srv/agents", "hook_manifest": "/srv/hook-manifest.json"}
 ```
 
-The file holds four fields: `base_url`, an optional `api_key`, `timeout` — the idle bound
-`--timeout` sets, written as a Go duration string such as `"90s"` — and `agents_dir`, the
+The file holds five fields: `base_url`, an optional `api_key`, `timeout` — the idle bound
+`--timeout` sets, written as a Go duration string such as `"90s"` — `agents_dir`, the
 directory Agent Files are read from instead of the home-relative default (see
-[Subagents](#subagents)). Nothing else belongs in it: the Model name and `--max-turns`
-stay flags, so a file can move a run's traffic and point it at a roster but never change
+[Subagents](#subagents)), and `hook_manifest`, the Hook Manifest that names the Guard Hooks
+every Bash Tool Call is run past (see [Guard Hooks](#guard-hooks)). Nothing else belongs in
+it — those five are the whole set: the Model name and `--max-turns` stay flags, so a file
+can move a run's traffic, point it at a roster and point it at the guards, but never change
 what a run does. It lives at
 `$HOME/.config/spindrift-driver/config.json`, or at the path `$SPINDRIFT_CONFIG` names,
 which is used verbatim.
@@ -142,7 +144,8 @@ Precedence is one ladder for every field: the flag, then the environment variabl
 (`SPINDRIFT_BASE_URL` for the URL, `SPINDRIFT_API_KEY` for the key), then the Driver
 Config, then the built-in default — a knob an operator turned by hand always outranks
 content baked into a Box. `timeout` has no environment variable, so for it the ladder is
-flag, Driver Config, default.
+flag, Driver Config, default; `agents_dir` and `hook_manifest` have neither a flag nor a
+variable, so for them the file is the only place they can be set.
 
 An absent file at the default path is not an error; that is the ordinary state of a
 machine with no config, and the run goes on with whatever the flags and defaults give it.
@@ -157,6 +160,47 @@ never travels on the command line, so it never appears in a process listing wher
 user of the host could read it. Nothing is read from the working directory or from the
 Target repo — no `spindrift.json`, no `config.json` in the checkout, no dotenv file —
 because the repository under repair does not get to configure the run that repairs it.
+
+## Guard Hooks
+
+A Guard Hook is a script the host bakes into the Box that the Driver runs before a Bash Tool
+Call, and the Hook Manifest is the JSON file that lists them. Its path comes only from the
+Driver Config's `hook_manifest` — there is no default path, and no flag or environment
+variable names it. With no `hook_manifest` in the file the run is unconfigured and
+unguarded: no manifest, no hooks, nothing inspected.
+
+```
+{"pre": [{"path": "/usr/lib/spindrift-hooks/deny-credentials.sh", "tools": ["Bash"], "rewrites": false}]}
+```
+
+The top-level object's only field is `pre`, an array of hooks run in manifest order — the
+file order is the run order, sorted by nothing, and the first refusal stops the chain. Each
+entry names `path` (the script to exec), `tools` (the hook-protocol tool names the entry
+applies to — `Bash` is the Bash Tool — an empty or absent list meaning every tool, so a hook
+that forgets to name its tools guards rather than skips), and `rewrites` (whether the hook
+rewrites the tool input).
+
+A hook is handed one JSON object on stdin — `{"tool_name":"Bash","tool_input":{"command":"…"}}`
+— and answers on stdout with `hookSpecificOutput`, whose `permissionDecision` is the verdict
+and whose `permissionDecisionReason` is the text the Model is given. A `deny` blocks the
+call: the command is never run, and the Tool Result comes back as an error naming the script
+and the reason. Silence passes — an empty stdout on a clean exit, or an absent or null
+`hookSpecificOutput`, is a hook with no opinion.
+
+Anything else fails closed, because the Driver cannot tell a broken hook from an approving
+one: a script that cannot be run, a hook that overruns its per-hook bound of 5s
+(`guardHookTimeout`), a hook that writes more than 1 MiB of stdout
+(`guardHookOutputLimit`), a hook that exits non-zero, and an answer that is nothing readable
+all block the call exactly as a deny does.
+
+A `hook_manifest` naming a file that cannot be read, or JSON that does not parse, is a
+startup error at exit 2 naming the file: the run refuses to start unguarded rather than
+discovering the missing file mid-task. A spawned child inherits the manifest exactly as it
+inherits the Driver Config, so delegation is no way around the guards.
+
+Not implemented here, and #22's to build: the rewrite path (`rewrites` is read and recorded,
+never applied), the post-call summary hook, and the `jq` precondition — a hook that inspects
+its own request needs a JSON reader such as `jq` baked into the Box beside it.
 
 ## Subagents
 
@@ -193,8 +237,9 @@ Tool whatever its roster says, and no roster limits whom a run may delegate to.
 The Subagent Tool is offered only when the roster holds at least one Agent File — with
 none there is nobody for a call to name — and a call takes the `agent` to delegate to and
 the `task` to hand it. The child is this same binary re-executed with `--agent <name>` and
-the task as its prompt; it inherits the working directory, the environment and the Driver
-Config, which is how it reaches the same Model server and the same roster as its parent.
+the task as its prompt; it inherits the working directory, the environment, the Driver
+Config and the Hook Manifest, which is how it reaches the same Model server, the same roster
+and the same Guard Hooks as its parent.
 A child is never offered the Subagent Tool, so delegation goes one level deep.
 
 Every event the child writes is relayed onto the parent's stdout as it arrives, with
