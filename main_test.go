@@ -2130,6 +2130,154 @@ func TestRunRejectionBodyStaysVerbatimInOneErrorEvent(t *testing.T) {
 	}
 }
 
+// lastErrorEvent returns the run's closing error event as a decoded map, so a
+// test can assert on fields beside its text — oneErrorEvent's text-only return
+// cannot show whether reset_at is present at all.
+func lastErrorEvent(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	events := stdoutEvents(t, raw)
+	if len(events) == 0 {
+		t.Fatalf("stdout is empty, want a final error event: %q", raw)
+	}
+	ev := events[len(events)-1]
+	if got := ev["kind"]; got != "error" {
+		t.Fatalf("last event kind = %v, want %q: %q", got, "error", raw)
+	}
+	return ev
+}
+
+// rejectionServer answers every POST with one plain rejection of the given
+// status and headers, counting the POSTs so a test can prove the run did not
+// retry.
+func rejectionServer(t *testing.T, status int, headers map[string]string, body string) (*httptest.Server, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		posts++
+		mu.Unlock()
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return posts
+	}
+}
+
+func TestRunRateLimitRejectionFillsResetAt(t *testing.T) {
+	const pinned int64 = 1700000000000
+	pinClock(t, pinned)
+	const body = "slow down"
+	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, body)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", code, stderr.String())
+	}
+	ev := lastErrorEvent(t, stdout.String())
+	if want := "server returned 429 Too Many Requests: " + body; ev["text"] != want {
+		t.Errorf("error event text = %v, want %q", ev["text"], want)
+	}
+	reset, ok := ev["reset_at"]
+	if !ok {
+		t.Fatalf("error event %q carries no reset_at, want the Retry-After instant", stdout.String())
+	}
+	if got, _ := reset.(float64); int64(got) != pinned+7000 {
+		t.Errorf("reset_at = %v, want %d (pinned clock + 7s)", reset, pinned+7000)
+	}
+	if n := posts(); n != 1 {
+		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
+	}
+}
+
+func TestRunRateLimitResetAtAcceptsHTTPDate(t *testing.T) {
+	// A pinned clock far from the header's date, so passing the pinned value
+	// through instead of reading the date would show up as the wrong instant.
+	pinClock(t, 1700000000000)
+	const date = "Wed, 15 Nov 2023 08:12:01 GMT"
+	want := time.Date(2023, time.November, 15, 8, 12, 1, 0, time.UTC).UnixMilli()
+	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": date}, "rate limited")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	}
+	reset, ok := lastErrorEvent(t, stdout.String())["reset_at"]
+	if !ok {
+		t.Fatalf("error event %q carries no reset_at, want the instant %q names", stdout.String(), date)
+	}
+	if got, _ := reset.(float64); int64(got) != want {
+		t.Errorf("reset_at = %v, want %d (%s in epoch milliseconds)", reset, want, date)
+	}
+	if n := posts(); n != 1 {
+		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
+	}
+}
+
+func TestRunRateLimitWithoutRetryAfterOmitsResetAt(t *testing.T) {
+	pinClock(t, 1700000000000)
+	srv, posts := rejectionServer(t, http.StatusTooManyRequests, nil, "rate limited")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	}
+	if _, ok := lastErrorEvent(t, stdout.String())["reset_at"]; ok {
+		t.Errorf("error event %q carries reset_at, want the key absent when no reset was named", stdout.String())
+	}
+	if n := posts(); n != 1 {
+		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
+	}
+}
+
+func TestRunRateLimitResetAtIgnoresUnrepresentableDelta(t *testing.T) {
+	// 2^61 seconds parses as an int64 but does not survive the move to
+	// milliseconds: wrapped, it reads back as a plausible instant for a reset that
+	// never existed, so an unrepresentable delta has to be treated as no reset.
+	pinClock(t, 1700000000000)
+	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2305843009213693952"}, "rate limited")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	}
+	if got, ok := lastErrorEvent(t, stdout.String())["reset_at"]; ok {
+		t.Errorf("error event carries reset_at %v, want the key absent for a delta too large to represent", got)
+	}
+	if n := posts(); n != 1 {
+		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
+	}
+}
+
+// The whitespace a rejection pads its body with is part of the body: trimming it
+// here would make the host's copy differ from the bytes the server sent.
+func TestRunRejectionWhitespaceSurvivesInErrorEvent(t *testing.T) {
+	const body = "\ncontext length exceeded\n"
+	srv, _ := rejectionServer(t, http.StatusBadRequest, nil, body)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	}
+	want := "server returned 400 Bad Request: " + body
+	if got := oneErrorEvent(t, stdout.String()); got != want {
+		t.Errorf("error event text = %q, want the rejection with its whitespace intact %q", got, want)
+	}
+}
+
 // Retry scope is narrow: a transport error plus 5xx only. The injected budget
 // is generous, so these permanent answers must still cost exactly one POST --
 // any retry at all shows up as an extra POST, not as a different exit code.

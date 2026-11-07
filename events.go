@@ -51,6 +51,13 @@ type event struct {
 	ToolOutput string       `json:"tool_output,omitempty"`
 	IsError    bool         `json:"is_error,omitempty"`
 	Tokens     *tokenTotals `json:"tokens,omitempty"`
+	// ResetAt is the instant a rate-limited server said it would take the request
+	// again, in the epoch milliseconds the timestamp field already uses — a second
+	// time format on this wire would give a host two clocks to reconcile. Only the
+	// error kind fills it, and only when the rejection named a reset: 0 means none
+	// was named, and no real instant is 0, so omitempty keeps the key off every
+	// line with nothing to report.
+	ResetAt int64 `json:"reset_at,omitempty"`
 }
 
 // resultPayload is the result kind's own wire type because the run summary
