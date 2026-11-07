@@ -608,3 +608,40 @@ func TestGuardCommandOutputExactlyAtTheCapPasses(t *testing.T) {
 		t.Errorf("guardCommand = %q, want the empty string (proceed) for output at the cap", got)
 	}
 }
+
+func TestGuardCommandRefusesWhenJqIsUnavailable(t *testing.T) {
+	// The marker is written with bash builtins (`: >`), because an emptied PATH
+	// would make an external touch fail and a failed hook run would refuse for
+	// the wrong reason — this has to prove the script was never started.
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := writeGuardHookScript(t, "approve.sh",
+		`: > `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`)
+	// Setenv before the call: LookPath reads the current env when guardCommand
+	// asks, and the fixture's absolute shebang keeps it startable either way.
+	t.Setenv("PATH", "")
+
+	got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+
+	if !strings.HasPrefix(got, "error: ") {
+		t.Errorf("guardCommand = %q, want an error: prefixed refusal when jq is missing", got)
+	}
+	if !strings.Contains(got, "jq") {
+		t.Errorf("refusal %q does not name jq", got)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("hook %s ran although jq was unavailable", script)
+	}
+}
+
+func TestGuardCommandNoHooksDoesNotNeedJq(t *testing.T) {
+	// The fast path stays first: a run with nothing to guard must not be refused
+	// for a missing jq, or an unguarded deployment breaks over a tool it never
+	// asked for.
+	t.Setenv("PATH", "")
+
+	if got := guardCommand("ls", "bash", nil, nil); got != "" {
+		t.Errorf("guardCommand with no hooks = %q, want the empty string", got)
+	}
+}

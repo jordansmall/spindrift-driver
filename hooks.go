@@ -234,11 +234,22 @@ type hookDecision struct {
 //
 // Every refusal carries the "error: " prefix, which is what turns this string
 // into an error Tool Result downstream, and a refusal raised by a run names the
-// hook's path so the operator can find the script to ask why.
+// hook's path so the operator can find the script to ask why — except the
+// missing-jq precondition below, which belongs to the run, not to a hook.
 func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) string {
 	if len(hooks) == 0 {
-		// An unguarded run pays nothing: no marshalling, no fork, no wait.
+		// An unguarded run pays nothing: no marshalling, no fork, no wait — and no
+		// jq, since nothing here needs reading.
 		return ""
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		// A guard that cannot read its own request must never be trusted as
+		// approving: the host's baked hook scripts shell out to jq to parse the
+		// stdin this function builds, so without jq a hook exits 0 having inspected
+		// nothing and that silence reads as a pass. Refuse before any hook runs,
+		// which is also before the command can run. The reason names jq rather than
+		// a hook path — jq is a precondition of the guarded run, not of one hook.
+		return "error: jq is not available, so the guarded command cannot be run"
 	}
 	protocolName := hookToolName(driverTool)
 	var request bytes.Buffer
