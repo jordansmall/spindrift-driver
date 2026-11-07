@@ -526,9 +526,12 @@ func TestGuardCommandFailsClosedWhenTheHookCannotBeRun(t *testing.T) {
 }
 
 func TestGuardCommandFailsClosedWhenTheHookHangs(t *testing.T) {
+	// guardHookTimeout is one knob shared by the whole test binary, so it is
+	// restored in Cleanup and this file stays serial: two hang tests running at
+	// once would each be judged against the other's bound.
 	old := guardHookTimeout
 	guardHookTimeout = 100 * time.Millisecond
-	defer func() { guardHookTimeout = old }()
+	t.Cleanup(func() { guardHookTimeout = old })
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
 	_, got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
@@ -1029,7 +1032,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWhenTheScriptCannotBeStarted(t *test
 func TestSummarizeToolOutputKeepsTheOriginalWhenTheHookHangs(t *testing.T) {
 	old := guardHookTimeout
 	guardHookTimeout = 100 * time.Millisecond
-	defer func() { guardHookTimeout = old }()
+	t.Cleanup(func() { guardHookTimeout = old })
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
 	got := summarizeToolOutput("bash", "ls", "file listing\nexit code: 0", &summaryHook{path: script}, nil)
