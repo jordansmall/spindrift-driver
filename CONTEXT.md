@@ -29,7 +29,15 @@ The output the Driver sends back to the Model for one Tool Call, in the next req
 _Avoid_: observation, output
 
 **Bash Tool**:
-The one Tool in scope: runs a shell command and returns its output as the tool result.
+Runs a shell command in the run's working directory and returns its output as the Tool Result.
+
+**Agent File**:
+One entry in the subagent roster, kept as a markdown file in a directory that defaults to `$HOME/.config/spindrift-driver/agents` and is redirected only by the Driver Config's `agents_dir` — one file per entry, every `*.md` file in it an entry. Its frontmatter carries `name`, `description`, `model`, `tools` and `spawns`; `name` and `model` are required, and the `model` id is used verbatim as the child's Model, with no effort or vendor suffix parsed out of it. The body below the frontmatter is the child's system prompt. `tools` and `spawns` are read and recorded, not enforced.
+_Avoid_: profile, persona, yaml config, subagent definition, agent card
+
+**Subagent Tool**:
+The Tool that delegates one task to a roster entry named in the call: the Driver re-executes this same binary as a child run with `--agent <name>`, so the child runs on its own context from the Agent File's model id and system prompt, and inherits the working directory, the environment and the Driver Config. The child's events are relayed into the parent's stream with `role` set to the agent's name and `in_subagent` true, and its usage rolls into the parent's result totals. The child's final answer is the Tool Result, which names the agent in `subagent`; a child that fails is an error Tool Result and the parent goes on. Spawns run one at a time, and a child run is never offered this Tool, so delegation stops at one level.
+_Avoid_: subprocess, fork, nested agent, MCP agent, tool forwarding
 
 **Event**:
 One canonical driverkit fact the Driver reports on stdout: one JSON object on one line, named by its `kind` and timestamped in epoch milliseconds. These events are the whole stdout contract — a host decodes a run event by event, it does not scrape text.
