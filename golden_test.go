@@ -34,10 +34,12 @@ const goldenRegenerateCmd = "go test -run TestGoldenPassLog -update"
 //
 // The run is shaped to put every interesting event form in one Pass: a Model
 // call that streams thinking ahead of its prose and then a succeeding bash tool
-// call, a second call with no prose at all (which is why it carries no text
-// event) and a failing bash tool call, then a final answer. That yields start,
-// reasoning, text, usage, tool_call, tool_result in both its success and
-// is_error shapes, and result.
+// call, three calls with no prose at all (which is why they carry no text event)
+// that send one failing bash command and then the same command verbatim twice
+// more until the repeated-call breaker refuses to run it, then a final answer.
+// That yields start, reasoning, text, usage, tool_call, tool_result in its
+// success, is_error, and refused shapes — the refused one an is_error result with
+// no exit-code line, because no command ran — and result.
 //
 // The error kind is deliberately absent from this artifact: a single Pass cannot
 // both succeed and fail, and issue #27 owns the conformance-shaped log that
@@ -71,8 +73,15 @@ func TestGoldenPassLog(t *testing.T) {
 }
 
 // goldenPassStream drives one Pass and returns its raw stdout. The scripted
-// server supplies three responses; the two bash commands are printf-only and one
-// exits non-zero, so nothing here reads the repo, the clock, or the environment.
+// server supplies five responses; the bash commands are printf-only, one
+// succeeds, one fails, and the same failing command runs a second time before the
+// breaker refuses it on its third consecutive send, so nothing here reads the
+// repo, the clock, or the environment.
+//
+// The three failing calls carry distinct tool_calls ids over byte-identical
+// arguments: the repeated-call breaker keys on the tool name and the raw
+// arguments string rather than the id, and the log has to show that instead of
+// having the test assert it.
 //
 // Only the first response is framed by hand: its thinking has to arrive as the
 // delta.reasoning_content chunks a real reasoning endpoint sends, which a whole
@@ -98,9 +107,15 @@ func goldenPassStream(t *testing.T) []byte {
 		// Call 2: no content at all (so no text event, and no thinking either) and a
 		// command that exits 3.
 		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":148,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
-		// Call 3: the final answer, from a different model id, reporting cache read
+		// Call 3: the same tool name and the same arguments string under a fresh call
+		// id, so the breaker is only at two in a row and the command really runs again.
+		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":192,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
+		// Call 4: identical a third time, so the breaker refuses it — the synthetic
+		// Tool Result this log pins, handed out without bash ever being reached.
+		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":236,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_3","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
+		// Call 5: the final answer, from a different model id, reporting cache read
 		// in the OpenAI spelling.
-		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":177,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Ran both commands; the second failed with exit code 3."}}]}`),
+		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":268,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Ran both commands; the second failed with exit code 3."}}]}`),
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -108,8 +123,8 @@ func goldenPassStream(t *testing.T) []byte {
 	if code != 0 {
 		t.Fatalf("golden Pass exited %d, want 0; stderr = %q", code, stderr.String())
 	}
-	if got := srv.requestBodies(t); len(got) != 3 {
-		t.Fatalf("golden Pass made %d Model call(s), want 3", len(got))
+	if got := srv.requestBodies(t); len(got) != 5 {
+		t.Fatalf("golden Pass made %d Model call(s), want 5", len(got))
 	}
 	return stdout.Bytes()
 }
@@ -159,14 +174,18 @@ func assertStreamContract(t *testing.T, raw []byte) {
 	wantKinds := []string{
 		"start", "reasoning", "text", "usage", "tool_call", "tool_result",
 		"start", "usage", "tool_call", "tool_result",
+		"start", "usage", "tool_call", "tool_result",
+		"start", "usage", "tool_call", "tool_result",
 		"start", "text", "usage", "result",
 	}
 	if strings.Join(kinds, ",") != strings.Join(wantKinds, ",") {
 		t.Fatalf("kind sequence = %s, want %s", strings.Join(kinds, ","), strings.Join(wantKinds, ","))
 	}
 
-	// The two tool_result shapes the golden exists to pin: one clean, one is_error.
-	var failed, clean int
+	// The three tool_result shapes the golden exists to pin: one clean, one is_error
+	// reporting a real exit code, and one is_error refusal that never ran and so
+	// carries no exit-code line at all.
+	var failed, clean, refused int
 	for _, ev := range events {
 		if ev["kind"] != "tool_result" {
 			continue
@@ -180,14 +199,24 @@ func assertStreamContract(t *testing.T, raw []byte) {
 			t.Errorf("is_error present but %v: omitempty must keep a clean result off the wire entirely", isErr)
 		}
 		failed++
+		// The repeated-call refusal is a third shape, not just another failure: the
+		// command never reached bash, so the only thing a decoder can read is the
+		// "error: " prefix and the demand for a different action.
+		output, _ := ev["tool_output"].(string)
+		if !strings.Contains(output, "exit code:") && strings.Contains(output, "take a different action") {
+			refused++
+		}
 	}
-	if clean != 1 || failed != 1 {
-		t.Errorf("tool_result shapes = %d clean and %d is_error, want one of each", clean, failed)
+	if clean != 1 || failed != 3 {
+		t.Errorf("tool_result shapes = %d clean and %d is_error, want 1 clean and 3 is_error", clean, failed)
+	}
+	if refused != 1 {
+		t.Errorf("%d tool_result(s) read as the synthetic refusal, want exactly one: is_error true, no exit code: line, and text asking for a different action", refused)
 	}
 
 	result := events[len(events)-1]
-	if turns, _ := result["num_turns"].(float64); int(turns) != 3 {
-		t.Errorf("result num_turns = %v, want 3 Model calls", result["num_turns"])
+	if turns, _ := result["num_turns"].(float64); int(turns) != 5 {
+		t.Errorf("result num_turns = %v, want 5 Model calls", result["num_turns"])
 	}
 	for _, name := range []string{"duration_ms", "duration_api_ms"} {
 		if v, _ := result[name].(float64); v <= 0 {
@@ -195,11 +224,12 @@ func assertStreamContract(t *testing.T, raw []byte) {
 		}
 	}
 	tokens, _ := result["tokens"].(map[string]any)
-	// 104+148+177 input, 21+18+12 output, 64 (llama.cpp spelling) + 25 (OpenAI
-	// details spelling) cache read, summed by the Driver from the usage events.
-	for name, want := range map[string]float64{"input": 429, "output": 51, "cache_read": 89} {
+	// 104+148+192+236+268 input, 21+18+18+18+12 output, 64 (llama.cpp spelling) +
+	// 25 (OpenAI details spelling) cache read, summed by the Driver from the usage
+	// events — the refused call included, since the Model was charged for it.
+	for name, want := range map[string]float64{"input": 948, "output": 87, "cache_read": 89} {
 		if got, _ := tokens[name].(float64); got != want {
-			t.Errorf("result tokens[%s] = %v, want the three calls summed to %v", name, tokens[name], want)
+			t.Errorf("result tokens[%s] = %v, want the five calls summed to %v", name, tokens[name], want)
 		}
 	}
 	models, _ := result["models"].([]any)
