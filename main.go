@@ -21,6 +21,10 @@ import (
 )
 
 const defaultBaseURL = "http://localhost:8080/v1"
+
+// defaultMaxTurns is the built-in cap on the agent loop, named so the flag
+// default and the usage text read one value rather than two that can drift.
+const defaultMaxTurns = 300
 const envBaseURL = "SPINDRIFT_BASE_URL"
 const envAPIKey = "SPINDRIFT_API_KEY"
 
@@ -66,8 +70,9 @@ type config struct {
 	systemPrompt string
 }
 
-// usage is a var, not a const: the --timeout default is interpolated from
-// chatAttemptTimeout so the text cannot drift from the value in effect.
+// usage is a var, not a const: the --timeout and --max-turns defaults are
+// interpolated from chatAttemptTimeout and defaultMaxTurns so the text cannot
+// drift from the values in effect.
 var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>] [--agent <name>]
 
 The prompt may be given positionally or on stdin. --model is required.
@@ -78,7 +83,7 @@ parsed, is a startup error, never a fallback.
 A configured hook_manifest lists the Guard Hooks every Bash Tool Call runs through; one that cannot be read is a startup error, never an unguarded run.
 The API key comes from $` + envAPIKey + ` or that file, never from argv.
 --base-url defaults to $SPINDRIFT_BASE_URL or ` + defaultBaseURL + `.
---max-turns caps the number of agent turns (default 50).
+--max-turns caps the number of agent turns (default ` + fmt.Sprint(defaultMaxTurns) + `).
 --agent <name> runs as that Agent File entry: its model id names the model unless --model
 gives one, and the file body replaces the system prompt. A run selected this way is never offered
 the Subagent Tool, so a subagent cannot spawn another.
@@ -391,7 +396,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	fs.SetOutput(io.Discard) // usage errors are reported by run, keep parse silent
 	baseURL := fs.String("base-url", "", "OpenAI-compatible API base URL (default: $SPINDRIFT_BASE_URL or "+defaultBaseURL+")")
 	model := fs.String("model", "", "model name (required)")
-	maxTurns := fs.Int("max-turns", 50, "maximum agent turns")
+	maxTurns := fs.Int("max-turns", defaultMaxTurns, "maximum agent turns")
 	agentName := fs.String("agent", "", "run as this Agent File entry: its model id is used unless --model names one, and its body is the system prompt")
 	timeout := fs.Duration("timeout", chatAttemptTimeout, "idle timeout for one chat request: caps the dial, the response headers and the gap between received bytes, not the whole generation; accepts Go durations such as 90s or 2m")
 	pre, post := splitAtEndOfFlags(args)
