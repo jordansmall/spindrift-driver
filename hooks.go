@@ -25,11 +25,10 @@ var guardHookOutputLimit = 1 << 20
 // run, the hook-protocol tool names it applies to, and whether it rewrites the
 // tool input.
 //
-// rewrites is read and recorded but not enforced until issue #22 owns the
-// rewrite path and the post-call summary hook — the same precedent this branch
-// already sets for an Agent File's tools and spawns, which are parsed, recorded,
-// and only later acted on. guardCommand below does execute the pre-call chain,
-// but only its deny verdict and its failures act.
+// rewrites is a promise about the answer, never a gate on applying it: a hook
+// carrying the flag that answers without a rewrite has broken that promise and
+// the call is refused, while a hook without the flag that hands back updatedInput
+// anyway has its rewrite applied just the same.
 type guardHook struct {
 	path     string
 	tools    []string
@@ -200,10 +199,9 @@ type hookToolInput struct {
 	Command string `json:"command"`
 }
 
-// hookResponse is the part of a hook's stdout this step reads. updatedInput —
-// the rewrite path — and updatedToolOutput belong to #22, which owns rewriting
-// and the post-call summary hook, so a hook that supplies them changes nothing
-// here.
+// hookResponse is the part of a hook's stdout this step reads. updatedInput is
+// the rewrite path; updatedToolOutput belongs to #22's post-call summary hook,
+// so a hook that supplies that changes nothing here.
 //
 // HookSpecificOutput is a pointer so that JSON null decodes as absent: no
 // verdict is a pass, while a hookSpecificOutput of the wrong shape fails the
@@ -216,12 +214,19 @@ type hookResponse struct {
 type hookDecision struct {
 	PermissionDecision       string `json:"permissionDecision"`
 	PermissionDecisionReason string `json:"permissionDecisionReason"`
+	// UpdatedInput is a pointer for the same reason HookSpecificOutput is: JSON
+	// null reads as "the hook offered no rewrite", not as a rewrite to the empty
+	// command.
+	UpdatedInput *hookToolInput `json:"updatedInput"`
 }
 
 // guardCommand runs command through the pre-call Guard Hooks in manifest order
-// and returns the refusal to hand back as the Tool Result, or "" when every
-// applicable hook let the call through. The first refusal stops the chain: a
-// command already refused has no reason to be asked of a second hook.
+// and returns the command to run together with the refusal to hand back as the
+// Tool Result, "" for "no objection". The first refusal stops the chain: a
+// command already refused has no reason to be asked of a second hook, and a
+// refused call runs nothing, so the command returned with a refusal is the
+// empty string. A hook that answers with updatedInput replaces the command the
+// rest of the chain sees and the command the caller runs.
 //
 // A hook's silence is a pass and anything else is a block. Silence means an
 // empty or whitespace-only stdout, an absent or null hookSpecificOutput, and
@@ -230,17 +235,18 @@ type hookDecision struct {
 // guardHookTimeout, a non-zero exit, stdout past guardHookOutputLimit, and
 // stdout that carries no readable verdict are the fail-closed half: the Driver
 // refuses rather than accept an answer it never got, since it cannot tell a
-// broken hook from an approving one.
+// broken hook from an approving one. So is a rewriting hook's answer that rewrote
+// nothing — the same doubt about a hook that may have stopped answering halfway.
 //
 // Every refusal carries the "error: " prefix, which is what turns this string
 // into an error Tool Result downstream, and a refusal raised by a run names the
 // hook's path so the operator can find the script to ask why — except the
 // missing-jq precondition below, which belongs to the run, not to a hook.
-func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) string {
+func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
 	if len(hooks) == 0 {
 		// An unguarded run pays nothing: no marshalling, no fork, no wait — and no
-		// jq, since nothing here needs reading.
-		return ""
+		// jq, since nothing here needs reading. The command runs as asked.
+		return command, ""
 	}
 	if _, err := exec.LookPath("jq"); err != nil {
 		// A guard that cannot read its own request must never be trusted as
@@ -249,38 +255,79 @@ func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Write
 		// nothing and that silence reads as a pass. Refuse before any hook runs,
 		// which is also before the command can run. The reason names jq rather than
 		// a hook path — jq is a precondition of the guarded run, not of one hook.
-		return "error: jq is not available, so the guarded command cannot be run"
+		return "", "error: jq is not available, so the guarded command cannot be run"
 	}
 	protocolName := hookToolName(driverTool)
-	var request bytes.Buffer
-	// Encoder rather than Marshal, for events.go's reason: markup in a command
-	// must reach the hook literally instead of as \u003c escapes. Encode's trailing
-	// newline is the encoder's doing, not part of the payload.
-	enc := json.NewEncoder(&request)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}}); err != nil {
-		// Fail closed like a hook that never answered: a request the Driver could
-		// not build is a command no hook was ever asked about, so running it would
-		// be running it unguarded.
-		return fmt.Sprintf("error: guard hook request could not be built: %v", err)
-	}
-	payload := bytes.TrimSuffix(request.Bytes(), []byte("\n"))
 
 	for _, hook := range hooks {
 		if !hook.appliesTo(protocolName) {
 			continue
 		}
+		// Built per hook rather than once for the chain: a rewrite from an earlier
+		// hook is the command the next hook is asked about.
+		payload, err := encodeHookRequest(protocolName, command)
+		if err != nil {
+			// Fail closed like a hook that never answered: a request the Driver could
+			// not build is a command no hook was ever asked about, so running it would
+			// be running it unguarded.
+			return "", fmt.Sprintf("error: guard hook request could not be built: %v", err)
+		}
 		// The run is judged before the verdict: a hook that never answered blocks
 		// the call on its own, with nothing left to parse.
 		stdout, refusal := runGuardHook(hook, payload, stderr)
+		var answer hookResponse
 		if refusal == "" {
-			refusal = hookVerdict(hook, stdout)
+			answer, refusal = hookVerdict(hook, stdout)
+		}
+		if refusal == "" {
+			// Judged only after the verdicts, so a rewriting hook that denies is
+			// refused for denying rather than for the rewrite it withheld.
+			command, refusal = hookRewrite(hook, command, answer)
 		}
 		if refusal != "" {
-			return refusal
+			return "", refusal
 		}
 	}
-	return ""
+	return command, ""
+}
+
+// hookRewrite decides what the chain runs next once a hook raised no refusal:
+// the non-empty updatedInput.command the hook handed back, or command itself.
+// A hook the manifest declares a rewriter owes that answer for any command worth
+// rewriting, and withholding it refuses the call — the Driver cannot tell "there
+// was nothing to sanitize" from a hook that stopped answering, and running the
+// original text would be running it past the one hook standing in its way. The
+// empty command is the exception: there is nothing in it to rewrite, so an
+// unrewritten empty string is the answer the hook was owed.
+//
+// The rewrite is applied whether or not hook.rewrites is set; the flag only
+// decides who is refused for not supplying one.
+func hookRewrite(hook guardHook, command string, answer hookResponse) (string, string) {
+	var updated *hookToolInput
+	if answer.HookSpecificOutput != nil {
+		updated = answer.HookSpecificOutput.UpdatedInput
+	}
+	if updated != nil && updated.Command != "" {
+		return updated.Command, ""
+	}
+	if hook.rewrites && command != "" {
+		return "", fmt.Sprintf("error: guard hook %s is a rewriting hook and returned no rewrite, so the command is blocked", hook.path)
+	}
+	return command, ""
+}
+
+// encodeHookRequest builds the stdin one hook is handed for command. Encoder
+// rather than Marshal, for events.go's reason: markup in a command must reach
+// the hook literally instead of as \u003c escapes. Encode's trailing newline is
+// the encoder's doing, not part of the payload, so it comes off here.
+func encodeHookRequest(protocolName, command string) ([]byte, error) {
+	var request bytes.Buffer
+	enc := json.NewEncoder(&request)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}}); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(request.Bytes(), []byte("\n")), nil
 }
 
 // runGuardHook executes one hook and returns its stdout, or, when the run
@@ -363,28 +410,31 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 }
 
 // hookVerdict turns one hook's stdout into the refusal it asks for, or "" when
-// it raised no objection.
-func hookVerdict(hook guardHook, stdout []byte) string {
+// it raised no objection. The decoding happens here and the decoded answer comes
+// back with the verdict, so hookRewrite reads the same parse rather than a
+// second one: an answer that never got decoded — silence, or stdout this could
+// not read — comes back as the zero hookResponse alongside its own verdict.
+func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 	if len(bytes.TrimSpace(stdout)) == 0 {
 		// Silence: a hook that said nothing, which is a pass and not a verdict the
 		// Driver has to be able to read.
-		return ""
+		return hookResponse{}, ""
 	}
 	var response hookResponse
 	if err := json.Unmarshal(stdout, &response); err != nil {
-		return fmt.Sprintf("error: guard hook %s returned unparsable output", hook.path)
+		return hookResponse{}, fmt.Sprintf("error: guard hook %s returned unparsable output", hook.path)
 	}
 	if response.HookSpecificOutput == nil {
-		return ""
+		return response, ""
 	}
 	if response.HookSpecificOutput.PermissionDecision != "deny" {
-		return ""
+		return response, ""
 	}
 	reason := response.HookSpecificOutput.PermissionDecisionReason
 	if reason == "" {
 		reason = "the hook gave no reason"
 	}
-	return fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
+	return response, fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason
