@@ -52,6 +52,10 @@ type config struct {
 	// nothing is guarded: unlike agentsDir the manifest has no home-relative
 	// default, so an absent key has nothing to fall back to.
 	hooks []guardHook
+	// summary is the Hook Manifest's one post-call entry, nil when no Hook
+	// Manifest is configured or the configured one names no post call. Nothing
+	// reads it yet: the slice that rewrites a Tool Result with it is the next one.
+	summary *summaryHook
 	// agent is the roster entry this run was started as by --agent, "" for a
 	// top-level run. It is the fact that makes a run a child, and the tool offer
 	// is read with it: a child never gets the Subagent Tool.
@@ -457,11 +461,12 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	// run unguarded because a file went missing. loadHookManifest already names
 	// the manifest path in every message it returns, so nothing is wrapped here.
 	if file.hookManifest != "" {
-		hooks, err := loadHookManifest(file.hookManifest)
+		manifest, err := loadHookManifest(file.hookManifest)
 		if err != nil {
 			return config{}, err
 		}
-		cfg.hooks = hooks
+		cfg.hooks = manifest.pre
+		cfg.summary = manifest.summary
 	}
 	// Resolved against the loaded roster, never opened from a path in argv: the
 	// configured directory is the only place an Agent File comes from.

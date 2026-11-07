@@ -33,10 +33,11 @@ func TestLoadHookManifest(t *testing.T) {
 	  ]
 	}`)
 
-	hooks, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path)
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
+	hooks := manifest.pre
 	want := []guardHook{
 		{path: "/lib/hooks/deny.sh", tools: []string{"Bash", "Write"}, rewrites: false},
 		{path: "/lib/hooks/sanitize.sh", tools: []string{"Bash"}, rewrites: true},
@@ -56,12 +57,12 @@ func TestLoadHookManifest(t *testing.T) {
 func TestLoadHookManifestEmptyPre(t *testing.T) {
 	path := writeHookManifest(t, `{"pre":[]}`)
 
-	hooks, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path)
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
-	if len(hooks) != 0 {
-		t.Errorf("loadHookManifest returned %d hooks, want none: %+v", len(hooks), hooks)
+	if len(manifest.pre) != 0 {
+		t.Errorf("loadHookManifest returned %d hooks, want none: %+v", len(manifest.pre), manifest.pre)
 	}
 }
 
@@ -70,17 +71,17 @@ func TestLoadHookManifestKeepsFileOrder(t *testing.T) {
 	// denial in slot 0 stays the thing that runs first.
 	path := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/zulu.sh"},{"path":"/lib/hooks/alpha.sh"}]}`)
 
-	hooks, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path)
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
 	want := []string{"/lib/hooks/zulu.sh", "/lib/hooks/alpha.sh"}
-	if len(hooks) != len(want) {
-		t.Fatalf("loadHookManifest returned %d hooks, want %d: %+v", len(hooks), len(want), hooks)
+	if len(manifest.pre) != len(want) {
+		t.Fatalf("loadHookManifest returned %d hooks, want %d: %+v", len(manifest.pre), len(want), manifest.pre)
 	}
 	for i, w := range want {
-		if hooks[i].path != w {
-			t.Errorf("pre[%d].path = %q, want %q", i, hooks[i].path, w)
+		if manifest.pre[i].path != w {
+			t.Errorf("pre[%d].path = %q, want %q", i, manifest.pre[i].path, w)
 		}
 	}
 }
@@ -127,7 +128,7 @@ func TestLoadHookManifestMalformedJSON(t *testing.T) {
 
 func TestLoadHookManifestUnknownField(t *testing.T) {
 	for _, tc := range []struct{ name, contents, want string }{
-		{"post hooks are not in this slice", `{"pre":[],"post":[{"path":"/lib/hooks/summarize.sh"}]}`, "post"},
+		{"summarise is not the key", `{"pre":[],"summarize":{"path":"/lib/hooks/summarize.sh"}}`, "summarize"},
 		{"near-miss typo", `{"Pre":[]}`, "Pre"},
 		{"stray key", `{"pre":[],"version":2}`, "version"},
 	} {
@@ -226,12 +227,139 @@ func TestGuardHookAppliesTo(t *testing.T) {
 func TestLoadHookManifestNoPreField(t *testing.T) {
 	path := writeHookManifest(t, `{}`)
 
-	hooks, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path)
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error: a manifest that says nothing is a valid manifest", path, err)
 	}
-	if len(hooks) != 0 {
-		t.Errorf("loadHookManifest returned %d hooks, want none: %+v", len(hooks), hooks)
+	if len(manifest.pre) != 0 {
+		t.Errorf("loadHookManifest returned %d hooks, want none: %+v", len(manifest.pre), manifest.pre)
+	}
+	if manifest.summary != nil {
+		t.Errorf("summary = %+v, want nil", *manifest.summary)
+	}
+}
+
+// The manifest lists the pre-call hooks in run order plus one post-call summary
+// hook, so a post entry has to survive the load even though nothing applies it
+// yet (the rewrite of a Tool Result is the next slice).
+func TestLoadHookManifestSummaryHook(t *testing.T) {
+	path := writeHookManifest(t, `{
+	  "pre": [{"path": "/lib/hooks/deny.sh"}],
+	  "post": {"path": "/lib/hooks/summarize.sh", "tools": ["Bash", "Write"]}
+	}`)
+
+	manifest, err := loadHookManifest(path)
+	if err != nil {
+		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
+	}
+	if len(manifest.pre) != 1 {
+		t.Errorf("pre = %+v, want the one pre-call hook still parsed", manifest.pre)
+	}
+	if manifest.summary == nil {
+		t.Fatalf("summary = nil, want the post-call entry parsed")
+	}
+	if manifest.summary.path != "/lib/hooks/summarize.sh" {
+		t.Errorf("summary.path = %q, want %q", manifest.summary.path, "/lib/hooks/summarize.sh")
+	}
+	if want := []string{"Bash", "Write"}; !slices.Equal(manifest.summary.tools, want) {
+		t.Errorf("summary.tools = %v, want %v", manifest.summary.tools, want)
+	}
+}
+
+// A manifest that names only post-call work is still a manifest: the absent pre
+// list must not stand in front of the summary hook.
+func TestLoadHookManifestSummaryWithoutPre(t *testing.T) {
+	path := writeHookManifest(t, `{"post":{"path":"/lib/hooks/summarize.sh"}}`)
+
+	manifest, err := loadHookManifest(path)
+	if err != nil {
+		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
+	}
+	if len(manifest.pre) != 0 {
+		t.Errorf("pre = %+v, want none", manifest.pre)
+	}
+	if manifest.summary == nil {
+		t.Fatalf("summary = nil, want the post-call entry parsed even with no pre list")
+	}
+	if manifest.summary.path != "/lib/hooks/summarize.sh" {
+		t.Errorf("summary.path = %q, want %q", manifest.summary.path, "/lib/hooks/summarize.sh")
+	}
+	if len(manifest.summary.tools) != 0 {
+		t.Errorf("summary.tools = %v, want none: an absent tools list means every tool", manifest.summary.tools)
+	}
+}
+
+func TestLoadHookManifestNoSummary(t *testing.T) {
+	path := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}]}`)
+
+	manifest, err := loadHookManifest(path)
+	if err != nil {
+		t.Fatalf("loadHookManifest(%s) = %v, want no error: post is optional", path, err)
+	}
+	if manifest.summary != nil {
+		t.Errorf("summary = %+v, want nil when the file names no post-call hook", *manifest.summary)
+	}
+	if len(manifest.pre) != 1 || manifest.pre[0].path != "/lib/hooks/deny.sh" {
+		t.Errorf("pre = %+v, want the one pre-call hook", manifest.pre)
+	}
+}
+
+// The one post-call entry is held to the same shape rules as a pre-call one, so
+// every complaint names the manifest and says which key went wrong: "post" in
+// the place a pre-call entry's position would occupy.
+func TestLoadHookManifestBadSummary(t *testing.T) {
+	for _, tc := range []struct{ name, contents, want string }{
+		// One summary hook is the contract, so an array is refused as the wrong
+		// shape rather than read as a list of them.
+		{"array", `{"post":[{"path":"/lib/hooks/summarize.sh"}]}`, `field "post" must be an object, got array`},
+		// null is a written key with nothing in it, not the silence of an absent
+		// post, so it is refused the way "pre":null is.
+		{"null", `{"post":null}`, `field "post" must be an object, got null`},
+		{"string", `{"post":"/lib/hooks/summarize.sh"}`, `field "post" must be an object, got string`},
+		{"number", `{"post":2}`, `field "post" must be an object, got number`},
+		// rewrites belongs to the pre-call chain's promise about its input; a
+		// post-call entry has no such flag to set.
+		{"rewrites", `{"post":{"path":"/x.sh","rewrites":true}}`, `post: unknown field "rewrites"`},
+		{"typo", `{"post":{"path":"/x.sh","tool":["Bash"]}}`, `post: unknown field "tool"`},
+		{"no path", `{"post":{"tools":["Bash"]}}`, `post: missing field "path"`},
+		{"empty path", `{"post":{"path":""}}`, `post: field "path" must not be empty`},
+		{"path number", `{"post":{"path":8080}}`, `post: field "path" must be a string, got number`},
+		{"path null", `{"post":{"path":null}}`, `post: field "path" must be a string, got null`},
+		{"tools string", `{"post":{"path":"/x.sh","tools":"Bash"}}`, `post: field "tools" must be an array, got string`},
+		{"tools null", `{"post":{"path":"/x.sh","tools":null}}`, `post: field "tools" must be an array, got null`},
+		{"tools item number", `{"post":{"path":"/x.sh","tools":["Bash",8080]}}`, `post: field "tools"[1] must be a string, got number`},
+		{"tools item null", `{"post":{"path":"/x.sh","tools":[null]}}`, `post: field "tools"[0] must be a string, got null`},
+		// The pre-call list is still read, and still reported on, when the summary
+		// entry is the broken half of the file.
+		{"with a pre list", `{"pre":[{"path":"/ok.sh"}],"post":{"tools":["Bash"]}}`, `post: missing field "path"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeHookManifest(t, tc.contents)
+
+			_, err := loadHookManifest(path)
+			assertErrMessage(t, err, path, tc.want)
+		})
+	}
+}
+
+func TestSummaryHookAppliesTo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook summaryHook
+		tool string
+		want bool
+	}{
+		{"listed tool", summaryHook{path: "/x.sh", tools: []string{"Bash", "Write"}}, "Bash", true},
+		{"unlisted tool", summaryHook{path: "/x.sh", tools: []string{"Bash"}}, "Read", false},
+		{"case differs", summaryHook{path: "/x.sh", tools: []string{"Bash"}}, "bash", false},
+		{"empty tools covers everything", summaryHook{path: "/x.sh", tools: []string{}}, "Anything", true},
+		{"absent tools covers everything", summaryHook{path: "/x.sh"}, "Anything", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.hook.appliesTo(tc.tool); got != tc.want {
+				t.Errorf("summaryHook %+v .appliesTo(%q) = %v, want %v", tc.hook, tc.tool, got, tc.want)
+			}
+		})
 	}
 }
 
