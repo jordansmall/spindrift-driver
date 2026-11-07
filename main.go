@@ -318,12 +318,15 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// tool_call event is already on the wire before any hook fires. The refusal is
 	// what the Model is told, and its "error: " prefix is what toolResultIsError
 	// already reads as a failed Tool Result — so the refusal needs no new event
-	// grammar, only that runBashTool is never reached.
+	// grammar, only that runBashTool is never reached. A rewrite is host policy on
+	// what executes, so it replaces the command runBashTool is handed while
+	// tool_target keeps reporting the command the Model asked for.
 	return toolPlan{input: input, target: args.Command, run: func() string {
-		if _, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr); refusal != "" {
+		command, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr)
+		if refusal != "" {
 			return refusal
 		}
-		return runBashTool(args.Command)
+		return runBashTool(command)
 	}}
 }
 

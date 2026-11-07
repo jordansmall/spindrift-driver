@@ -4355,6 +4355,59 @@ func TestRunGuardHookDenyBlocksBashCommand(t *testing.T) {
 	}
 }
 
+// TestRunGuardHookRewriteReplacesTheCommandThatRuns is the run-visible half of a
+// rewrite: the Guard chain handed back a different command, so what executes and
+// what the Model sees in its Tool Result is that command and not the one it
+// asked for. The rewrite is host policy on what runs and therefore does not
+// reach back into the tool_call event, which reports the call the Model made and
+// was already on the wire before the hook fired.
+func TestRunGuardHookRewriteReplacesTheCommandThatRuns(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker.txt")
+	hook := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`","rewrites":true}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	command := "true > " + marker + " && echo original-raw-text"
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_r","type":"function","function":{"name":"bash","arguments":"{\"command\":\"`+command+`\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"ran the scrubbed command"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a rewrite is not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	output, _ := resultEv["tool_output"].(string)
+	if !strings.Contains(output, "scrubbed") {
+		t.Errorf("tool_result tool_output = %q, want the output of the rewritten command", output)
+	}
+	if strings.Contains(output, "original-raw-text") {
+		t.Errorf("tool_result tool_output = %q, want no trace of the command the Model asked for", output)
+	}
+	if resultEv["is_error"] == true {
+		t.Errorf("rewritten tool_result is_error = %v, want not an error: %v", resultEv["is_error"], resultEv)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("marker %s exists: the original command ran instead of the rewrite", marker)
+	}
+	callInput, _ := callEv["tool_input"].(map[string]any)
+	if v, ok := callInput["command"]; !ok || v != command {
+		t.Errorf("tool_call tool_input.command = %v, want the original %q — a rewrite must not retro-edit the event", callEv["tool_input"], command)
+	}
+	if callEv["tool_target"] != command {
+		t.Errorf("tool_call tool_target = %v, want the original %q", callEv["tool_target"], command)
+	}
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] == "error" {
+			t.Errorf("stdout carries an error event for a rewritten call: %q", raw)
+		}
+	}
+}
+
 // TestRunGuardHookFiresAfterToolCallEvent pins which side of the planning seam
 // the Guard chain sits on: a hook is an executed script with up to
 // guardHookTimeout of its own, so it fires when the call runs — after the
