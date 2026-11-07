@@ -3152,6 +3152,71 @@ func TestParseArgsLoadsRosterAndOffer(t *testing.T) {
 	}
 }
 
+// TestParseArgsLoadsHookManifest: the Hook Manifest the Driver Config names is
+// read once at startup, so cfg.hooks carries exactly what the file said and in
+// manifest order, which is the order a later slice runs the hooks in.
+func TestParseArgsLoadsHookManifest(t *testing.T) {
+	manifest := writeHookManifest(t, `{
+	  "pre": [
+	    {"path": "/lib/hooks/deny.sh", "tools": ["Bash", "Write"], "rewrites": false},
+	    {"path": "/lib/hooks/sanitize.sh", "tools": ["Bash"], "rewrites": true}
+	  ]
+	}`)
+	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	cfg, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(path))
+	if err != nil {
+		t.Fatalf("parseArgs error = %v, want none for a well-formed manifest", err)
+	}
+	want := []guardHook{
+		{path: "/lib/hooks/deny.sh", tools: []string{"Bash", "Write"}},
+		{path: "/lib/hooks/sanitize.sh", tools: []string{"Bash"}, rewrites: true},
+	}
+	if len(cfg.hooks) != len(want) {
+		t.Fatalf("hooks = %+v, want %d entries: %+v", cfg.hooks, len(want), want)
+	}
+	// Run order is file order, so the comparison is positional on purpose.
+	for i, w := range want {
+		got := cfg.hooks[i]
+		if got.path != w.path || got.rewrites != w.rewrites || !reflect.DeepEqual(got.tools, w.tools) {
+			t.Errorf("hooks[%d] = %+v, want %+v", i, got, w)
+		}
+	}
+}
+
+// TestParseArgsNoHookManifestKeyGuardsNothing: the manifest is opt-in. With no
+// hook_manifest key the run is not pointed at a default file — cfg.hooks stays
+// empty, which is the state "nothing is guarded", never an error.
+func TestParseArgsNoHookManifestKeyGuardsNothing(t *testing.T) {
+	path := writeDriverConfig(t, `{"base_url":"http://named:9/v1"}`)
+	cfg, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(path))
+	if err != nil {
+		t.Fatalf("parseArgs error = %v, want none when no manifest is configured", err)
+	}
+	if len(cfg.hooks) != 0 {
+		t.Errorf("hooks = %+v, want none", cfg.hooks)
+	}
+}
+
+// TestParseArgsMissingHookManifestFailsStartup: a manifest the Driver Config
+// names has to be readable — the absence of a file the operator promised is a
+// startup error naming it, exactly as a named Driver Config file's is.
+func TestParseArgsMissingHookManifestFailsStartup(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "hooks.json")
+	path := writeDriverConfig(t, `{"hook_manifest":"`+missing+`"}`)
+	_, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(path))
+	assertErrMessage(t, err, missing, "cannot read")
+}
+
+// TestParseArgsMalformedHookManifestFailsStartup: half a manifest is not "a
+// manifest that said nothing". Parsing it fails, and the failure is fatal rather
+// than a silent downgrade to an unguarded run.
+func TestParseArgsMalformedHookManifestFailsStartup(t *testing.T) {
+	manifest := writeHookManifest(t, `{"pre": [`)
+	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	_, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(path))
+	assertErrMessage(t, err, manifest, "malformed JSON")
+}
+
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	// --help output is the only place an operator learns the knob exists, so it
 	// must name the flag and the default actually in effect. The default is read
@@ -4052,6 +4117,26 @@ func TestRunDriverConfigMalformedJSONFailsStartup(t *testing.T) {
 	assertNoStartEvent(t, stdout.String())
 	if !strings.Contains(stderr.String(), path) {
 		t.Errorf("stderr = %q, want the operator copy naming %q", stderr.String(), path)
+	}
+}
+
+// A Hook Manifest the Driver Config names that is not there fails startup in the
+// existing exit-2 class: the one error event names the manifest and the problem,
+// and no Model call is ever attempted with the guards missing.
+func TestRunMissingHookManifestFailsStartup(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "hooks.json")
+	path := writeDriverConfig(t, `{"hook_manifest":"`+missing+`"}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, missing) || !strings.Contains(got, "cannot read") {
+		t.Errorf("error event text = %q, want it to name %q and report the file unreadable", got, missing)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), missing) {
+		t.Errorf("stderr = %q, want the operator copy of the failure naming %q", stderr.String(), missing)
 	}
 }
 

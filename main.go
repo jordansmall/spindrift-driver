@@ -47,6 +47,11 @@ type config struct {
 	// offeredTools so the offer and the roster cannot disagree later.
 	agents []agentEntry
 	tools  []toolSpec
+	// hooks is the Guard Hook list read from the Driver Config's hook_manifest
+	// once at startup. An empty list means no Hook Manifest is configured, so
+	// nothing is guarded: unlike agentsDir the manifest has no home-relative
+	// default, so an absent key has nothing to fall back to.
+	hooks []guardHook
 	// agent is the roster entry this run was started as by --agent, "" for a
 	// top-level run. It is the fact that makes a run a child, and the tool offer
 	// is read with it: a child never gets the Subagent Tool.
@@ -430,6 +435,18 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 			return config{}, err
 		}
 		cfg.agents = entries
+	}
+	// The manifest path comes only from the Driver Config — no flag and no
+	// environment variable — so the precedence ladder does not apply. A configured
+	// manifest that cannot be read or does not parse is fatal: a Box must never
+	// run unguarded because a file went missing. loadHookManifest already names
+	// the manifest path in every message it returns, so nothing is wrapped here.
+	if file.hookManifest != "" {
+		hooks, err := loadHookManifest(file.hookManifest)
+		if err != nil {
+			return config{}, err
+		}
+		cfg.hooks = hooks
 	}
 	// Resolved against the loaded roster, never opened from a path in argv: the
 	// configured directory is the only place an Agent File comes from.
