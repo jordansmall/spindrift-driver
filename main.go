@@ -38,6 +38,10 @@ type config struct {
 	// --api-key flag would put the secret in argv, where process listings and
 	// shell history expose it.
 	apiKey string
+	// agentsDir is the Agent Files directory: the Driver Config's agents_dir, or
+	// the home-relative default, or "" when neither resolves — which is "no
+	// Agent Files", never an error.
+	agentsDir string
 }
 
 // usage is a var, not a const: the --timeout default is interpolated from
@@ -46,7 +50,7 @@ var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>]
 
 The prompt may be given positionally or on stdin. --model is required.
 Precedence for every setting: flag, then environment, then the Driver Config, then the built-in default.
-The Driver Config is JSON at the path $` + envConfigPath + ` names, else $HOME/` + defaultDriverConfigPath + `; it carries base_url, api_key and timeout.
+The Driver Config is JSON at the path $` + envConfigPath + ` names, else $HOME/` + defaultDriverConfigPath + `; it carries base_url, api_key, timeout and agents_dir.
 An absent file at the default path is not an error; a missing file that $` + envConfigPath + ` names, or any file that cannot be
 parsed, is a startup error, never a fallback.
 The API key comes from $` + envAPIKey + ` or that file, never from argv.
@@ -335,6 +339,14 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		cfg.apiKey = v
 	} else {
 		cfg.apiKey = file.apiKey
+	}
+
+	// No flag and no environment variable here, so no precedence ladder: the
+	// file's value is taken verbatim — no Clean, no tilde expansion — so a later
+	// error names the directory the operator wrote.
+	cfg.agentsDir = agentsDirPath(lookupEnv)
+	if file.agentsDir != "" {
+		cfg.agentsDir = file.agentsDir
 	}
 
 	prompt, err := promptFrom(positional, stdin)

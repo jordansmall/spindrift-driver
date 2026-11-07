@@ -163,7 +163,7 @@ func TestDriverConfigPath(t *testing.T) {
 }
 
 func TestLoadDriverConfigWellFormed(t *testing.T) {
-	path := writeDriverConfig(t, `{"base_url":"http://model.test:9/v1","api_key":"sk-test","timeout":"90s"}`)
+	path := writeDriverConfig(t, `{"base_url":"http://model.test:9/v1","api_key":"sk-test","timeout":"90s","agents_dir":"/srv/agents"}`)
 
 	cfg, err := loadDriverConfig(path)
 	if err != nil {
@@ -171,6 +171,9 @@ func TestLoadDriverConfigWellFormed(t *testing.T) {
 	}
 	if cfg.baseURL != "http://model.test:9/v1" {
 		t.Errorf("baseURL = %q, want %q", cfg.baseURL, "http://model.test:9/v1")
+	}
+	if cfg.agentsDir != "/srv/agents" {
+		t.Errorf("agentsDir = %q, want %q", cfg.agentsDir, "/srv/agents")
 	}
 	if cfg.apiKey != "sk-test" {
 		t.Errorf("apiKey = %q, want %q", cfg.apiKey, "sk-test")
@@ -187,7 +190,7 @@ func TestLoadDriverConfigPartialFileLeavesRestZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadDriverConfig(%q) error = %v, want nil", path, err)
 	}
-	if cfg.baseURL != "" || cfg.timeout != 0 {
+	if cfg.baseURL != "" || cfg.timeout != 0 || cfg.agentsDir != "" {
 		t.Errorf("cfg = %+v, want only apiKey set", cfg)
 	}
 	if cfg.apiKey != "sk-only" {
@@ -267,6 +270,9 @@ func TestLoadDriverConfigWrongType(t *testing.T) {
 		{"api_key null", `{"api_key":null}`, `field "api_key" must be a string, got null`},
 		{"timeout number", `{"timeout":90}`, `field "timeout" must be a string, got number`},
 		{"timeout null", `{"timeout":null}`, `field "timeout" must be a string, got null`},
+		{"agents_dir number", `{"agents_dir":8080}`, `field "agents_dir" must be a string, got number`},
+		{"agents_dir null", `{"agents_dir":null}`, `field "agents_dir" must be a string, got null`},
+		{"agents_dir object", `{"agents_dir":{"d":1}}`, `field "agents_dir" must be a string, got object`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeDriverConfig(t, tc.contents)
