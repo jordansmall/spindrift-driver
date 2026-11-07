@@ -423,12 +423,13 @@ func TestReadmeDocumentsDriverConfig(t *testing.T) {
 	}
 }
 
-// TestReadmeDocumentsGuardHooks pins the operator-facing half of the pre-call
-// Guard Hook chain: where the manifest lives and what it looks like, in what order
-// it runs, what a hook is handed and answers with, what a refusal looks like, what
-// happens when a hook cannot answer, and — because only half the protocol is built
-// — what is still #22's. A host that bakes a hook from wrong prose bakes one whose
-// verdict is never read, or expects a rewrite this step does not apply.
+// TestReadmeDocumentsGuardHooks pins the operator-facing half of the Guard Hook
+// contract: where the manifest lives and what it looks like, in what order the
+// pre-call chain runs, what a hook is handed and answers with, what a refusal
+// looks like, what happens when a hook cannot answer, what a rewrite does, and
+// what the one post-call summary hook may and may not do to a Tool Result. A host
+// that bakes a hook from wrong prose bakes one whose verdict is never read, one
+// that rewrites in vain, or one that throws away a result the run still needs.
 func TestReadmeDocumentsGuardHooks(t *testing.T) {
 	const file = "README.md"
 	raw, err := os.ReadFile(file)
@@ -511,15 +512,57 @@ func TestReadmeDocumentsGuardHooks(t *testing.T) {
 	if !near(sec, "child", "inherit", 240) {
 		t.Error("the Guard Hooks section does not say a spawned child inherits the manifest")
 	}
-	// What #22 owns, stated as not implemented rather than left to inference: a
-	// reader who believes rewrites work ships a manifest that lies.
-	for _, want := range []string{"#22", "rewrite", "post-call", "jq"} {
-		if !strings.Contains(sec, want) {
-			t.Errorf("the Guard Hooks section does not state that %s belongs to #22 and is not implemented here", want)
-		}
+	// The rewrite path, by field name and by consequence: the rewritten command is
+	// the one that runs, the flag never withholds an answer it did not promise, and
+	// a rewriting hook that promises in silence is refused for it.
+	if !near(sec, "updatedinput", "replaces", 240) {
+		t.Error("the Guard Hooks section does not say updatedInput.command replaces the command")
 	}
-	if !regexp.MustCompile(`not implemented|does not apply|no effect here`).MatchString(sec) {
-		t.Error("the Guard Hooks section does not say plainly that #22's half is not implemented here")
+	if !near(sec, "rewritten", "runs", 240) {
+		t.Error("the Guard Hooks section does not say the rewritten command is the command that runs")
+	}
+	if !near(sec, "rewrites", "applied anyway", 320) {
+		t.Error("the Guard Hooks section does not say a rewrite from a hook that did not declare rewrites is applied anyway")
+	}
+	if !near(sec, "rewrites: true", "no rewrite", 320) || !near(sec, "no rewrite", "by name", 240) {
+		t.Error("the Guard Hooks section does not refuse a hook declared rewrites: true that answers with no rewrite, by name")
+	}
+	// A rewrite is host policy on what executes, so the wire keeps reporting the
+	// Model's own request rather than the sanitized text.
+	if !near(sec, "tool_call", "asked for", 320) {
+		t.Error("the Guard Hooks section does not say the tool_call event still reports the command the Model asked for")
+	}
+	// The post-call half: one hook rather than a chain, its answer field, and the
+	// opposite default on a failed run — a call that already ran keeps its result.
+	if !near(sec, "post", "one object", 240) {
+		t.Error("the Guard Hooks section does not say post is one hook object rather than an array")
+	}
+	if !near(sec, "updatedtooloutput", "replaces", 240) {
+		t.Error("the Guard Hooks section does not say updatedToolOutput replaces the Tool Result")
+	}
+	if !near(sec, "summary", "unchanged", 400) || !near(sec, "unchanged", "fails open", 240) {
+		t.Error("the Guard Hooks section does not say a failing summary hook fails open and leaves the Tool Result unchanged")
+	}
+	// The floor under a replacement is the Driver's own Tool Result cap. Read from
+	// the code like the two hook bounds above, so raising it fails here until the
+	// page says the new value.
+	if want := strings.ToLower(fmt.Sprintf("%d KiB", bashToolMaxOutput/1024)); !near(sec, want, "floor", 320) {
+		t.Errorf("the Guard Hooks section does not name the %s Tool Result cap as the floor on a summary replacement", want)
+	}
+	// jq belongs to a guarded run and to nothing else: without it a hook would
+	// inspect nothing and pass, and an unguarded run must not pay for it.
+	if !near(sec, "jq", "every guarded call", 320) {
+		t.Error("the Guard Hooks section does not say an unavailable jq refuses every guarded call")
+	}
+	if !near(sec, "jq", "unconfigured", 320) {
+		t.Error("the Guard Hooks section does not say a run with no Hook Manifest configured needs no jq")
+	}
+	// The disclaimer the section used to close with has to stay gone: a reader who
+	// believes the rewrite path is still unbuilt writes a manifest that never asks
+	// for a scrub, and nothing on the wire tells them the Driver would have
+	// honoured one.
+	if regexp.MustCompile(`not implemented|is not built|does not apply|no effect here`).MatchString(sec) {
+		t.Error("the Guard Hooks section still claims part of the Guard Hook protocol is unimplemented")
 	}
 }
 
