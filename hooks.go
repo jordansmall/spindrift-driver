@@ -35,69 +35,178 @@ type guardHook struct {
 	rewrites bool
 }
 
+// summaryHook is the manifest's one post-call entry: the script that summarises
+// a Tool Result and the hook-protocol tool names its result is worth rewriting.
+//
+// Deliberately its own type rather than a guardHook without a rewrites flag: a
+// summary entry is not a link in the pre-call chain, and keeping it separate
+// means the fail-open semantics it will carry stay local to it instead of
+// leaking into the chain's fail-closed rules.
+type summaryHook struct {
+	path  string
+	tools []string
+}
+
+// hookManifest is what one Hook Manifest file holds: the pre-call Guard Hooks in
+// run order and the one post-call summary hook, nil when the file names none.
+//
+// A struct rather than a second return value so a future field does not grow the
+// return tuple again.
+type hookManifest struct {
+	pre     []guardHook
+	summary *summaryHook
+}
+
 // knownManifestFields and knownHookFields are the whole Hook Manifest schema,
-// top level and per entry. Deliberately not more: the run order is the file
+// top level and per pre-call entry; knownSummaryFields is the per-entry schema
+// of the one post-call entry. Deliberately not more: the run order is the file
 // order, so a "priority" or "enabled" key would be a second, contradicted
 // answer to when a hook runs.
+//
+// A summary entry has no "rewrites" key: whether the post-call script rewrites
+// the Tool Result is what it exists for, so the flag would only let a manifest
+// switch the feature off in a way nothing reads.
 var (
-	knownManifestFields = []string{"pre"}
+	knownManifestFields = []string{"pre", "post"}
 	knownHookFields     = []string{"path", "tools", "rewrites"}
+	knownSummaryFields  = []string{"path", "tools"}
 )
 
 // loadHookManifest reads exactly one Hook Manifest and returns its pre-call
 // Guard Hooks in manifest order — the run order is the file order and nothing
-// here sorts them.
+// here sorts them — together with the one post-call summary hook, nil when the
+// file names none.
 //
 // Unlike loadDriverConfig this takes an explicit path and never resolves a
 // default: which file the manifest is stays the caller's decision (issue #22's,
 // once the Driver Config's hook_manifest field is wired up). It writes nothing
-// anywhere, and an absent "pre" is the only silence it accepts — a file that
-// cannot be read, a top-level value that is not an object (a top-level null or
-// an empty file included, which json would otherwise hand back as a nil map and
-// read as "no hooks"), and any unknown field are all errors naming the path.
-func loadHookManifest(path string) ([]guardHook, error) {
+// anywhere, and an absent "pre" or "post" is the only silence it accepts — a
+// file that cannot be read, a top-level value that is not an object (a top-level
+// null or an empty file included, which json would otherwise hand back as a nil
+// map and read as "no hooks"), and any unknown field are all errors naming the
+// path.
+func loadHookManifest(path string) (hookManifest, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("hook manifest %s: cannot read: %v", path, err)
+		return hookManifest{}, fmt.Errorf("hook manifest %s: cannot read: %v", path, err)
 	}
 	// Checked before decoding for the reason loadDriverConfig gives: the decode
 	// error alone cannot tell "no file content" from "content of the wrong
 	// shape", and the second reading must not quietly mean no hooks.
 	if kind := jsonKind(raw); kind != "object" {
-		return nil, fmt.Errorf("hook manifest %s: malformed JSON: top-level value is %s, want an object", path, kind)
+		return hookManifest{}, fmt.Errorf("hook manifest %s: malformed JSON: top-level value is %s, want an object", path, kind)
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil, fmt.Errorf("hook manifest %s: malformed JSON: %v", path, err)
+		return hookManifest{}, fmt.Errorf("hook manifest %s: malformed JSON: %v", path, err)
 	}
 	// Sorted before the unknown-key scan so a file with several complaints always
 	// reports the same one: map iteration order would otherwise pick at random.
 	for _, k := range sortedKeys(fields) {
 		if !slices.Contains(knownManifestFields, k) {
-			return nil, fmt.Errorf("hook manifest %s: unknown field %q", path, k)
+			return hookManifest{}, fmt.Errorf("hook manifest %s: unknown field %q", path, k)
 		}
 	}
-	rawPre, ok := fields["pre"]
-	if !ok {
-		// A manifest that says nothing is a valid manifest: no pre-call hooks.
-		return nil, nil
+	// Both keys are optional, and each is read independently: a manifest that
+	// names only post-call work still gets its summary hook parsed, so neither
+	// key's absence may short-circuit the other.
+	var manifest hookManifest
+	if rawPre, ok := fields["pre"]; ok {
+		if kind := jsonKind(rawPre); kind != "array" {
+			return hookManifest{}, fmt.Errorf("hook manifest %s: field %q must be an array, got %s", path, "pre", kind)
+		}
+		var entries []json.RawMessage
+		if err := json.Unmarshal(rawPre, &entries); err != nil {
+			return hookManifest{}, fmt.Errorf("hook manifest %s: field %q: %v", path, "pre", err)
+		}
+		manifest.pre = make([]guardHook, 0, len(entries))
+		for i, entry := range entries {
+			hook, err := parseGuardHook(path, i, entry)
+			if err != nil {
+				return hookManifest{}, err
+			}
+			manifest.pre = append(manifest.pre, hook)
+		}
 	}
-	if kind := jsonKind(rawPre); kind != "array" {
-		return nil, fmt.Errorf("hook manifest %s: field %q must be an array, got %s", path, "pre", kind)
-	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(rawPre, &entries); err != nil {
-		return nil, fmt.Errorf("hook manifest %s: field %q: %v", path, "pre", err)
-	}
-	hooks := make([]guardHook, 0, len(entries))
-	for i, entry := range entries {
-		hook, err := parseGuardHook(path, i, entry)
+	if rawPost, ok := fields["post"]; ok {
+		summary, err := parseSummaryHook(path, rawPost)
 		if err != nil {
-			return nil, err
+			return hookManifest{}, err
 		}
-		hooks = append(hooks, hook)
+		manifest.summary = &summary
 	}
-	return hooks, nil
+	return manifest, nil
+}
+
+// parseSummaryHook decodes the "post" object. Its complaints carry the manifest
+// path and the field name "post" where parseGuardHook puts an entry's position:
+// there is only ever one of them, so the name is how the operator finds it.
+func parseSummaryHook(path string, raw json.RawMessage) (summaryHook, error) {
+	at := "post"
+	if kind := jsonKind(raw); kind != "object" {
+		// field "post" rather than bare post for the shape complaint: post is a
+		// top-level key, so its own wording follows the one "pre" uses.
+		return summaryHook{}, fmt.Errorf("hook manifest %s: field %q must be an object, got %s", path, at, kind)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return summaryHook{}, fmt.Errorf("hook manifest %s: %s: %v", path, at, err)
+	}
+	for _, k := range sortedKeys(fields) {
+		if !slices.Contains(knownSummaryFields, k) {
+			return summaryHook{}, fmt.Errorf("hook manifest %s: %s: unknown field %q", path, at, k)
+		}
+	}
+	var summary summaryHook
+	// The script is the whole entry here too: a summary hook with nothing to run
+	// is a manifest promising a summary no script will write.
+	rawPath, ok := fields["path"]
+	if !ok {
+		return summaryHook{}, fmt.Errorf("hook manifest %s: %s: missing field %q", path, at, "path")
+	}
+	if kind := jsonKind(rawPath); kind != "string" {
+		return summaryHook{}, fmt.Errorf("hook manifest %s: %s: field %q must be a string, got %s", path, at, "path", kind)
+	}
+	if err := json.Unmarshal(rawPath, &summary.path); err != nil {
+		return summaryHook{}, fmt.Errorf("hook manifest %s: %s: field %q: %v", path, at, "path", err)
+	}
+	if summary.path == "" {
+		return summaryHook{}, fmt.Errorf("hook manifest %s: %s: field %q must not be empty", path, at, "path")
+	}
+	if rawTools, ok := fields["tools"]; ok {
+		tools, err := parseHookTools(path, at, rawTools)
+		if err != nil {
+			return summaryHook{}, err
+		}
+		summary.tools = tools
+	}
+	return summary, nil
+}
+
+// parseHookTools decodes an entry's "tools" value for either kind of manifest
+// entry, naming the offending element by position. An absent key never reaches
+// this: an empty list — written [] or left out — is the every-tool answer, not a
+// decode of nothing.
+func parseHookTools(path, at string, raw json.RawMessage) ([]string, error) {
+	if kind := jsonKind(raw); kind != "array" {
+		return nil, fmt.Errorf("hook manifest %s: %s: field %q must be an array, got %s", path, at, "tools", kind)
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("hook manifest %s: %s: field %q: %v", path, at, "tools", err)
+	}
+	var tools []string
+	for j, item := range items {
+		if kind := jsonKind(item); kind != "string" {
+			return nil, fmt.Errorf("hook manifest %s: %s: field %q[%d] must be a string, got %s", path, at, "tools", j, kind)
+		}
+		var name string
+		if err := json.Unmarshal(item, &name); err != nil {
+			return nil, fmt.Errorf("hook manifest %s: %s: field %q[%d]: %v", path, at, "tools", j, err)
+		}
+		tools = append(tools, name)
+	}
+	return tools, nil
 }
 
 // parseGuardHook decodes one element of "pre". Every complaint carries the
@@ -134,23 +243,11 @@ func parseGuardHook(path string, idx int, raw json.RawMessage) (guardHook, error
 		return guardHook{}, fmt.Errorf("hook manifest %s: %s: field %q must not be empty", path, at, "path")
 	}
 	if rawTools, ok := fields["tools"]; ok {
-		if kind := jsonKind(rawTools); kind != "array" {
-			return guardHook{}, fmt.Errorf("hook manifest %s: %s: field %q must be an array, got %s", path, at, "tools", kind)
+		tools, err := parseHookTools(path, at, rawTools)
+		if err != nil {
+			return guardHook{}, err
 		}
-		var items []json.RawMessage
-		if err := json.Unmarshal(rawTools, &items); err != nil {
-			return guardHook{}, fmt.Errorf("hook manifest %s: %s: field %q: %v", path, at, "tools", err)
-		}
-		for j, item := range items {
-			if kind := jsonKind(item); kind != "string" {
-				return guardHook{}, fmt.Errorf("hook manifest %s: %s: field %q[%d] must be a string, got %s", path, at, "tools", j, kind)
-			}
-			var name string
-			if err := json.Unmarshal(item, &name); err != nil {
-				return guardHook{}, fmt.Errorf("hook manifest %s: %s: field %q[%d]: %v", path, at, "tools", j, err)
-			}
-			hook.tools = append(hook.tools, name)
-		}
+		hook.tools = tools
 	}
 	if rawRewrites, ok := fields["rewrites"]; ok {
 		if kind := jsonKind(rawRewrites); kind != "boolean" {
@@ -172,10 +269,22 @@ func parseGuardHook(path string, idx int, raw json.RawMessage) (guardHook, error
 // tool names ("Bash"), and translating between those and the Driver's tool
 // names is issue #22's mapping concern, not this function's.
 func (h guardHook) appliesTo(protocolName string) bool {
-	if len(h.tools) == 0 {
+	return toolMatches(h.tools, protocolName)
+}
+
+// appliesTo reports whether the summary entry has anything to say about the
+// named tool.
+func (h summaryHook) appliesTo(protocolName string) bool {
+	return toolMatches(h.tools, protocolName)
+}
+
+// toolMatches is the tools rule both kinds of manifest entry share: an empty
+// list means every tool.
+func toolMatches(tools []string, protocolName string) bool {
+	if len(tools) == 0 {
 		return true
 	}
-	return slices.Contains(h.tools, protocolName)
+	return slices.Contains(tools, protocolName)
 }
 
 // hookToolName is the Driver's tool name in the hook protocol's vocabulary, the

@@ -3183,6 +3183,33 @@ func TestParseArgsLoadsHookManifest(t *testing.T) {
 	}
 }
 
+// TestParseArgsLoadsHookManifestSummary: the one post-call entry is carried on
+// the config beside the pre-call list, so the slice that rewrites a Tool Result
+// has the script to run without reading the file twice. A manifest naming no
+// post entry leaves it nil, which is "nothing to summarise", not an error.
+func TestParseArgsLoadsHookManifestSummary(t *testing.T) {
+	withSummary := writeHookManifest(t, `{"post":{"path":"/lib/hooks/summarize.sh","tools":["Bash"]}}`)
+	cfg, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(writeDriverConfig(t, `{"hook_manifest":"`+withSummary+`"}`)))
+	if err != nil {
+		t.Fatalf("parseArgs error = %v, want none for a well-formed manifest", err)
+	}
+	if cfg.summary == nil {
+		t.Fatalf("summary = nil, want the post-call entry")
+	}
+	if cfg.summary.path != "/lib/hooks/summarize.sh" || !reflect.DeepEqual(cfg.summary.tools, []string{"Bash"}) {
+		t.Errorf("summary = %+v, want /lib/hooks/summarize.sh tools [Bash]", *cfg.summary)
+	}
+
+	preOnly := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}]}`)
+	cfg, err = parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(writeDriverConfig(t, `{"hook_manifest":"`+preOnly+`"}`)))
+	if err != nil {
+		t.Fatalf("parseArgs error = %v, want none for a manifest with no post entry", err)
+	}
+	if cfg.summary != nil {
+		t.Errorf("summary = %+v, want nil when the manifest names no post-call hook", *cfg.summary)
+	}
+}
+
 // TestParseArgsNoHookManifestKeyGuardsNothing: the manifest is opt-in. With no
 // hook_manifest key the run is not pointed at a default file — cfg.hooks stays
 // empty, which is the state "nothing is guarded", never an error.
@@ -4150,6 +4177,27 @@ func TestRunMissingHookManifestFailsStartup(t *testing.T) {
 	assertNoStartEvent(t, stdout.String())
 	if !strings.Contains(stderr.String(), missing) {
 		t.Errorf("stderr = %q, want the operator copy of the failure naming %q", stderr.String(), missing)
+	}
+}
+
+// A Hook Manifest whose post-call entry is broken is as fatal as one that cannot
+// be read: the manifest is read whole at startup or not at all, so a run never
+// proceeds guarding its pre-call work with a file nobody fully understood.
+func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
+	manifest := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}],"post":{"tools":["Bash"]}}`)
+	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	}
+	got := oneErrorEvent(t, stdout.String())
+	if !strings.Contains(got, manifest) || !strings.Contains(got, `post: missing field "path"`) {
+		t.Errorf("error event text = %q, want it to name %q and the post entry's missing path", got, manifest)
+	}
+	assertNoStartEvent(t, stdout.String())
+	if !strings.Contains(stderr.String(), manifest) {
+		t.Errorf("stderr = %q, want the operator copy of the failure naming %q", stderr.String(), manifest)
 	}
 }
 
