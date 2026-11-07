@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +10,16 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"time"
 )
+
+// guardHookTimeout bounds one Guard Hook run; tests inject a shorter value.
+var guardHookTimeout = 5 * time.Second
+
+// guardHookOutputLimit caps how much of one Guard Hook's stdout the Driver
+// holds; tests inject a smaller value. The cap is inclusive: exactly this many
+// bytes is an answer, one byte more is a hook that flooded instead.
+var guardHookOutputLimit = 1 << 20
 
 // guardHook is one pre-call Guard Hook entry of a Hook Manifest: the script to
 // run, the hook-protocol tool names it applies to, and whether it rewrites the
@@ -19,7 +29,7 @@ import (
 // rewrite path and the post-call summary hook — the same precedent this branch
 // already sets for an Agent File's tools and spawns, which are parsed, recorded,
 // and only later acted on. guardCommand below does execute the pre-call chain,
-// but only its deny verdict acts.
+// but only its deny verdict and its failures act.
 type guardHook struct {
 	path     string
 	tools    []string
@@ -194,11 +204,18 @@ type hookToolInput struct {
 // the rewrite path — and updatedToolOutput belong to #22, which owns rewriting
 // and the post-call summary hook, so a hook that supplies them changes nothing
 // here.
+//
+// HookSpecificOutput is a pointer so that JSON null decodes as absent: no
+// verdict is a pass, while a hookSpecificOutput of the wrong shape fails the
+// decode and is a block. A plain struct field would read both as its zero
+// value.
 type hookResponse struct {
-	HookSpecificOutput struct {
-		PermissionDecision       string `json:"permissionDecision"`
-		PermissionDecisionReason string `json:"permissionDecisionReason"`
-	} `json:"hookSpecificOutput"`
+	HookSpecificOutput *hookDecision `json:"hookSpecificOutput"`
+}
+
+type hookDecision struct {
+	PermissionDecision       string `json:"permissionDecision"`
+	PermissionDecisionReason string `json:"permissionDecisionReason"`
 }
 
 // guardCommand runs command through the pre-call Guard Hooks in manifest order
@@ -206,13 +223,18 @@ type hookResponse struct {
 // applicable hook let the call through. The first refusal stops the chain: a
 // command already refused has no reason to be asked of a second hook.
 //
-// Only a literal "deny" decision refuses. Everything else — "allow", "ask", no
-// decision, no hookSpecificOutput, and stdout that is empty or all whitespace,
-// which is a hook's silence rather than a verdict — proceeds, because a hook
-// that did not say no did not say no. The remaining silences are not verdicts
-// either yet: non-zero exit, unparsable stdout, a script that cannot be started,
-// and a hook that hangs are slice 4b's fail-closed cases, marked at each site
-// below.
+// A hook's silence is a pass and anything else is a block. Silence means an
+// empty or whitespace-only stdout, an absent or null hookSpecificOutput, and
+// any decision that is not the literal "deny" — those are hooks with no
+// opinion. A script that cannot be started, a run that outlives
+// guardHookTimeout, a non-zero exit, stdout past guardHookOutputLimit, and
+// stdout that carries no readable verdict are the fail-closed half: the Driver
+// refuses rather than accept an answer it never got, since it cannot tell a
+// broken hook from an approving one.
+//
+// Every refusal carries the "error: " prefix, which is what turns this string
+// into an error Tool Result downstream, and a refusal raised by a run names the
+// hook's path so the operator can find the script to ask why.
 func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) string {
 	if len(hooks) == 0 {
 		// An unguarded run pays nothing: no marshalling, no fork, no wait.
@@ -221,64 +243,137 @@ func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Write
 	protocolName := hookToolName(driverTool)
 	var request bytes.Buffer
 	// Encoder rather than Marshal, for events.go's reason: markup in a command
-	// must reach the hook literally instead of as \u003c escapes, and writing into
-	// a bytes.Buffer cannot fail — Encode's trailing newline is the encoder's
-	// doing, not part of the payload.
+	// must reach the hook literally instead of as \u003c escapes. Encode's trailing
+	// newline is the encoder's doing, not part of the payload.
 	enc := json.NewEncoder(&request)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}})
+	if err := enc.Encode(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}}); err != nil {
+		// Fail closed like a hook that never answered: a request the Driver could
+		// not build is a command no hook was ever asked about, so running it would
+		// be running it unguarded.
+		return fmt.Sprintf("error: guard hook request could not be built: %v", err)
+	}
 	payload := bytes.TrimSuffix(request.Bytes(), []byte("\n"))
 
 	for _, hook := range hooks {
 		if !hook.appliesTo(protocolName) {
 			continue
 		}
-		cmd := exec.Command(hook.path)
-		// The script is what the host baked — shebang, mode bits and all — so it is
-		// exec'd directly. A shell in between would add a second quoting layer over
-		// text the hook is handed as data, and a manifest path is not a command.
-		cmd.Stdin = bytes.NewReader(payload)
-		var stdout bytes.Buffer
-		cmd.Stdout = &stdout
-		// A hook's own noise goes to the operator's progress copy, never to the wire:
-		// stdout carries only event lines, so a stray byte from a hook would be a
-		// malformed event. Hence the buffer for stdout — the child is never handed
-		// the parent's stdout fd — and nil here meaning there is no copy to write to,
-		// so the noise is dropped rather than inherited.
-		if stderr == nil {
-			cmd.Stderr = io.Discard
-		} else {
-			cmd.Stderr = stderr
+		// The run is judged before the verdict: a hook that never answered blocks
+		// the call on its own, with nothing left to parse.
+		stdout, refusal := runGuardHook(hook, payload, stderr)
+		if refusal == "" {
+			refusal = hookVerdict(hook, stdout)
 		}
-		// No cmd.Dir and no cmd.Env, following runBashTool: the hook judges the
-		// command in the same cwd and environment the command is about to run in.
-		if err := cmd.Start(); err != nil {
-			// 4b: a hook that never ran fails closed here. Until then it has no say.
-			continue
+		if refusal != "" {
+			return refusal
 		}
-		// 4b reads the exit status and enforces a timeout here; until then the
-		// status is not consulted, so it is deliberately not even kept.
-		_ = cmd.Wait()
-		if len(bytes.TrimSpace(stdout.Bytes())) == 0 {
-			continue
-		}
-		var response hookResponse
-		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
-			// 4b: unparsable stdout fails closed here.
-			continue
-		}
-		if response.HookSpecificOutput.PermissionDecision != "deny" {
-			continue
-		}
-		reason := response.HookSpecificOutput.PermissionDecisionReason
-		if reason == "" {
-			reason = "the hook gave no reason"
-		}
-		// The "error: " prefix is what turns this string into an error Tool Result
-		// downstream, and the path is how the operator finds the script to ask why.
-		return fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
 	}
 	return ""
+}
+
+// runGuardHook executes one hook and returns its stdout, or, when the run
+// itself failed, the refusal that blocks the call in place of an answer.
+func runGuardHook(hook guardHook, payload []byte, stderr io.Writer) (stdout []byte, refusal string) {
+	ctx, cancel := context.WithTimeout(context.Background(), guardHookTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, hook.path)
+	// The script is what the host baked — shebang, mode bits and all — so it is
+	// exec'd directly. A shell in between would add a second quoting layer over
+	// text the hook is handed as data, and a manifest path is not a command.
+	cmd.Stdin = bytes.NewReader(payload)
+	out := &cappedWriter{limit: guardHookOutputLimit}
+	cmd.Stdout = out
+	// A hook's own noise goes to the operator's progress copy, never to the wire:
+	// stdout carries only event lines, so a stray byte from a hook would be a
+	// malformed event. Hence the buffer for stdout — the child is never handed
+	// the parent's stdout fd — and nil here meaning there is no copy to write to,
+	// so the noise is dropped rather than inherited.
+	if stderr == nil {
+		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stderr = stderr
+	}
+	// No cmd.Dir and no cmd.Env, following runBashTool: the hook judges the
+	// command in the same cwd and environment the command is about to run in.
+	// WaitDelay for the reason runBashTool gives: a grandchild the hook detached
+	// can survive the kill holding the output pipes, and Wait would block on
+	// their EOF forever — a fired bound that never produces a refusal.
+	cmd.WaitDelay = time.Second
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Sprintf("error: guard hook %s could not be run: %v", hook.path, err)
+	}
+	err := cmd.Wait()
+	if ctx.Err() != nil {
+		// Judged before err, so the kill the bound fired reads as a timeout and not
+		// as the signal death it was. The accepted race runBashTool documents
+		// applies here too: a hook that finished between Wait and this check is
+		// reported as timed out.
+		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", hook.path, guardHookTimeout)
+	}
+	if err != nil {
+		// Includes a death on a signal, which exec words as "signal: …" — the
+		// hook stopped without a verdict either way.
+		return nil, fmt.Sprintf("error: guard hook %s failed: %v", hook.path, err)
+	}
+	if out.truncated {
+		// Judged before any verdict is read out of the kept prefix: what was thrown
+		// away may have been a deny, and an answer the Driver only half received is
+		// not an answer.
+		return nil, fmt.Sprintf("error: guard hook %s wrote more than %d bytes of output, so the command is blocked", hook.path, out.limit)
+	}
+	return out.buf.Bytes(), ""
+}
+
+// cappedWriter keeps at most limit bytes of what is written through it and
+// records that the write went over. exec needs an io.Writer for a child's
+// stdout and the stdlib has no bounded one.
+//
+// Write always reports the whole slice as consumed and never returns an error:
+// an error here reaches exec.Cmd.Wait, and the run would be refused as a
+// short write or a failed hook instead of by the message naming the output
+// bound. The truncation flag is what the caller judges.
+type cappedWriter struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	if room := w.limit - w.buf.Len(); len(p) > room {
+		w.truncated = true
+		if room > 0 {
+			w.buf.Write(p[:room])
+		}
+		return len(p), nil
+	}
+	w.buf.Write(p)
+	return len(p), nil
+}
+
+// hookVerdict turns one hook's stdout into the refusal it asks for, or "" when
+// it raised no objection.
+func hookVerdict(hook guardHook, stdout []byte) string {
+	if len(bytes.TrimSpace(stdout)) == 0 {
+		// Silence: a hook that said nothing, which is a pass and not a verdict the
+		// Driver has to be able to read.
+		return ""
+	}
+	var response hookResponse
+	if err := json.Unmarshal(stdout, &response); err != nil {
+		return fmt.Sprintf("error: guard hook %s returned unparsable output", hook.path)
+	}
+	if response.HookSpecificOutput == nil {
+		return ""
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		return ""
+	}
+	reason := response.HookSpecificOutput.PermissionDecisionReason
+	if reason == "" {
+		reason = "the hook gave no reason"
+	}
+	return fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

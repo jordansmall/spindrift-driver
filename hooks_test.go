@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeHookManifest puts contents in a file of its own and hands back the path,
@@ -323,9 +325,9 @@ func TestGuardCommandDenyWithoutReasonUsesFallback(t *testing.T) {
 }
 
 func TestGuardCommandProceedsUnlessTheHookDenies(t *testing.T) {
-	// The last two cases are slice 4b's fail-closed cases. They are pinned here
-	// only so this slice can neither panic on them nor deny on them; 4b replaces
-	// them with refusals.
+	// "null hookSpecificOutput" passes while a string or number there refuses:
+	// null is JSON for "not there", so it is the absence of a verdict, whereas a
+	// value of the wrong shape is a hook that answered something unreadable.
 	for _, tc := range []struct{ name, body string }{
 		{"allow", `echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`},
 		{"ask", `echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'`},
@@ -335,8 +337,6 @@ func TestGuardCommandProceedsUnlessTheHookDenies(t *testing.T) {
 		{"null hookSpecificOutput", `echo '{"hookSpecificOutput":null}'`},
 		{"empty stdout", `:`},
 		{"whitespace stdout", `printf '  \n\t\n'`},
-		{"unparsable stdout (4b)", `echo 'not json at all'`},
-		{"non-zero exit (4b)", `echo '{"permissionDecision":"allow"}' >&2; exit 3`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			script := writeGuardHookScript(t, "hook.sh", tc.body)
@@ -345,6 +345,89 @@ func TestGuardCommandProceedsUnlessTheHookDenies(t *testing.T) {
 				t.Errorf("guardCommand = %q, want the empty string (proceed)", got)
 			}
 		})
+	}
+}
+
+func TestGuardCommandFailsClosedOnAMisbehavingHook(t *testing.T) {
+	// Silence is a verdict of "no opinion", but a hook that exits non-zero or
+	// answers with unreadable stdout has said nothing usable, and the call is
+	// refused rather than waved through.
+	for _, tc := range []struct{ name, body, want string }{
+		{"non-zero exit", `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}' >&2; exit 3`, "failed: exit status 3"},
+		{"stdout is not JSON", `echo 'not json at all'`, "returned unparsable output"},
+		{"JSON with trailing junk", `echo '{"hookSpecificOutput":{}} trailing'`, "returned unparsable output"},
+		{"stdout is a bare string", `echo '"deny"'`, "returned unparsable output"},
+		{"hookSpecificOutput is a string", `echo '{"hookSpecificOutput":"deny"}'`, "returned unparsable output"},
+		{"hookSpecificOutput is a number", `echo '{"hookSpecificOutput":7}'`, "returned unparsable output"},
+		{"hookSpecificOutput is an array", `echo '{"hookSpecificOutput":["deny"]}'`, "returned unparsable output"},
+		{"hookSpecificOutput is a boolean", `echo '{"hookSpecificOutput":true}'`, "returned unparsable output"},
+		{"decision is a number", `echo '{"hookSpecificOutput":{"permissionDecision":7}}'`, "returned unparsable output"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "hook.sh", tc.body)
+
+			got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+
+			want := "error: guard hook " + script + " " + tc.want
+			if got != want {
+				t.Errorf("guardCommand = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGuardCommandFailsClosedWhenTheHookCannotBeRun(t *testing.T) {
+	// A manifest entry pointing at a script that is not on disk is the one
+	// misbehaviour the fixture cannot script, so the path is simply never written.
+	missing := filepath.Join(t.TempDir(), "never-installed.sh")
+
+	got := guardCommand("ls", "bash", []guardHook{{path: missing}}, nil)
+
+	if !strings.HasPrefix(got, "error: ") {
+		t.Errorf("guardCommand = %q, want an error: prefixed refusal", got)
+	}
+	if !strings.Contains(got, missing) {
+		t.Errorf("refusal %q does not name the hook %q", got, missing)
+	}
+	if !strings.Contains(got, "could not be run") {
+		t.Errorf("refusal %q does not say the hook could not be run", got)
+	}
+	if strings.Contains(got, "denied") {
+		t.Errorf("refusal %q blames the hook for a verdict it never made", got)
+	}
+}
+
+func TestGuardCommandFailsClosedWhenTheHookHangs(t *testing.T) {
+	old := guardHookTimeout
+	guardHookTimeout = 100 * time.Millisecond
+	defer func() { guardHookTimeout = old }()
+	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
+
+	got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil)
+
+	want := "error: guard hook " + script + " timed out after 100ms, so the command is blocked"
+	if got != want {
+		t.Errorf("guardCommand = %q, want %q", got, want)
+	}
+}
+
+func TestGuardCommandAFailingHookStopsTheChain(t *testing.T) {
+	// The refusal a non-zero exit produces stops the chain like a denial does:
+	// the second hook never gets to speak for a command already blocked.
+	dir := t.TempDir()
+	secondMarker := filepath.Join(dir, "second-ran")
+	first := writeGuardHookScript(t, "first.sh", "exit 3")
+	second := writeGuardHookScript(t, "second.sh",
+		`touch `+secondMarker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
+
+	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+
+	if want := "error: guard hook " + first + " failed: exit status 3"; got != want {
+		t.Errorf("guardCommand = %q, want %q", got, want)
+	}
+	if hookMarkerExists(t, secondMarker) {
+		t.Errorf("hook %s ran although an earlier hook already refused", second)
 	}
 }
 
@@ -474,5 +557,54 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 				t.Errorf("refusal %q carries the hook's stderr, which belongs to the operator's copy", got)
 			}
 		})
+	}
+}
+
+func TestGuardCommandFailsClosedWhenTheHookOverrunsTheOutputCap(t *testing.T) {
+	old := guardHookOutputLimit
+	guardHookOutputLimit = 4096
+	t.Cleanup(func() { guardHookOutputLimit = old })
+
+	dir := t.TempDir()
+	secondMarker := filepath.Join(dir, "second-ran")
+	// The flood is whitespace and the verdict sits past the cap, so a cap that
+	// quietly dropped the tail would hand back whitespace and read as silence.
+	first := writeGuardHookScript(t, "flood.sh",
+		`yes '' | head -c 8192
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`)
+	second := writeGuardHookScript(t, "second.sh",
+		`touch `+secondMarker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
+
+	got := guardCommand("ls", "bash", []guardHook{{path: first}, {path: second}}, nil)
+
+	if !strings.HasPrefix(got, "error: ") {
+		t.Errorf("guardCommand = %q, want an error: prefixed refusal", got)
+	}
+	if !strings.Contains(got, first) {
+		t.Errorf("refusal %q does not name the hook %q", got, first)
+	}
+	if !strings.Contains(got, fmt.Sprintf("%d bytes", guardHookOutputLimit)) {
+		t.Errorf("refusal %q does not name the output bound of %d bytes", got, guardHookOutputLimit)
+	}
+	if !strings.Contains(got, "blocked") {
+		t.Errorf("refusal %q does not say the command is blocked", got)
+	}
+	if hookMarkerExists(t, secondMarker) {
+		t.Errorf("hook %s ran although an earlier hook already refused", second)
+	}
+}
+
+func TestGuardCommandOutputExactlyAtTheCapPasses(t *testing.T) {
+	// The bound is inclusive: a hook that fills it is a hook that answered, so an
+	// off-by-one that reads "reached" as "exceeded" refuses every long verdict.
+	old := guardHookOutputLimit
+	guardHookOutputLimit = 4096
+	t.Cleanup(func() { guardHookOutputLimit = old })
+	script := writeGuardHookScript(t, "exact.sh",
+		fmt.Sprintf(`yes '' | head -c %d`, guardHookOutputLimit))
+
+	if got := guardCommand("ls", "bash", []guardHook{{path: script}}, nil); got != "" {
+		t.Errorf("guardCommand = %q, want the empty string (proceed) for output at the cap", got)
 	}
 }
