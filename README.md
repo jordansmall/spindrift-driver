@@ -239,7 +239,10 @@ none there is nobody for a call to name — and a call takes the `agent` to dele
 the `task` to hand it. The child is this same binary re-executed with `--agent <name>` and
 the task as its prompt; it inherits the working directory, the environment, the Driver
 Config and the Hook Manifest, which is how it reaches the same Model server, the same roster
-and the same Guard Hooks as its parent.
+and the same Guard Hooks as its parent. That inheritance is the environment's and the
+config file's, not the command line's: `--base-url`, `--timeout` and `--max-turns` are not
+passed on, so a child dials whatever its own environment and Driver Config name and runs
+under the default turn cap.
 A child is never offered the Subagent Tool, so delegation goes one level deep.
 
 Every event the child writes is relayed onto the parent's stdout as it arrives, with
