@@ -618,13 +618,16 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		cfg.summary = manifest.summary
 	}
 	// Resolved against the loaded roster, never opened from a path in argv: the
-	// configured directory is the only place an Agent File comes from.
+	// configured directory is the only place an Agent File comes from. The entry
+	// stays in scope below because the offer is read out of it too.
 	cfg.agent = *agentName
+	var self agentEntry
 	if cfg.agent != "" {
 		entry, ok := findAgent(cfg.agents, cfg.agent)
 		if !ok {
 			return config{}, fmt.Errorf("unknown agent %q", cfg.agent)
 		}
+		self = entry
 		// The entry's model id is used verbatim — no effort suffix, no splitting on
 		// "/" — because it is a router's key, not something the Driver composes.
 		if cfg.model == "" {
@@ -637,13 +640,13 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
 	}
-	cfg.tools = offeredTools(cfg.agents)
-	if cfg.agent != "" {
-		// A child is never offered the Subagent Tool: a subagent able to spawn is
-		// unbounded recursion, and the roster's own spawns field is not enforcement
-		// until #26 lands. The file Tools are offered: a child still works in the
-		// same working directory.
-		cfg.tools = []toolSpec{bashTool, editTool, writeTool}
+	// The offer follows the caller: a run named by --agent gets exactly the Tools
+	// its entry grants, and the top-level process — which no Agent File limits —
+	// gets the whole set.
+	if self.Name != "" {
+		cfg.tools = toolsForEntry(self, cfg.agents)
+	} else {
+		cfg.tools = offeredTools(cfg.agents)
 	}
 
 	prompt, err := promptFrom(positional, stdin)

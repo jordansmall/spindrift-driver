@@ -529,8 +529,9 @@ func TestSubagentFailureIsAnErrorToolResult(t *testing.T) {
 	}
 }
 
-// TestSubagentChildIsNotOfferedTheSubagentTool: recursion is stopped at the
-// offer, so the child gets the file Tools but never the means to spawn.
+// TestSubagentChildIsNotOfferedTheSubagentTool: the child's Agent File grants no
+// Tools, so its offer is the bash floor — the grant is what limits it, and the
+// Subagent Tool is nothing it was given, which is where recursion stops.
 func TestSubagentChildIsNotOfferedTheSubagentTool(t *testing.T) {
 	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
 	srv := newScriptedChatServer(t,
@@ -552,8 +553,8 @@ func TestSubagentChildIsNotOfferedTheSubagentTool(t *testing.T) {
 	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
 		t.Errorf("parent offer = %v, want [bash edit write subagent]", got)
 	}
-	if got := postedToolNames(t, sent[1]); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
-		t.Errorf("child offer = %v, want [bash edit write] — a subagent that can spawn is unbounded recursion", got)
+	if got := postedToolNames(t, sent[1]); !reflect.DeepEqual(got, []string{"bash"}) {
+		t.Errorf("child offer = %v, want [bash] — an entry granting nothing leaves only the floor", got)
 	}
 }
 
