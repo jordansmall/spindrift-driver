@@ -193,6 +193,67 @@ func offeredTools(agents []agentEntry) []toolSpec {
 	return []toolSpec{bashTool, editTool, writeTool, subagentTool}
 }
 
+// spawnable is the roster subset one caller may hand work to. The empty name is
+// the top-level process, which no Agent File limits, so it gets the whole
+// roster. Otherwise the roster answers twice: spawns is only a grant over what
+// exists, so a name with no Agent File drops, and iterating the roster instead
+// of the frontmatter keeps the offer in the directory's lexical order — and in
+// one entry per name however many times spawns repeats it.
+func spawnable(agent string, roster []agentEntry) []agentEntry {
+	if agent == "" {
+		return roster
+	}
+	caller, ok := findAgent(roster, agent)
+	if !ok {
+		return nil
+	}
+	var out []agentEntry
+	for _, entry := range roster {
+		for _, name := range caller.Spawns {
+			if name == entry.Name {
+				out = append(out, entry)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// toolsForEntry is the offer for a run selected by --agent: grants restrict the
+// canonical list and never add to it (docs/adr/0006): an unknown grant name
+// names no Tool, because no fifth Tool exists. The output follows the
+// canonical bash, edit, write, subagent order whatever order the file typed its
+// grants in, so what a server sees does not depend on how the frontmatter was
+// written.
+func toolsForEntry(entry agentEntry, roster []agentEntry) []toolSpec {
+	granted := make(map[string]bool, len(entry.Tools))
+	for _, name := range entry.Tools {
+		granted[name] = true
+	}
+	var tools []toolSpec
+	if granted["bash"] {
+		tools = append(tools, bashTool)
+	}
+	if granted["edit"] {
+		tools = append(tools, editTool)
+	}
+	if granted["write"] {
+		tools = append(tools, writeTool)
+	}
+	// Same reasoning offeredTools records: with nobody the caller may name,
+	// offering the Tool only invites a call that cannot be honoured.
+	if granted["subagent"] && len(spawnable(entry.Name, roster)) > 0 {
+		tools = append(tools, subagentTool)
+	}
+	// The floor: a run with nothing recognisable in its offer could do nothing
+	// at all, so a grant set that names no Tool still gets bash. A grant that
+	// does name a Tool is taken literally, bash included or not.
+	if len(tools) == 0 {
+		tools = append(tools, bashTool)
+	}
+	return tools
+}
+
 // findAgent resolves a --agent name against the roster. The match is exact:
 // a prefix or case-folded lookup would let a typo in argv run a different
 // subagent than the operator named, silently.
