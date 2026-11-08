@@ -476,3 +476,51 @@ func TestFileToolDispatchesWrite(t *testing.T) {
 		t.Errorf("file content = %q, want %q", b, "via planToolCall")
 	}
 }
+
+func TestPlanWriteCallGuardHookDenies(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	script := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	plan := planWriteCall(writeCall(`{"path":"secret.txt","content":"hunter2"}`), nil,
+		session{cfg: config{hooks: []guardHook{{path: script}}}})
+	out := plan.run()
+
+	want := "error: guard hook " + script + " denied this command: credential path"
+	if out != want {
+		t.Errorf("plan.run() = %q, want %q", out, want)
+	}
+	if !plan.isError(out) {
+		t.Errorf("is_error = false for %q, want true", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secret.txt")); !os.IsNotExist(err) {
+		t.Errorf("denied write created secret.txt: %v", err)
+	}
+}
+
+func TestPlanEditCallGuardHookDenies(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	target := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(target, []byte("hunter2"), 0o644); err != nil {
+		t.Fatalf("seed target file: %v", err)
+	}
+	script := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	plan := planEditCall(editCall(`{"path":"notes.txt","old_string":"hunter2","new_string":"redacted"}`), nil,
+		session{cfg: config{hooks: []guardHook{{path: script}}}})
+	out := plan.run()
+
+	if want := "error: guard hook " + script + " denied this command: credential path"; out != want {
+		t.Errorf("plan.run() = %q, want %q", out, want)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target file: %v", err)
+	}
+	if string(body) != "hunter2" {
+		t.Errorf("file content = %q, want the denied edit to leave %q untouched", body, "hunter2")
+	}
+}
