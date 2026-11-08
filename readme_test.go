@@ -783,3 +783,154 @@ func TestReadmeDocumentsSubagents(t *testing.T) {
 		t.Error("the usage line does not list [--agent <name>] next to [--timeout <dur>]")
 	}
 }
+
+// TestReadmeDocumentsFileTools pins the page to the two file Tools offered beside
+// Bash: that the intro names them as part of every offer, that the event stream
+// says which path a file call acts on and what a failed file operation looks
+// like, and that the pre-call chain is asked about a file Tool Call in the Read
+// tool's own shape — the one claim on the page that tells a host its existing
+// "deny reading this credential path" rule already covers Edit and Write. Prose
+// that still describes a Bash-only run has operators baking manifests whose file
+// calls go unguarded, which is nothing on the wire reports.
+func TestReadmeDocumentsFileTools(t *testing.T) {
+	const file = "README.md"
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	// The intro is where the offer is stated, and it has to name both file Tools:
+	// a reader who meets them only in a tool_call event cannot tell what a call
+	// carries or what it does to the checkout.
+	head := norm
+	if i := strings.Index(norm, "## output"); i > 0 {
+		head = norm[:i]
+	}
+	var offered []string
+	for _, s := range sentencesContaining(head, "edit") {
+		if strings.Contains(s, "write") && strings.Contains(s, "tool") {
+			offered = append(offered, s)
+		}
+	}
+	if len(offered) == 0 {
+		t.Error("the intro does not name the edit and write Tools among the Tools every run is offered")
+	}
+
+	out := markdownSectionAround(norm, "jsonl")
+	if out == "" {
+		t.Fatal("no section documents the JSONL event stream on stdout")
+	}
+	// A file call's tool_target is a path, not a command, and it is the one
+	// resolved value both events report — a reader auditing a log against the
+	// checkout needs to know relative paths are already gone.
+	var targetLines []string
+	for _, s := range sentencesContaining(out, "tool_target") {
+		if strings.Contains(s, "path") && strings.Contains(s, "resolved") {
+			targetLines = append(targetLines, s)
+		}
+	}
+	if len(targetLines) == 0 {
+		t.Error("the event-stream section does not say tool_target is the resolved path for the file Tools (relative paths read against the run's working directory)")
+	}
+	// is_error covers a failed file operation, not only a failed command, and a
+	// file result is a sentence rather than command output.
+	var errorLines []string
+	for _, s := range sentencesContaining(out, "is_error") {
+		if strings.Contains(s, "file") {
+			errorLines = append(errorLines, s)
+		}
+	}
+	if len(errorLines) == 0 {
+		t.Error("the tool_result bullet does not say is_error is set for a failed file operation as well as a failed command")
+	}
+	if !strings.Contains(out, "error:") || !near(out, "wrote", "bytes", 240) {
+		t.Error("the tool_result bullet does not show a file Tool's sentence-shaped result (`wrote N bytes to <path>`, `edited <path>: replaced N matches`) and its error:-prefixed failures")
+	}
+
+	sec := markdownSectionBody(string(raw), "guard hooks")
+	if sec == "" {
+		t.Fatal("README.md has no ## Guard Hooks section")
+	}
+	// The exact shape a file Tool Call is handed the chain as. These are the
+	// tokens a hook author parses, so they have to appear literally.
+	var shapeLines []string
+	for _, s := range sentencesContaining(sec, `"tool_name":"read"`) {
+		if strings.Contains(s, "file_path") {
+			shapeLines = append(shapeLines, s)
+		}
+	}
+	if len(shapeLines) == 0 {
+		t.Error(`the Guard Hooks section does not show the read-shaped pre-call request for a file Tool ({"tool_name":"Read","tool_input":{"file_path":…}})`)
+	}
+	// One shape for both file Tools is what makes one host rule cover both.
+	var bothLines []string
+	for _, s := range sentencesContaining(sec, "read") {
+		if strings.Contains(s, "edit") && strings.Contains(s, "write") {
+			bothLines = append(bothLines, s)
+		}
+	}
+	if len(bothLines) == 0 {
+		t.Error("no sentence says both the edit and write Tools are presented to the chain as the Read tool")
+	}
+	// Which entries are consulted: the ones guarding reads, which an empty or
+	// absent tools list already means.
+	var consulted []string
+	for _, s := range sentencesContaining(sec, "tools") {
+		if strings.Contains(s, "read") && (strings.Contains(s, "absent") || strings.Contains(s, "empty")) {
+			consulted = append(consulted, s)
+		}
+	}
+	if len(consulted) == 0 {
+		t.Error("the Guard Hooks section does not say which manifest entries guard a file Tool call (tools naming Read, or an empty or absent list)")
+	}
+	// The schema sentence has to name the protocol names an entry may list, or an
+	// operator writes `tools: ["Write"]` — a name the chain never asks about — and the
+	// guard never fires while looking configured.
+	if !satisfiesOrder(sec, "hook-protocol tool names", "bash", "read") {
+		t.Error("the manifest's tools field does not name both Bash and Read as hook-protocol tool names")
+	}
+	// A denial stops the write, not just the Model: the file keeps its bytes.
+	var fileDeny []string
+	for _, s := range sentencesContaining(sec, "deny") {
+		if strings.Contains(s, "file") && regexp.MustCompile(`before|never|untouched`).MatchString(s) {
+			fileDeny = append(fileDeny, s)
+		}
+	}
+	if len(fileDeny) == 0 {
+		t.Error("the Guard Hooks section does not say a deny refuses a file Tool call before the file changes")
+	}
+	// Rewriting stays command-only: a read has no input to rewrite, so the
+	// silent-rewriter refusal does not reach a file call.
+	var rewriteLines []string
+	for _, s := range sentencesContaining(sec, "rewrites") {
+		if strings.Contains(s, "read") && regexp.MustCompile(`command-only|not refused|ignored|no input`).MatchString(s) {
+			rewriteLines = append(rewriteLines, s)
+		}
+	}
+	if len(rewriteLines) == 0 {
+		t.Error("the Guard Hooks section does not say rewriting stays command-only policy, so a rewriter answering a read-shaped call silently is not refused")
+	}
+	// jq is still the precondition, file calls included.
+	if !near(sec, "jq", "file", 320) {
+		t.Error("the Guard Hooks section does not say the jq precondition covers guarded file Tool calls")
+	}
+	// The summary hook is command-shaped, so it never rewrites a file result.
+	var summaryScope []string
+	for _, s := range sentencesContaining(sec, "bash") {
+		if strings.Contains(s, "file") && strings.Contains(s, "unchanged") {
+			summaryScope = append(summaryScope, s)
+		}
+	}
+	if len(summaryScope) == 0 {
+		t.Error("the Guard Hooks section does not say the post-call summary hook is handed Bash Tool results, so a file Tool's result reaches the Model unchanged")
+	}
+
+	// The Subagents section's "not enforced" claim has to name all three always-on
+	// Tools now, or it reads as a Bash-only offer and understates what a roster
+	// cannot restrict.
+	subagents := markdownSectionBody(string(raw), "subagents")
+	if !regexp.MustCompile(`every run gets[^.]*bash[^.]*edit[^.]*write`).MatchString(subagents) {
+		t.Error("the Subagents section does not say every run gets the Bash, Edit and Write Tools whatever its roster says")
+	}
+}

@@ -2,9 +2,10 @@
 
 A **Driver** for the spindrift coordinator: one prompt in, one final answer out — and
 the answer arrives as a `result` event on stdout's event stream, not as loose text.
-It talks to an OpenAI-compatible **Model** server, offers that Model a Bash **Tool**
-— and a Subagent **Tool** whenever Agent Files are present — runs the Tool Calls the
-Model asks for, and loops until the Model answers.
+It talks to an OpenAI-compatible **Model** server, offers that Model a Bash **Tool**, an
+Edit **Tool** (`edit`) and a Write **Tool** (`write`) — and a Subagent **Tool** whenever
+Agent Files are present — runs the Tool Calls the Model asks for, and loops until the
+Model answers. Every run gets those three; only the Subagent **Tool** depends on anything.
 
 ```
 usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>] [--agent <name>]
@@ -50,12 +51,19 @@ exit.
 - `usage` — exactly one usage event per Model call, holding that call's `tokens` and
   never a running total. A server that reports no usage still gets one, with zeroes.
 - `tool_call` — the Model invoking a Tool: `tool_name`, `tool_input` (the arguments
-  decoded as JSON) and `tool_target` (the command, for the Bash Tool).
-- `tool_result` — that call's output on its way back to the Model, `is_error` set when
-  the command failed. `tool_call` and `tool_result` pair by `tool_id`. A call the
-  Repeated-Call Breaker refused never ran, so its `tool_result` is the Driver's own text
-  asking the Model to take a different action, and it pairs with its `tool_call` like any
-  result does.
+  decoded as JSON) and `tool_target` (the command, for the Bash Tool; for `edit` and
+  `write`, the resolved absolute path the call acts on — a relative `path` is read against
+  the run's working directory once, at plan time, and `tool_call` and `tool_result` report
+  that one value).
+- `tool_result` — that call's output on its way back to the Model, `is_error` set when the
+  command failed or a file operation did. A file Tool answers in a sentence rather than
+  command output — `wrote N bytes to <path>`, `edited <path>: replaced N matches` — and
+  `is_error` is true exactly for the `error:`-prefixed ones: an `edit` whose `old_string`
+  matches nowhere in the file, or matches more than once without `replace_all`, names the
+  count, writes nothing, and the run goes on past it to exit 0. `tool_call` and `tool_result`
+  pair by `tool_id`. A call the Repeated-Call Breaker refused never ran, so its `tool_result`
+  is the Driver's own text asking the Model to take a different action, and it pairs with its
+  `tool_call` like any result does.
 - `result` — the final answer, in `text`, plus `num_turns`, `duration_ms`,
   `duration_api_ms`, the session token totals in `tokens` and the `models` that
   answered. The answer is this event's `text`; it is also emitted as a `text` event,
@@ -149,10 +157,10 @@ The file holds five fields: `base_url`, an optional `api_key`, `timeout` — the
 `--timeout` sets, written as a Go duration string such as `"90s"` — `agents_dir`, the
 directory Agent Files are read from instead of the home-relative default (see
 [Subagents](#subagents)), and `hook_manifest`, the Hook Manifest that names the Guard Hooks
-every Bash Tool Call is run past (see [Guard Hooks](#guard-hooks)). Nothing else belongs in
-it — those five are the whole set: the Model name and `--max-turns` stay flags, so a file
-can move a run's traffic, point it at a roster and point it at the guards, but never change
-what a run does. It lives at
+every Bash Tool Call and every `edit` or `write` Call is run past (see
+[Guard Hooks](#guard-hooks)). Nothing else belongs in it — those five are the whole set: the
+Model name and `--max-turns` stay flags, so a file can move a run's traffic, point it at a
+roster and point it at the guards, but never change what a run does. It lives at
 `$HOME/.config/spindrift-driver/config.json`, or at the path `$SPINDRIFT_CONFIG` names,
 which is used verbatim.
 
@@ -180,8 +188,9 @@ because the repository under repair does not get to configure the run that repai
 ## Guard Hooks
 
 A Guard Hook is a script the host bakes into the Box that the Driver runs around a Bash Tool
-Call — before it, to decide whether the command may run and what command that is, and after
-it, to summarise the Tool Result the Model reads. The Hook Manifest is the JSON file that
+Call, or around an `edit` or `write` Call — before it, to decide whether the command may run
+and what command that is (and, for a file Call, whether that path may be touched at all), and
+after it, to summarise the Tool Result the Model reads. The Hook Manifest is the JSON file that
 lists them. Its path comes only from the Driver Config's `hook_manifest` — there is no
 default path, and no flag or environment variable names it. With no `hook_manifest` in the
 file the run is unconfigured and unguarded: no manifest, no hooks, nothing inspected.
@@ -194,9 +203,10 @@ file the run is unconfigured and unguarded: no manifest, no hooks, nothing inspe
 The top-level object has two fields. `pre` is an array of hooks run in manifest order — the
 file order is the run order, sorted by nothing, and the first refusal stops the chain. Each
 entry names `path` (the script to exec), `tools` (the hook-protocol tool names the entry
-applies to — `Bash` is the Bash Tool — an empty or absent list meaning every tool, so a hook
-that forgets to name its tools guards rather than skips), and `rewrites` (whether the hook
-rewrites the tool input). `post` is one object rather than an array — the contract is one
+applies to — `Bash` is the Bash Tool and `Read` the name a file Tool Call is guarded under, so
+an entry listing `Bash` alone never sees an `edit` — an empty or absent list meaning every tool,
+so a hook that forgets to name its tools guards rather than skips), and `rewrites` (whether the
+hook rewrites the tool input). `post` is one object rather than an array — the contract is one
 summary hook, not a chain — and its entry names `path` and `tools` only. `rewrites` on it is
 refused as an unknown field, because rewriting the Tool Result is what the post-call script
 exists for, so the flag would only be a switch nothing reads.
@@ -219,6 +229,18 @@ by name, since the Driver cannot tell "there was nothing to sanitize" from a hoo
 answering halfway; the empty command owes nothing, because there is nothing in it to rewrite.
 The `tool_call` event still reports the command the Model asked for: a rewrite is host policy
 on what executes, not a claim about what was requested.
+
+A file Tool Call is put to the same chain, but in the **Read** tool's own shape: both `edit`
+and `write` hand the pre-call hooks `{"tool_name":"Read","tool_input":{"file_path":"/abs/path"}}`
+— one shape for both Tools, so a host rule that denies reading a credential path covers Edit
+and Write without being rewritten. The entries consulted are the ones guarding reads: a
+`tools` list naming `Read`, or an empty or absent `tools` list, which already means every
+tool. A `deny` refuses before the file changes, so the file keeps the bytes it had and the
+Tool Result is the refusal naming the script and the reason. Rewriting stays command-only
+policy — a read has no input to rewrite, so a hook that declared `rewrites: true` is not
+refused for answering a file Call with no `updatedInput`, and any `updatedInput` handed back
+there is ignored. `jq` stays the precondition of a guarded run, file Calls included: with no
+`jq` on `PATH` a guarded `edit` is refused naming `jq`, exactly as a guarded command is.
 
 Anything else fails closed, because the Driver cannot tell a broken hook from an approving
 one: a script that cannot be run, a hook that overruns its per-hook bound of 5s
@@ -244,7 +266,9 @@ be started, a run past the same 5s (`guardHookTimeout`) and 1 MiB (`guardHookOut
 bound, a non-zero exit, a flood of stdout, an answer that is nothing readable, and an empty
 replacement, which would trade a real result for the empty string. The Driver's own 10 KiB
 Tool Result cap (`bashToolMaxOutput`) stays in place as the floor under a replacement, so a
-hook cannot summarise upwards. A refused call is never summarised.
+hook cannot summarise upwards. A refused call is never summarised. That request is
+command-shaped, so the summary hook is handed Bash Tool results only and a file Tool's result
+reaches the Model unchanged, exactly as the Driver wrote it.
 
 A `hook_manifest` naming a file that cannot be read, or JSON that does not parse, is a
 startup error at exit 2 naming the file: the run refuses to start unguarded rather than
@@ -281,8 +305,8 @@ You are a scout. Read, and report paths; never edit.
 `name` and `model` are required. `model` is the child's Model id, used verbatim — no
 effort suffix is parsed off it — and `--model` still overrides it for a run started with
 `--agent`, as it does for any run. The body below the frontmatter is the child's system
-prompt. `tools` and `spawns` are read and recorded, not enforced: every run gets the Bash
-Tool whatever its roster says, and no roster limits whom a run may delegate to.
+prompt. `tools` and `spawns` are read and recorded, not enforced: every run gets the Bash, Edit
+and Write Tools whatever its roster says, and no roster limits whom a run may delegate to.
 
 The Subagent Tool is offered only when the roster holds at least one Agent File — with
 none there is nobody for a call to name — and a call takes the `agent` to delegate to and
