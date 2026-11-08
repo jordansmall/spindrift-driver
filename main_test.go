@@ -3975,6 +3975,45 @@ func agentFixture(t *testing.T, name, model, body string) string {
 	return writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
 }
 
+// agentSpec is one Agent File as a policy test writes it: an empty field is left
+// out of the frontmatter rather than written empty, so a row states only the
+// grants it means. tools and spawns hold the inline comma form verbatim.
+type agentSpec struct {
+	name        string
+	model       string
+	description string
+	tools       string
+	spawns      string
+	body        string
+}
+
+// agentFixtureEntries writes one Agent File per spec into a fresh directory and
+// returns the path of a Driver Config naming it. File names carry the spec index
+// so the roster's lexical order is the order the row wrote them in.
+func agentFixtureEntries(t *testing.T, specs ...agentSpec) string {
+	t.Helper()
+	dir := t.TempDir()
+	for i, s := range specs {
+		fm := []string{"name: " + s.name, "model: " + s.model}
+		if s.description != "" {
+			fm = append(fm, "description: "+s.description)
+		}
+		if s.tools != "" {
+			fm = append(fm, "tools: "+s.tools)
+		}
+		if s.spawns != "" {
+			fm = append(fm, "spawns: "+s.spawns)
+		}
+		body := s.body
+		if body == "" {
+			body = "work on it"
+		}
+		contents := "---\n" + strings.Join(fm, "\n") + "\n---\n" + body + "\n"
+		writeAgentFile(t, dir, fmt.Sprintf("%d-%s.md", i, s.name), contents)
+	}
+	return writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+}
+
 // TestParseArgsAgentSelectsRosterEntry: --agent is what makes a run a child, so
 // all three facts the entry carries land on the config — the name it was
 // selected by, its model id and its body as the system prompt.
@@ -4092,19 +4131,103 @@ func TestRunAgentModelPostedVerbatim(t *testing.T) {
 }
 
 // TestRunChildNotOfferedSubagentTool: a run selected by --agent is a child, and
-// a child holding the Subagent Tool could spawn without bound. The top-level
-// case rides along so the suppression cannot leak upward out of the child.
+// its offer is its entry's grants — a child spawning children is unbounded
+// recursion, so an entry that grants no subagent never sees the Tool. The
+// top-level case rides along so the grant-shaped offer cannot leak upward.
 func TestRunChildNotOfferedSubagentTool(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
+	roster := []agentSpec{
+		{name: "reviewer", model: "m-r", body: "review things"},
+		{name: "full", model: "m-full", tools: "bash, edit, write", body: "do the work"},
+	}
 	for _, tc := range []struct {
 		name  string
 		agent []string
 		want  []string
 	}{
-		{name: "child", agent: []string{"--agent", "reviewer"}, want: []string{"bash", "edit", "write"}},
+		{name: "child grants nothing", agent: []string{"--agent", "reviewer"}, want: []string{"bash"}},
+		{name: "child granted the file tools", agent: []string{"--agent", "full"}, want: []string{"bash", "edit", "write"}},
 		{name: "top level keeps the tool", agent: nil, want: []string{"bash", "edit", "write", "subagent"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := agentFixtureEntries(t, roster...)
+			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			args := append([]string{"p"}, tc.agent...)
+			args = append(args, "--model", "m", "--base-url", srv.srv.URL)
+			var stdout, stderr bytes.Buffer
+			code := run(args, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+			}
+			sent := srv.requestBodies(t)
+			if len(sent) != 1 {
+				t.Fatalf("POSTs = %d, want 1", len(sent))
+			}
+			if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("offered tools = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunOfferIsWhatTheEntryGrants: the offer a child posts is its own entry's
+// grants and nothing else — no Tool it was not granted, canonical order rather
+// than file order, an unknown grant dropped, the Subagent Tool only where the
+// entry both grants it and has someone it may name. The top-level row rides
+// along: the same assignment serves it, and no Agent File limits that run.
+func TestRunOfferIsWhatTheEntryGrants(t *testing.T) {
+	grantee := agentSpec{name: "lead", model: "m-lead", tools: "bash, subagent", spawns: "helper"}
+	helper := agentSpec{name: "helper", model: "m-helper"}
+	for _, tc := range []struct {
+		name  string
+		specs []agentSpec
+		agent []string
+		want  []string
+	}{
+		{
+			name:  "grants nothing",
+			specs: []agentSpec{{name: "plain", model: "m-plain"}},
+			agent: []string{"--agent", "plain"},
+			want:  []string{"bash"},
+		},
+		{
+			name:  "grants bash and edit",
+			specs: []agentSpec{{name: "patcher", model: "m-patcher", tools: "bash, edit"}},
+			agent: []string{"--agent", "patcher"},
+			want:  []string{"bash", "edit"},
+		},
+		{
+			name:  "grant order is canonical not file order",
+			specs: []agentSpec{{name: "writer", model: "m-writer", tools: "write, bash"}},
+			agent: []string{"--agent", "writer"},
+			want:  []string{"bash", "write"},
+		},
+		{
+			name:  "unknown grant is dropped",
+			specs: []agentSpec{{name: "odd", model: "m-odd", tools: "bash, read"}},
+			agent: []string{"--agent", "odd"},
+			want:  []string{"bash"},
+		},
+		{
+			name:  "grants subagent and has someone to spawn",
+			specs: []agentSpec{grantee, helper},
+			agent: []string{"--agent", "lead"},
+			want:  []string{"bash", "subagent"},
+		},
+		{
+			name:  "grants subagent with no one to spawn",
+			specs: []agentSpec{{name: "lead", model: "m-lead", tools: "bash, subagent"}, helper},
+			agent: []string{"--agent", "lead"},
+			want:  []string{"bash"},
+		},
+		{
+			name:  "top level keeps the whole offer",
+			specs: []agentSpec{grantee, helper},
+			agent: nil,
+			want:  []string{"bash", "edit", "write", "subagent"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := agentFixtureEntries(t, tc.specs...)
 			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 			args := append([]string{"p"}, tc.agent...)
 			args = append(args, "--model", "m", "--base-url", srv.srv.URL)
