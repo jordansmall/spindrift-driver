@@ -289,8 +289,8 @@ func toolMatches(tools []string, protocolName string) bool {
 }
 
 // hookToolName is the Driver's tool name in the hook protocol's vocabulary, the
-// one the manifest is written in; #22 extends this map when the Edit and Write
-// Tools land.
+// one the manifest is written in. The file Tools never pass through it: guardRead
+// names "Read" for both, so one credential-path rule covers all three Tools.
 func hookToolName(driverTool string) string {
 	if driverTool == "bash" {
 		return "Bash"
@@ -299,14 +299,18 @@ func hookToolName(driverTool string) string {
 }
 
 // hookRequest and hookToolInput are the pre-call payload a hook reads on stdin,
-// in the protocol's tool vocabulary: {"tool_name":"Bash","tool_input":{"command":…}}.
+// in the protocol's tool vocabulary: {"tool_name":"Bash","tool_input":{"command":…}}
+// for a command, {"tool_name":"Read","tool_input":{"file_path":…}} for a read.
+// Both input fields are omitempty because only one is filled per request shape,
+// so a Bash request carries no file_path key and a read no command key.
 type hookRequest struct {
 	ToolName  string        `json:"tool_name"`
 	ToolInput hookToolInput `json:"tool_input"`
 }
 
 type hookToolInput struct {
-	Command string `json:"command"`
+	Command  string `json:"command,omitempty"`
+	FilePath string `json:"file_path,omitempty"`
 }
 
 // hookPostRequest is what the one post-call summary hook reads on stdin: the
@@ -450,6 +454,61 @@ func hookRewrite(hook guardHook, command string, answer hookResponse) (string, s
 // the encoder's doing, not part of the payload, so it comes off here.
 func encodeHookRequest(protocolName, command string) ([]byte, error) {
 	return encodeHookPayload(hookRequest{ToolName: protocolName, ToolInput: hookToolInput{Command: command}})
+}
+
+// encodeHookReadRequest builds the stdin one hook is handed when the call under
+// guard is a file Tool reading or writing path. See guardRead for why the tool
+// name is Read and not the Driver's own name for the call.
+func encodeHookReadRequest(path string) ([]byte, error) {
+	return encodeHookPayload(hookRequest{ToolName: "Read", ToolInput: hookToolInput{FilePath: path}})
+}
+
+// guardRead runs filePath through the pre-call Guard Hooks in manifest order and
+// returns the refusal to hand back as the Tool Result, "" for "no objection".
+// The call is presented as the Read tool's own request — tool_name "Read" for
+// both file Tools, not two new protocol names — so one host rule that denies
+// reading a credential path covers Edit and Write as well as bash without being
+// rewritten. The hooks asked are the ones guarding reads, which an empty tools
+// list already means.
+//
+// hookRewrite has no place here: a read has no input to rewrite, so the rule
+// that refuses a silent rewriter is command-only policy, and any updatedInput a
+// hook answers a read with is ignored. Everything else about the chain is
+// guardCommand's fail-closed judgement, first refusal winning.
+func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
+	if len(hooks) == 0 {
+		// An unguarded run pays nothing: no marshalling, no fork, no jq lookup.
+		return ""
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		// The same doubt guardCommand raises — a guard that cannot read its own
+		// request has inspected nothing — worded for a run that has no command in
+		// it, and still named for jq rather than a hook path.
+		return "error: jq is not available, so the guarded read cannot be run"
+	}
+	// Built once for the chain rather than per hook as guardCommand does: with no
+	// rewrite to feed forward, every hook is asked about the same path.
+	payload, err := encodeHookReadRequest(filePath)
+	if err != nil {
+		// Fail closed like a hook that never answered: a request the Driver could
+		// not build is a path no hook was ever asked about.
+		return fmt.Sprintf("error: guard hook request could not be built: %v", err)
+	}
+	for _, hook := range hooks {
+		if !hook.appliesTo("Read") {
+			continue
+		}
+		// The run is judged before the verdict, as in guardCommand: a hook that never
+		// answered blocks the call on its own, with nothing left to parse.
+		stdout, refusal := runHookScript(hook.path, payload, stderr)
+		if refusal == "" {
+			_, refusal = hookVerdict(hook, stdout)
+		}
+		if refusal != "" {
+			return refusal
+		}
+	}
+	return ""
 }
 
 // encodeHookPostRequest builds the stdin the summary hook is handed for a
