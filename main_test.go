@@ -3769,9 +3769,9 @@ func TestChatRequestWireShape(t *testing.T) {
 }
 
 // TestSubagentToolWireShape: the Subagent Tool travels to the Model in the same
-// envelope bash does, and its schema is the only thing the Model has to go on —
-// the agent names themselves arrive in a later issue, so the description must
-// not enumerate them.
+// envelope bash does, and its schema is the only thing the Model has to go on
+// for the arguments. The per-run agent listing lives on the copy subagentToolFor
+// hands out, so the base spec marshalled here carries none.
 func TestSubagentToolWireShape(t *testing.T) {
 	raw, err := json.Marshal(subagentTool)
 	if err != nil {
