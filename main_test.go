@@ -1070,7 +1070,9 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 		t.Fatalf("POSTs = %d, want 3", len(bodies))
 	}
 
-	// every request must advertise exactly one function tool named bash
+	// every request must advertise the whole offer, and no Subagent Tool without
+	// a roster to name
+	wantOffer := []string{"bash", "edit", "write"}
 	for i, body := range bodies {
 		var parsed struct {
 			Tools []toolSpec `json:"tools"`
@@ -1078,8 +1080,8 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 		if err := json.Unmarshal(body, &parsed); err != nil {
 			t.Fatalf("unmarshal request %d: %v", i+1, err)
 		}
-		if len(parsed.Tools) != 1 || parsed.Tools[0].Type != "function" || parsed.Tools[0].Function.Name != "bash" {
-			t.Errorf("request %d tools = %+v, want one function tool named bash", i+1, parsed.Tools)
+		if got := offeredNames(parsed.Tools); !reflect.DeepEqual(got, wantOffer) {
+			t.Errorf("request %d tools = %v, want %v", i+1, got, wantOffer)
 		}
 	}
 
@@ -3387,7 +3389,7 @@ func TestParseArgsAgentsDir(t *testing.T) {
 
 // TestParseArgsAbsentDefaultAgentsDir: the home-relative default is never the
 // operator's promise, so a directory that is simply not there reads as "no
-// Agent Files" — no entries, no error, bash-only offer. A configured directory
+// Agent Files" — no entries, no error, and no Subagent Tool. A configured directory
 // missing is fatal, which is the asymmetry this test pins from the other side.
 func TestParseArgsAbsentDefaultAgentsDir(t *testing.T) {
 	home := t.TempDir()
@@ -3403,8 +3405,8 @@ func TestParseArgsAbsentDefaultAgentsDir(t *testing.T) {
 	if len(cfg.agents) != 0 {
 		t.Errorf("agents = %+v, want none", cfg.agents)
 	}
-	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash"}) {
-		t.Errorf("tools = %v, want [bash]", got)
+	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
+		t.Errorf("tools = %v, want [bash edit write]", got)
 	}
 }
 
@@ -3471,8 +3473,8 @@ func TestParseArgsLoadsRosterAndOffer(t *testing.T) {
 	if len(cfg.agents) != 2 || cfg.agents[0].Name != "alpha" || cfg.agents[1].Name != "beta" {
 		t.Errorf("agents = %+v, want [alpha beta] in file-name order", cfg.agents)
 	}
-	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
-		t.Errorf("tools = %v, want [bash subagent]", got)
+	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
+		t.Errorf("tools = %v, want [bash edit write subagent]", got)
 	}
 }
 
@@ -3819,6 +3821,92 @@ func TestSubagentToolWireShape(t *testing.T) {
 	}
 }
 
+// TestFileToolWireShape pins the Edit and Write Tool schemas the Model is told:
+// the schema is the only thing it writes arguments against, and replace_all is
+// the one boolean in either, so its JSON type must not drift to string.
+func TestFileToolWireShape(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tool     toolSpec
+		strings  []string
+		bools    []string
+		required []string
+	}{
+		{
+			name:     "edit",
+			tool:     editTool,
+			strings:  []string{"path", "old_string", "new_string"},
+			bools:    []string{"replace_all"},
+			required: []string{"path", "old_string", "new_string"},
+		},
+		{
+			name:     "write",
+			tool:     writeTool,
+			strings:  []string{"path", "content"},
+			required: []string{"path", "content"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.tool)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var top map[string]any
+			if err := json.Unmarshal(raw, &top); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if top["type"] != "function" {
+				t.Errorf("type = %v, want function", top["type"])
+			}
+			fn, _ := top["function"].(map[string]any)
+			if fn["name"] != tc.name {
+				t.Errorf("function.name = %v, want %s", fn["name"], tc.name)
+			}
+			if desc, _ := fn["description"].(string); desc == "" {
+				t.Error("function.description is empty: the Model cannot tell what the tool is for")
+			}
+			params, _ := fn["parameters"].(map[string]any)
+			if params["type"] != "object" {
+				t.Errorf("parameters.type = %v, want object", params["type"])
+			}
+			props, _ := params["properties"].(map[string]any)
+			for _, kind := range []struct {
+				jsonType string
+				names    []string
+			}{
+				{jsonType: "string", names: tc.strings},
+				{jsonType: "boolean", names: tc.bools},
+			} {
+				for _, name := range kind.names {
+					prop, _ := props[name].(map[string]any)
+					if prop == nil || prop["type"] != kind.jsonType {
+						t.Errorf("parameters.properties.%s = %v, want a %s property", name, props[name], kind.jsonType)
+					}
+				}
+			}
+			want := map[string]bool{}
+			for _, name := range tc.required {
+				want[name] = true
+			}
+			required, _ := params["required"].([]any)
+			if len(required) != len(tc.required) {
+				t.Fatalf("parameters.required = %v, want %v", params["required"], tc.required)
+			}
+			for _, item := range required {
+				name, _ := item.(string)
+				if !want[name] {
+					t.Errorf("parameters.required contains %v, want only %v", item, tc.required)
+					continue
+				}
+				delete(want, name)
+			}
+			if len(want) != 0 {
+				t.Errorf("parameters.required = %v, want %v", params["required"], tc.required)
+			}
+		})
+	}
+}
+
 // postedToolNames reads the tool offer back off a recorded POST body: what the
 // Model was actually told, not what a hand-built struct was meant to hold.
 func postedToolNames(t *testing.T, raw []byte) []string {
@@ -3832,9 +3920,9 @@ func postedToolNames(t *testing.T, raw []byte) []string {
 	return offeredNames(body.Tools)
 }
 
-// TestRunOffersBashOnlyWithNoAgentFiles is the issue's first acceptance
+// TestRunOffersNoSubagentWithoutAgentFiles is the issue's first acceptance
 // criterion: with no Agent Files the run offers no Subagent Tool at all.
-func TestRunOffersBashOnlyWithNoAgentFiles(t *testing.T) {
+func TestRunOffersNoSubagentWithoutAgentFiles(t *testing.T) {
 	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
@@ -3845,8 +3933,8 @@ func TestRunOffersBashOnlyWithNoAgentFiles(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("POSTs = %d, want 1", len(sent))
 	}
-	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash"}) {
-		t.Errorf("offered tools = %v, want [bash] only", got)
+	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
+		t.Errorf("offered tools = %v, want [bash edit write] only", got)
 	}
 }
 
@@ -3872,8 +3960,8 @@ func TestRunOffersSubagentToolWithAgentFiles(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("POSTs = %d, want 1", len(sent))
 	}
-	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
-		t.Errorf("offered tools = %v, want [bash subagent]", got)
+	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
+		t.Errorf("offered tools = %v, want [bash edit write subagent]", got)
 	}
 }
 
@@ -4013,8 +4101,8 @@ func TestRunChildNotOfferedSubagentTool(t *testing.T) {
 		agent []string
 		want  []string
 	}{
-		{name: "child", agent: []string{"--agent", "reviewer"}, want: []string{"bash"}},
-		{name: "top level keeps the tool", agent: nil, want: []string{"bash", "subagent"}},
+		{name: "child", agent: []string{"--agent", "reviewer"}, want: []string{"bash", "edit", "write"}},
+		{name: "top level keeps the tool", agent: nil, want: []string{"bash", "edit", "write", "subagent"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
