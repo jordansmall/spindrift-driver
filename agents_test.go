@@ -452,3 +452,93 @@ func TestOfferedTools(t *testing.T) {
 		t.Errorf("offeredTools(roster) = %+v, want [bashTool editTool writeTool subagentTool]", got)
 	}
 }
+
+// rosterNames reduces an entry list to the names a failure message can show.
+func rosterNames(entries []agentEntry) []string {
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	return names
+}
+
+// TestSpawnable: spawns is a grant over the roster, so the roster answers twice
+// — a name with no Agent File can never be honoured — and the answer keeps the
+// roster's lexical order rather than the frontmatter's, which is what makes a
+// spawns-derived offer byte-stable.
+func TestSpawnable(t *testing.T) {
+	roster := []agentEntry{
+		{Name: "planner", Model: "m", Spawns: []string{"worker", "critic", "worker", "ghost"}},
+		{Name: "critic", Model: "m"},
+		{Name: "quiet", Model: "m"},
+		{Name: "worker", Model: "m", Spawns: []string{"critic"}},
+	}
+	tests := []struct {
+		name  string
+		agent string
+		want  []string
+	}{
+		{"top level is unrestricted", "", []string{"planner", "critic", "quiet", "worker"}},
+		{"roster order wins over frontmatter order, unknown names drop, duplicates fold", "planner", []string{"critic", "worker"}},
+		{"child of one", "worker", []string{"critic"}},
+		{"naming nobody spawns nobody", "quiet", nil},
+		{"caller off the roster spawns nobody", "stranger", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := spawnable(tc.agent, roster)
+			if !reflect.DeepEqual(rosterNames(got), tc.want) {
+				t.Errorf("spawnable(%q) = %v, want %v", tc.agent, rosterNames(got), tc.want)
+			}
+		})
+	}
+
+	// The helper answers with the roster's own entries and never rewrites them:
+	// a caller that appends to the result must not widen what the next run sees.
+	base := []agentEntry{{Name: "a", Model: "m"}, {Name: "b", Model: "m"}}
+	if got := spawnable("", base); !reflect.DeepEqual(got, base) || !reflect.DeepEqual(base, []agentEntry{{Name: "a", Model: "m"}, {Name: "b", Model: "m"}}) {
+		t.Errorf("spawnable(\"\") = %v over roster %+v, want the roster's own entries and an unchanged roster", rosterNames(got), base)
+	}
+}
+
+// TestToolsForEntry: a grant restricts the offer and never adds to it, the offer
+// comes out in the canonical order whatever order the file typed the grants in,
+// and an unknown grant name names no Tool at all.
+func TestToolsForEntry(t *testing.T) {
+	// The subagent leg asks the roster who the caller may name, so the fixture
+	// varies that answer by name rather than by the entry handed in.
+	roster := []agentEntry{
+		{Name: "planner", Model: "m", Spawns: []string{"worker"}},
+		{Name: "quiet", Model: "m"},
+		{Name: "wide", Model: "m", Spawns: []string{"ghost"}},
+		{Name: "worker", Model: "m"},
+	}
+	tests := []struct {
+		name  string
+		entry agentEntry
+		want  []string
+	}{
+		{"no tools granted is the bash floor", agentEntry{Name: "quiet", Model: "m"}, []string{"bash"}},
+		{"grants keep canonical order", agentEntry{Name: "editor", Model: "m", Tools: []string{"write", "bash", "edit"}}, []string{"bash", "edit", "write"}},
+		{"bash alone stays bash", agentEntry{Name: "shell", Model: "m", Tools: []string{"bash"}}, []string{"bash"}},
+		{"subagent with someone to name", agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "bash"}}, []string{"bash", "subagent"}},
+		{"subagent grant whose spawns name only unknown agents", agentEntry{Name: "wide", Model: "m", Tools: []string{"bash", "subagent"}}, []string{"bash"}},
+		{"subagent grant with no spawns field names nobody", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "subagent"}}, []string{"bash"}},
+		{"unknown grant names no Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "read"}}, []string{"bash"}},
+		{"unknown grant names cannot reach a fifth Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"read", "web"}}, []string{"bash"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := offeredNames(toolsForEntry(tc.entry, roster))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("toolsForEntry(%+v) = %v, want %v", tc.entry, got, tc.want)
+			}
+		})
+	}
+
+	// The offer is the package-level specs themselves, not copies that can drift
+	// from the shape the Model is taught.
+	if got := toolsForEntry(agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "write", "edit", "bash"}}, roster); !reflect.DeepEqual(got, []toolSpec{bashTool, editTool, writeTool, subagentTool}) {
+		t.Errorf("toolsForEntry(full grant) = %+v, want [bashTool editTool writeTool subagentTool]", got)
+	}
+}
