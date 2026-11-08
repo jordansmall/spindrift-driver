@@ -445,11 +445,12 @@ func TestOfferedTools(t *testing.T) {
 	if got := offeredNames(offeredTools(roster)); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
 		t.Errorf("offeredTools(roster) = %v, want [bash edit write subagent]", got)
 	}
-	// The entries are the package-level specs themselves, not copies that can
-	// drift from the shape the Model is taught. toolSpec carries a map, so
-	// DeepEqual is the only comparison available.
-	if got := offeredTools(roster); !reflect.DeepEqual(got, []toolSpec{bashTool, editTool, writeTool, subagentTool}) {
-		t.Errorf("offeredTools(roster) = %+v, want [bashTool editTool writeTool subagentTool]", got)
+	// bash, edit, and write are the package-level specs themselves, not copies
+	// that can drift from the shape the Model is taught; only the subagent spec
+	// is rebuilt, to carry this roster in its description. toolSpec carries a
+	// map, so DeepEqual is the only comparison available.
+	if got, want := offeredTools(roster), []toolSpec{bashTool, editTool, writeTool, subagentToolFor(roster)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("offeredTools(roster) = %+v, want %+v", got, want)
 	}
 }
 
@@ -536,9 +537,81 @@ func TestToolsForEntry(t *testing.T) {
 		})
 	}
 
-	// The offer is the package-level specs themselves, not copies that can drift
-	// from the shape the Model is taught.
-	if got := toolsForEntry(agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "write", "edit", "bash"}}, roster); !reflect.DeepEqual(got, []toolSpec{bashTool, editTool, writeTool, subagentTool}) {
-		t.Errorf("toolsForEntry(full grant) = %+v, want [bashTool editTool writeTool subagentTool]", got)
+	// The offer is the package-level specs themselves — the Subagent Tool's spec
+	// except for the roster-derived description, which is per-caller.
+	full := toolsForEntry(agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "write", "edit", "bash"}}, roster)
+	if want := []toolSpec{bashTool, editTool, writeTool, subagentToolFor(spawnable("planner", roster))}; !reflect.DeepEqual(full, want) {
+		t.Errorf("toolsForEntry(full grant) = %+v, want %+v", full, want)
+	}
+}
+
+// subagentSpecIn picks the Subagent Tool out of an offer so a test can read the
+// description a caller is actually shown.
+func subagentSpecIn(t *testing.T, tools []toolSpec) toolSpec {
+	t.Helper()
+	for _, tool := range tools {
+		if tool.Function.Name == "subagent" {
+			return tool
+		}
+	}
+	t.Fatalf("offer %v has no subagent Tool", offeredNames(tools))
+	return toolSpec{}
+}
+
+// TestSubagentToolDescription: the Subagent Tool says who this caller may name,
+// which is why it is built per run — the shared var has to come back untouched
+// or the next caller inherits the previous one's roster.
+func TestSubagentToolDescription(t *testing.T) {
+	const base = "Delegate one task to a named subagent and return that subagent's final answer."
+
+	roster := []agentEntry{
+		{Name: "reviewer", Model: "m", Description: "review the diff"},
+		{Name: "scout", Model: "m", Description: "read-only recon"},
+	}
+	listing := base + " Agents this run may spawn: reviewer (review the diff), scout (read-only recon)."
+	if got := subagentDescription(roster); got != listing {
+		t.Errorf("subagentDescription(roster) = %q, want %q", got, listing)
+	}
+
+	// An entry that described itself only in its name is still worth offering.
+	if got, want := subagentDescription([]agentEntry{{Name: "whisper", Model: "m"}}), base+" Agents this run may spawn: whisper."; got != want {
+		t.Errorf("subagentDescription(bare entry) = %q, want %q", got, want)
+	}
+
+	// A child sees the subset its spawns grant answers to, not the whole roster.
+	childRoster := []agentEntry{
+		{Name: "planner", Model: "m", Description: "plan the work", Tools: []string{"bash", "subagent"}, Spawns: []string{"worker"}},
+		{Name: "worker", Model: "m", Description: "carry out one step"},
+	}
+	if got, want := subagentSpecIn(t, toolsForEntry(childRoster[0], childRoster)).Function.Description, base+" Agents this run may spawn: worker (carry out one step)."; got != want {
+		t.Errorf("child subagent description = %q, want %q", got, want)
+	}
+
+	// With nobody to name the sentence stands alone: a malformed offer would be
+	// worse than one that lists nothing.
+	for _, empty := range [][]agentEntry{nil, {}} {
+		if got := subagentDescription(empty); got != base {
+			t.Errorf("subagentDescription(%v) = %q, want %q", empty, got, base)
+		}
+		if got := subagentToolFor(empty).Function.Description; got != base {
+			t.Errorf("subagentToolFor(%v) description = %q, want %q", empty, got, base)
+		}
+	}
+
+	// Only the description differs from the base spec.
+	spec := subagentToolFor(roster)
+	onlyListingChanged := subagentTool
+	onlyListingChanged.Function.Description = listing
+	if !reflect.DeepEqual(spec, onlyListingChanged) {
+		t.Errorf("subagentToolFor(roster) = %+v, want the base spec with description %q", spec, listing)
+	}
+
+	// Two runs in one process answer the same, and neither writes through the
+	// shared var the next one reads.
+	if again := subagentToolFor(roster).Function.Description; again != spec.Function.Description {
+		t.Errorf("second subagentToolFor(roster) = %q, want %q", again, spec.Function.Description)
+	}
+	if subagentTool.Function.Description != base {
+		t.Errorf("subagentTool.Description = %q, want the untouched base %q", subagentTool.Function.Description, base)
 	}
 }
