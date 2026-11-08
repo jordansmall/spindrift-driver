@@ -5248,3 +5248,233 @@ echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 		t.Errorf("summary hook %s ran for a call that never ran", summary)
 	}
 }
+
+// TestRunEditToolReplacesTextInFile is the run-level proof of the Edit Tool: the
+// Model asks with a relative path, and what the host actually rewrites is the
+// same absolute file the tool_call event named before the edit ran — one
+// resolved value feeding both the wire and the disk.
+func TestRunEditToolReplacesTextInFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir pkg: %v", err)
+	}
+	path := filepath.Join(dir, "pkg", "note.txt")
+	if err := os.WriteFile(path, []byte("head\ntarget line\ntail\n"), 0o644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"pkg/note.txt\",\"old_string\":\"target\",\"new_string\":\"replacement\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"edited the note"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	want := filepath.Join(dir, "pkg", "note.txt")
+	for _, ev := range []map[string]any{callEv, resultEv} {
+		if ev["tool_name"] != "edit" {
+			t.Errorf("%s tool_name = %v, want edit", ev["kind"], ev["tool_name"])
+		}
+		if ev["tool_target"] != want {
+			t.Errorf("%s tool_target = %v, want the resolved %s", ev["kind"], ev["tool_target"], want)
+		}
+	}
+	if resultEv["is_error"] == true {
+		t.Errorf("tool_result is_error = true, want a clean edit: %v", resultEv)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	if !strings.Contains(string(body), "replacement") || strings.Contains(string(body), "target") {
+		t.Errorf("file on disk = %q, want the new string in and the old string gone", body)
+	}
+	if got := resultText(t, raw); got != "edited the note" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+}
+
+// TestRunWriteToolCreatesFileWithParentsAndReportsThePath pins the two halves of
+// a write the Model could not have prepared for: the directories it never
+// mentioned exist by the time the call returns, and the path reported is the
+// absolute one the host wrote to. tool_name stays "write", the name the
+// host-side Strategy tracks writes under.
+func TestRunWriteToolCreatesFileWithParentsAndReportsThePath(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"created by the write tool\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"wrote the file"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	callEv, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	want := filepath.Join(dir, "out", "deep", "file.txt")
+	for _, ev := range []map[string]any{callEv, resultEv} {
+		if ev["tool_name"] != "write" {
+			t.Errorf("%s tool_name = %v, want write", ev["kind"], ev["tool_name"])
+		}
+		if ev["tool_target"] != want {
+			t.Errorf("%s tool_target = %v, want the resolved %s", ev["kind"], ev["tool_target"], want)
+		}
+	}
+	if resultEv["is_error"] == true {
+		t.Errorf("tool_result is_error = true, want a clean write: %v", resultEv)
+	}
+	body, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read created file %s: %v", want, err)
+	}
+	if string(body) != "created by the write tool" {
+		t.Errorf("file on disk = %q, want exactly the content the Model asked for", body)
+	}
+}
+
+// TestRunFileToolValidationFailureIsSyntheticErrorAndRunContinues is the
+// difference between a Model mistake and a run failure: an edit that matches
+// nothing comes back as a Driver-authored error the Model can correct on its next
+// turn, and the run still finishes normally.
+func TestRunFileToolValidationFailureIsSyntheticErrorAndRunContinues(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(path, []byte("nothing of interest here\n"), 0o644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"a phrase that is absent\",\"new_string\":\"x\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"missed, so I will stop"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failed edit is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	if got := resultText(t, raw); got != "missed, so I will stop" {
+		t.Errorf("result event text = %q, want the run to have gone on and answered", got)
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	if resultEv["is_error"] != true {
+		t.Errorf("tool_result is_error = %v, want true for a failed edit: %v", resultEv["is_error"], resultEv)
+	}
+	output, _ := resultEv["tool_output"].(string)
+	if !strings.HasPrefix(output, "error:") || !strings.Contains(output, "not found") {
+		t.Errorf("tool_result tool_output = %q, want Driver-authored text containing %q", output, "not found")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read note: %v", err)
+	}
+	if string(body) != "nothing of interest here\n" {
+		t.Errorf("file on disk = %q, want it untouched after a failed edit", body)
+	}
+}
+
+// TestRunGuardHookDeniesEditToolCall is the file Tool half of the Guard chain:
+// the pre-call hook judges the resolved path before the edit reads the file, so
+// the refusal is the whole result and the bytes on disk never change.
+func TestRunGuardHookDeniesEditToolCall(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "note.txt")
+	const original = "credential body, do not touch\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	hook := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"credential\",\"new_string\":\"public\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	// A refusal still reports the call the Model made: tool_target is resolved at
+	// plan time, before any hook was asked, so a denial cannot blank it.
+	if want := filepath.Join(dir, "note.txt"); callEv["tool_target"] != want {
+		t.Errorf("tool_call tool_target = %v, want %s", callEv["tool_target"], want)
+	}
+	output, _ := resultEv["tool_output"].(string)
+	for _, want := range []string{"error: ", hook, "credential path"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("tool_result tool_output = %q, want it to contain %q", output, want)
+		}
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("refusal tool_result is_error = %v, want true: %v", resultEv["is_error"], resultEv)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read note: %v", err)
+	}
+	if string(body) != original {
+		t.Errorf("file on disk = %q, want the original bytes: the refused edit ran anyway", body)
+	}
+	if got := resultText(t, raw); got != "told it was refused" {
+		t.Errorf("result event text = %q, want the run's own final answer", got)
+	}
+}
+
+// TestRunGuardHookDeniesWriteToolCall is the same judgement on the Tool that
+// creates: the denial arrives before MkdirAll, so neither the file nor the
+// directories leading to it exist once the run is over.
+func TestRunGuardHookDeniesWriteToolCall(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	hook := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+	want := filepath.Join(dir, "out", "deep", "file.txt")
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"credential material\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	}
+	raw := stdout.String()
+	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	output, _ := resultEv["tool_output"].(string)
+	for _, want := range []string{"error: ", hook, "credential path"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("tool_result tool_output = %q, want it to contain %q", output, want)
+		}
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("refusal tool_result is_error = %v, want true: %v", resultEv["is_error"], resultEv)
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Errorf("stat %s = %v, want the refused write never created it", want, err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(dir, "out")); err == nil {
+		t.Errorf("directory %s exists with %v: a refused write created parents anyway", filepath.Join(dir, "out"), entries)
+	}
+}
