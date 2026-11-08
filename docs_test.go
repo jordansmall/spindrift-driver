@@ -439,6 +439,84 @@ func TestContextRetiresBashToolAsOnlyTool(t *testing.T) {
 	}
 }
 
+// TestContextDefinesEditTool pins the glossary entry for the edit Tool. The reason
+// it belongs in the language file rather than only in the schema is the failure
+// wording: an ambiguous or unmatched call comes back named, which is what makes the
+// Tool safe to hand a Model instead of reaching for a shell text editor.
+func TestContextDefinesEditTool(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the Edit Tool vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "edit tool")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Edit Tool** glossary entry")
+	}
+	for _, want := range []string{"exact string", "exactly once", "replace_all", "not found", "matches", "working directory", "tool_target"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Edit Tool** entry does not state that the call names an exact string to replace, matches it exactly once unless replace_all is set, and reports the file as tool_target (missing %q)", want)
+		}
+	}
+	// The ambiguous-match wording, lowercased like the rest of the normalized
+	// document: it tells the Model how far off the call was.
+	if !strings.Contains(entry, "n matches") {
+		t.Errorf("the **Edit Tool** entry does not say an over-broad match comes back as `N matches` (missing %q)", "n matches")
+	}
+	// The point of the wording is that the Model can repair the call from the result
+	// alone, without guessing at what went wrong.
+	if !near(entry, "error tool result", "model", 240) {
+		t.Error("the **Edit Tool** entry does not state that a failed match returns an error Tool Result the Model acts on")
+	}
+	if !near(entry, "relative path", "working directory", 160) {
+		t.Error("the **Edit Tool** entry does not state that a relative path resolves against the run's working directory")
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Edit Tool** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "sed", "patch", "diff", "in-place"); n < 3 {
+		t.Errorf("the **Edit Tool** entry retires %d of the wrong words (sed, patch, diff, in-place); want at least 3", n)
+	}
+}
+
+// TestContextDefinesWriteTool pins the glossary entry for the write Tool, whose
+// stable name and tool_target are what the host-side Strategy reads: an entry that
+// describes the Tool without naming what its events report leaves the host guessing
+// which events prove a run wrote files.
+func TestContextDefinesWriteTool(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the Write Tool vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "write tool")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Write Tool** glossary entry")
+	}
+	for _, want := range []string{"overwrites", "parent directories", "working directory", "`write`", "tool_target"} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("the **Write Tool** entry does not state that the call overwrites a whole file, creates missing parent directories, and reports the file path as tool_target (missing %q)", want)
+		}
+	}
+	if !near(entry, "relative path", "working directory", 160) {
+		t.Error("the **Write Tool** entry does not state that a relative path resolves against the run's working directory")
+	}
+	if !near(entry, "`write`", "event", 200) {
+		t.Error("the **Write Tool** entry does not state that its events name the Tool `write`")
+	}
+	if !near(entry, "strategy", "changed files", 240) {
+		t.Error("the **Write Tool** entry does not state that tool_target is what the host-side Strategy watches to see a run changed files")
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Write Tool** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "heredoc", "redirect", "append", "touch"); n < 3 {
+		t.Errorf("the **Write Tool** entry retires %d of the wrong words (heredoc, redirect, append, touch); want at least 3", n)
+	}
+}
+
 // readADRs loads every ADR from disk keyed by file name, mapping to its raw text:
 // which decision supersedes which is a property of the record set, not of a file
 // name somebody chose, so the directory is read rather than its names assumed.
