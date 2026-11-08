@@ -17,9 +17,10 @@ import (
 // which is what makes the model id and the system prompt come from the Agent File
 // rather than from anything the parent composed.
 
-// planSubagentCall reads one Subagent Tool call. The roster is the only place an
-// agent comes from, so a name that is not in it is an ordinary Tool Result the
-// Model can correct — the same standing an unknown tool has.
+// planSubagentCall reads one Subagent Tool call. Agents come only from the
+// roster and a run may only hand work to the entries its own entry names, so a
+// name outside that set is an ordinary Tool Result the Model can correct — the
+// same standing an unknown tool has.
 func planSubagentCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Agent string `json:"agent"`
@@ -28,9 +29,13 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: cannot parse tool arguments: %v", err) }}
 	}
-	entry, ok := findAgent(s.cfg.agents, args.Agent)
+	// Looking up against the caller's permitted set covers both refusals the issue
+	// unifies: a name with no Agent File, and one its spawns does not permit. The
+	// top-level process names no entry, so nothing bounds it.
+	permitted := spawnable(s.cfg.agent, s.cfg.agents)
+	entry, ok := findAgent(permitted, args.Agent)
 	if !ok {
-		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: unknown agent %q", args.Agent) }}
+		return toolPlan{input: input, run: func() string { return spawnRefusal(args.Agent, permitted) }}
 	}
 	return toolPlan{
 		input:    input,
@@ -39,6 +44,19 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 		isError:  subagentResultIsError,
 		run:      func() string { return runSubagentTool(entry, args.Task, s) },
 	}
+}
+
+// spawnRefusal is the answer to a spawn this run may not make; naming the agents
+// it may spawn is what makes it correctable in one step rather than a guess.
+func spawnRefusal(name string, permitted []agentEntry) string {
+	if len(permitted) == 0 {
+		return fmt.Sprintf("error: cannot spawn agent %q: this run may spawn no agents", name)
+	}
+	names := make([]string, 0, len(permitted))
+	for _, entry := range permitted {
+		names = append(names, entry.Name)
+	}
+	return fmt.Sprintf("error: cannot spawn agent %q: this run may spawn %s", name, strings.Join(names, ", "))
 }
 
 // subagentResultIsError is the is_error rule for a Subagent Tool Result: the
