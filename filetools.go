@@ -18,8 +18,10 @@ import (
 // process cwd, which is where a file Tool acts — there is no per-run working
 // directory to consult.
 //
-// s is unused so far: the Guard Hook chain this call will answer to is wired in
-// separately, and until then nothing about the run changes what a write does.
+// The Guard Hook chain is asked inside run rather than at plan time, so the
+// call is judged when it runs: the tool_call event is already on the wire by
+// then, exactly as it is for bash. A refusal needs no new grammar because
+// fileToolResultIsError already reads the "error:" prefix as a failed result.
 func planWriteCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Path    string `json:"path"`
@@ -36,7 +38,12 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 		input:   input,
 		target:  resolved,
 		isError: fileToolResultIsError,
-		run:     func() string { return writeFileTool(resolved, args.Content) },
+		run: func() string {
+			if refusal := guardRead(resolved, s.cfg.hooks, s.stderr); refusal != "" {
+				return refusal
+			}
+			return writeFileTool(resolved, args.Content)
+		},
 	}
 }
 
@@ -85,7 +92,12 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 		input:   input,
 		target:  resolved,
 		isError: fileToolResultIsError,
-		run:     func() string { return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll) },
+		run: func() string {
+			if refusal := guardRead(resolved, s.cfg.hooks, s.stderr); refusal != "" {
+				return refusal
+			}
+			return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
+		},
 	}
 }
 
