@@ -598,6 +598,177 @@ func TestSubagentUnknownAgentIsAnOrdinaryResult(t *testing.T) {
 	}
 }
 
+// spawnAgentCall scripts one turn that asks for one subagent by name. The
+// scripted server answers whatever the Model asked for, so a name the caller may
+// not spawn still reaches the runtime check the offer cannot express.
+func spawnAgentCall(agent string) string {
+	return `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"` + agent + `\",\"task\":\"do the thing\"}"}}]}}]}`
+}
+
+// TestSubagentChildSpawnsOnlyItsOwn: an entry's spawns bounds what its run may
+// hand work to at the moment of the call, not merely what the offer lists — so a
+// name the entry does not name is refused as an ordinary Tool Result and starts
+// no process.
+func TestSubagentChildSpawnsOnlyItsOwn(t *testing.T) {
+	cfgPath := agentFixtureEntries(t,
+		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
+		agentSpec{name: "scout", model: "m-scout"},
+		agentSpec{name: "reviewer", model: "m-reviewer"},
+		agentSpec{name: "worker", model: "m-worker"},
+	)
+	callerArgs := func() []string {
+		return []string{"p", "--agent", "planner"}
+	}
+
+	t.Run("spawns names the child it may run", func(t *testing.T) {
+		srv := newScriptedChatServer(t, spawnAgentCall("worker"), completion("child answer"), completion("parent answer"))
+		subagentEnv(t, cfgPath, srv.srv.URL)
+
+		var stdout, stderr bytes.Buffer
+		args := append(callerArgs(), "--base-url", srv.srv.URL)
+		code := run(args, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+		}
+		raw := stdout.String()
+		if sent := srv.requestBodies(t); len(sent) != 3 {
+			t.Fatalf("POSTs = %d, want the caller's turn, the child's turn, the caller's final turn: stdout = %q", len(sent), raw)
+		}
+		relayed := relayedEvents(t, raw)
+		if len(relayed) == 0 {
+			t.Fatalf("stdout carries no relayed child events: %q", raw)
+		}
+		for _, ev := range relayed {
+			if ev["role"] != "worker" {
+				t.Errorf("relayed event role = %v, want the child's entry name", ev["role"])
+			}
+		}
+		_, resultEv := spawnPair(t, raw)
+		if out, _ := resultEv["tool_output"].(string); out != "child answer" {
+			t.Errorf("tool_output = %q, want the child's answer", out)
+		}
+		if resultEv["is_error"] == true {
+			t.Errorf("is_error = true, want a permitted spawn reported as a success: %v", resultEv)
+		}
+		if got := parentResult(t, raw)["text"]; got != "parent answer" {
+			t.Errorf("parent result text = %v, want the run to continue", got)
+		}
+	})
+
+	t.Run("a name spawns does not name is refused without spawning", func(t *testing.T) {
+		srv := newScriptedChatServer(t, spawnAgentCall("scout"), completion("parent answer"))
+		subagentEnv(t, cfgPath, srv.srv.URL)
+
+		var stdout, stderr bytes.Buffer
+		args := append(callerArgs(), "--base-url", srv.srv.URL)
+		code := run(args, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+		}
+		raw := stdout.String()
+		sent := srv.requestBodies(t)
+		if len(sent) != 2 {
+			t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(sent), raw)
+		}
+		for i, body := range sent {
+			if got := postedSpawn(t, body).Model; got != "m-planner" {
+				t.Errorf("POST %d sent model %q, want only the caller's model", i, got)
+			}
+		}
+		if relayed := relayedEvents(t, raw); len(relayed) != 0 {
+			t.Errorf("stdout carries relayed child events for a spawn the caller may not make: %v", relayed)
+		}
+		callEv, resultEv := spawnPair(t, raw)
+		out, _ := resultEv["tool_output"].(string)
+		if !strings.HasPrefix(out, "error:") || resultEv["is_error"] != true {
+			t.Errorf("tool_output = %q is_error = %v, want an error:-prefixed result flagged as one", out, resultEv["is_error"])
+		}
+		if !strings.Contains(out, `cannot spawn agent "scout"`) {
+			t.Errorf("tool_output = %q, want it to name the agent the call asked for", out)
+		}
+		if !strings.Contains(out, "worker") {
+			t.Errorf("tool_output = %q, want it to name the one agent this run may spawn", out)
+		}
+		for _, other := range []string{"planner", "reviewer"} {
+			if strings.Contains(out, other) {
+				t.Errorf("refusal %q names %q, which this run may not spawn", out, other)
+			}
+		}
+		// A refusal implies no relay, so neither half of the pairing fields is set.
+		if callEv["tool_target"] != nil || resultEv["subagent"] != nil || resultEv["tool_target"] != nil {
+			t.Errorf("refusal events carry subagent = %v tool_target = %v, want both unset", resultEv["subagent"], resultEv["tool_target"])
+		}
+		if got := parentResult(t, raw)["text"]; got != "parent answer" {
+			t.Errorf("parent result text = %v, want the run to go on after the refusal", got)
+		}
+	})
+}
+
+// TestSubagentSpawnOfAgentWithNoFileIsRefused: spawns is a grant over the Agent
+// Files that exist, so an entry whose spawns names only a missing file may spawn
+// nobody — and the refusal says so rather than naming an empty list.
+func TestSubagentSpawnOfAgentWithNoFileIsRefused(t *testing.T) {
+	cfgPath := agentFixtureEntries(t,
+		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "helper"},
+		agentSpec{name: "worker", model: "m-worker"},
+	)
+	srv := newScriptedChatServer(t, spawnAgentCall("helper"), completion("parent answer"))
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--agent", "planner", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+	if sent := srv.requestBodies(t); len(sent) != 2 {
+		t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(sent), raw)
+	}
+	_, resultEv := spawnPair(t, raw)
+	out, _ := resultEv["tool_output"].(string)
+	if !strings.HasPrefix(out, "error:") || resultEv["is_error"] != true {
+		t.Errorf("tool_output = %q is_error = %v, want an error:-prefixed result flagged as one", out, resultEv["is_error"])
+	}
+	if !strings.Contains(out, "this run may spawn no agents") {
+		t.Errorf("tool_output = %q, want the refusal to say this run may spawn nobody", out)
+	}
+	if strings.Contains(out, "worker") {
+		t.Errorf("tool_output = %q names worker, which planner's spawns does not grant", out)
+	}
+	if got := parentResult(t, raw)["text"]; got != "parent answer" {
+		t.Errorf("parent result text = %v, want the run to go on after the refusal", got)
+	}
+}
+
+// TestSubagentTopLevelIsUnrestricted: no Agent File selects the top-level
+// process, so no spawns field bounds it — it may name an entry another entry
+// cannot.
+func TestSubagentTopLevelIsUnrestricted(t *testing.T) {
+	cfgPath := agentFixtureEntries(t,
+		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
+		agentSpec{name: "worker", model: "m-worker"},
+	)
+	srv := newScriptedChatServer(t, spawnAgentCall("worker"), completion("child answer"), completion("parent answer"))
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+	if sent := srv.requestBodies(t); len(sent) != 3 {
+		t.Fatalf("POSTs = %d, want parent, child, parent: stdout = %q", len(sent), raw)
+	}
+	callEv, resultEv := spawnPair(t, raw)
+	if resultEv["subagent"] != "worker" || callEv["tool_target"] != "worker" {
+		t.Errorf("naming fields = %v / %v, want the entry the top-level run named", callEv["tool_target"], resultEv["subagent"])
+	}
+	if out, _ := resultEv["tool_output"].(string); out != "child answer" {
+		t.Errorf("tool_output = %q, want the child's answer", out)
+	}
+}
+
 // TestSubagentTaskStartingWithADashStaysPositional pins the "--" in the child's
 // argv: without it reorderFlagsFirst would hand a dash-leading task to the last
 // flag as its value and the child would run the wrong prompt.
