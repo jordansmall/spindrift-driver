@@ -305,8 +305,11 @@ You are a scout. Read, and report paths; never edit.
 `name` and `model` are required. `model` is the child's Model id, used verbatim — no
 effort suffix is parsed off it — and `--model` still overrides it for a run started with
 `--agent`, as it does for any run. The body below the frontmatter is the child's system
-prompt. `tools` and `spawns` are read and recorded, not enforced: every run gets the Bash, Edit
-and Write Tools whatever its roster says, and no roster limits whom a run may delegate to.
+prompt. `tools` grants the Tools that entry's run is offered, by the Driver's own names —
+`bash`, `edit`, `write` and `subagent`, in that order whatever order the file lists them,
+and an entry naming no tools, or only names the Driver does not know, is offered the Bash
+Tool alone; `spawns` limits which roster entries that run may delegate to, while a run
+started with no `--agent` flag is unrestricted.
 
 The Subagent Tool is offered only when the roster holds at least one Agent File — with
 none there is nobody for a call to name — and a call takes the `agent` to delegate to and
@@ -317,7 +320,15 @@ and the same Guard Hooks as its parent. That inheritance is the environment's an
 config file's, not the command line's: `--base-url`, `--timeout` and `--max-turns` are not
 passed on, so a child dials whatever its own environment and Driver Config name and runs
 under the default turn cap.
-A child is never offered the Subagent Tool, so delegation goes one level deep.
+A child is offered the Subagent Tool only when its entry grants `subagent` and its `spawns`
+list names at least one entry an Agent File defines, so delegation reaches as far as the
+roster allows and no further. A spawn the caller may not make — a name off its `spawns`
+list, or one no Agent File defines — is a synthetic error Tool Result naming the
+agents the run may spawn, and the run goes on from it, its exit code unaffected.
+The Tool's description lists exactly the agents the caller may spawn, each as
+`name (description)`, so the top level sees every entry and a child only its own. A
+child inherits the repeated-call breaker policy with a counter of its own, the count
+being per Driver process.
 
 Every event the child writes is relayed onto the parent's stdout as it arrives, with
 `role` set to the agent's name and `in_subagent` true, and the child's `usage` events roll

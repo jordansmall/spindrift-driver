@@ -155,7 +155,8 @@ func TestContextDefinesDriverConfig(t *testing.T) {
 // unit file. The Agent File is where a child's model id and system prompt come
 // from, so a reader who calls it a "profile" or a "persona" expects a document
 // richer than the one the Driver parses — one whose tools and spawns lists bind
-// something — and writes a roster whose restrictions bind nothing.
+// more than the exact Tool names and roster entries they repeat — and writes a
+// roster naming limits the Driver never reads.
 func TestContextDefinesAgentFile(t *testing.T) {
 	const file = "CONTEXT.md"
 	if _, err := os.Stat(file); err != nil {
@@ -191,7 +192,7 @@ func TestContextDefinesAgentFile(t *testing.T) {
 // shape is stated: that the child is this same binary re-executed rather than a
 // bespoke call the parent builds, that a child's events are the parent's events
 // with attribution, that a failing child is a Tool Result rather than a failed
-// run, and that a child cannot spawn in turn.
+// run, and that a child's own entry bounds what it is offered next.
 func TestContextDefinesSubagentTool(t *testing.T) {
 	const file = "CONTEXT.md"
 	if _, err := os.Stat(file); err != nil {
@@ -213,9 +214,13 @@ func TestContextDefinesSubagentTool(t *testing.T) {
 	if !near(entry, "error", "parent", 240) {
 		t.Error("the **Subagent Tool** entry does not state that a child failure is an error Tool Result the parent goes on with")
 	}
-	// Recursion is bounded by the offer, not by the roster's spawns field.
-	if !near(entry, "child", "never", 240) {
-		t.Error("the **Subagent Tool** entry does not state that a child is never offered the Tool itself")
+	// A child's offer is its own entry's, bounded by grants and by spawns rather
+	// than by a stop fixed at one level: read either way wrong, the author ships a
+	// roster the Driver contradicts — a child spawning past its list, or a child it
+	// expects never to be able to spawn at all.
+	if !near(entry, "child", "grants", 240) || !near(entry, "child", "spawns", 240) ||
+		!near(entry, "error tool result", "may spawn", 240) {
+		t.Error("the **Subagent Tool** entry does not state that a child is offered the Tool only when its entry grants it and its spawns list names somebody it may hand work to, a spawn outside that list being an error Tool Result naming the agents the caller may spawn")
 	}
 	// Inheritance is what keeps the guards holding across a delegation: a child
 	// that resolved its own manifest would run the command its parent was refused.
