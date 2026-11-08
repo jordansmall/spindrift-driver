@@ -1315,3 +1315,150 @@ func TestSubagentChildGuardComesFromTheConfiguredManifest(t *testing.T) {
 		}
 	}
 }
+
+// bashCallTurn scripts one turn that asks for exactly one bash command, with the
+// arguments escaped by hand as parentToolCallResponse does: a JSON object nested
+// inside a JSON string. The id is a parameter so a script can repeat the very
+// same call without repeating its event-pair handle.
+func bashCallTurn(id, command string) string {
+	return `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"` + id +
+		`","type":"function","function":{"name":"bash","arguments":"{\"command\":\"` + command + `\"}"}}]}}]}`
+}
+
+// repeatedCallBreakerText is the third-identical-call refusal main.go's
+// repeatedCallRefusal synthesises — written out rather than called so a child
+// inventing its own wording, rather than the inherited text, is what fails.
+const repeatedCallBreakerText = "error: bash was already called 2 times in a row with these exact arguments, so it was not run again; take a different action"
+
+// TestSubagentChildInheritsRepeatedCallBreaker: --agent selects the same kind of
+// run a spawn starts, and the breaker is compiled into run() rather than handed
+// down — so a child refuses its own third identical call with the very text the
+// top-level golden stream pins, as a synthetic Tool Result the run answers past.
+func TestSubagentChildInheritsRepeatedCallBreaker(t *testing.T) {
+	cfgPath := agentFixtureEntries(t, agentSpec{name: "worker", model: "m-worker", tools: "bash"})
+	srv := newScriptedChatServer(t,
+		bashCallTurn("call_1", "echo one"),
+		bashCallTurn("call_2", "echo one"),
+		bashCallTurn("call_3", "echo one"),
+		completion("child answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--agent", "worker", "p", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a refusal is a Tool Result the run answers past, not a failed run; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+	if sent := srv.requestBodies(t); len(sent) != 4 {
+		t.Fatalf("POSTs = %d, want three call turns and the answer: the third call must not be sent again, but the refusal is only a Tool Result: stdout = %q", len(sent), raw)
+	}
+
+	var results, refused int
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		results++
+		// A run started with --agent is the top-level process here, so every line it
+		// writes is its own: in_subagent would mean the refusal came from somewhere else.
+		if v, present := ev["in_subagent"]; present && v == true {
+			t.Errorf("tool_result carries in_subagent = %v, want the refusal among this run's own events: %v", v, ev)
+		}
+		out, _ := ev["tool_output"].(string)
+		if !strings.Contains(out, "bash was already called 2 times in a row") {
+			continue
+		}
+		refused++
+		if ev["tool_name"] != "bash" || ev["tool_target"] != "echo one" {
+			t.Errorf("refusing tool_result names %v %v, want the refused bash call and its command: %v", ev["tool_name"], ev["tool_target"], ev)
+		}
+		if ev["is_error"] != true {
+			t.Errorf("refusing tool_result is_error = %v, want true: %v", ev["is_error"], ev)
+		}
+		if out != repeatedCallBreakerText {
+			t.Errorf("refusing tool_output = %q, want the Driver's own synthetic refusal %q", out, repeatedCallBreakerText)
+		}
+	}
+	if refused != 1 {
+		t.Fatalf("%d tool_result event(s) carry the breaker refusal, want the third call refused once: %q", refused, raw)
+	}
+	if results != 3 {
+		t.Errorf("%d tool_result events, want one per scripted call: %q", results, raw)
+	}
+	if got := resultText(t, raw); got != "child answer" {
+		t.Errorf("result text = %q, want the child's answer past its own refusal", got)
+	}
+}
+
+// TestSubagentChildRepeatedCallCounterIsItsOwn: by the time the parent makes its
+// next identical call, the child has driven the "echo same" streak to a refusal,
+// so one shared counter would refuse the parent here — only a counter of its own
+// lets that call run. The intervening subagent call resets the parent's own
+// streak, so what is pinned is that the child's counts never reach the parent.
+func TestSubagentChildRepeatedCallCounterIsItsOwn(t *testing.T) {
+	cfgPath := agentFixtureEntries(t, agentSpec{name: "worker", model: "m-worker", tools: "bash"})
+	srv := newScriptedChatServer(t,
+		bashCallTurn("call_p1", "echo same"),
+		spawnAgentCall("worker"),
+		bashCallTurn("call_c1", "echo same"),
+		bashCallTurn("call_c2", "echo same"),
+		bashCallTurn("call_c3", "echo same"),
+		completion("child answer"),
+		bashCallTurn("call_p2", "echo same"),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+	if sent := srv.requestBodies(t); len(sent) != 8 {
+		t.Fatalf("POSTs = %d, want the script of 8 in full (the refusal must not stop either run short): stdout = %q", len(sent), raw)
+	}
+
+	// The child did refuse its third identical call, and it did so inside itself —
+	// relayed, so it belongs to the child's stream.
+	relayed := relayedToolResults(t, raw)
+	if n := len(relayed); n != 3 {
+		t.Fatalf("%d relayed tool_result events, want the child's three scripted calls: %q", n, raw)
+	}
+	refused, ok := relayed["call_c3"]
+	if !ok {
+		t.Fatalf("relayed stream carries no tool_result for the child's third call: %q", raw)
+	}
+	if out, _ := refused["tool_output"].(string); out != repeatedCallBreakerText {
+		t.Errorf("child's third call tool_output = %q, want the refusal %q", out, repeatedCallBreakerText)
+	}
+	if refused["is_error"] != true {
+		t.Errorf("child's third call is_error = %v, want true: %v", refused["is_error"], refused)
+	}
+
+	// And the parent's identical call after the spawn ran anyway.
+	var parentResults int
+	for _, ev := range stdoutEvents(t, raw) {
+		if ev["kind"] != "tool_result" || ev["in_subagent"] == true || ev["tool_name"] != "bash" {
+			continue
+		}
+		parentResults++
+		out, _ := ev["tool_output"].(string)
+		if strings.Contains(out, "was already called") {
+			t.Errorf("parent-side bash tool_output = %q, want no breaker refusal: the child's streak is not the parent's: %v", out, ev)
+		}
+		if v, present := ev["is_error"]; present {
+			t.Errorf("parent-side bash tool_result is_error = %v, want the command to have run: %v", v, ev)
+		}
+		if !strings.Contains(out, "same\nexit code: 0") {
+			t.Errorf("parent-side bash tool_output = %q, want the command's own output", out)
+		}
+	}
+	if parentResults != 2 {
+		t.Errorf("%d parent-side bash tool_result events, want the two identical calls the parent scripted: %q", parentResults, raw)
+	}
+	if got := parentResult(t, raw)["text"]; got != "parent answer" {
+		t.Errorf("parent result text = %v, want the parent's own final answer", got)
+	}
+}
