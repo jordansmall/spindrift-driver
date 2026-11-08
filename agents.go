@@ -190,7 +190,7 @@ func offeredTools(agents []agentEntry) []toolSpec {
 	if len(agents) == 0 {
 		return []toolSpec{bashTool, editTool, writeTool}
 	}
-	return []toolSpec{bashTool, editTool, writeTool, subagentTool}
+	return []toolSpec{bashTool, editTool, writeTool, subagentToolFor(agents)}
 }
 
 // spawnable is the roster subset one caller may hand work to. The empty name is
@@ -242,8 +242,8 @@ func toolsForEntry(entry agentEntry, roster []agentEntry) []toolSpec {
 	}
 	// Same reasoning offeredTools records: with nobody the caller may name,
 	// offering the Tool only invites a call that cannot be honoured.
-	if granted["subagent"] && len(spawnable(entry.Name, roster)) > 0 {
-		tools = append(tools, subagentTool)
+	if may := spawnable(entry.Name, roster); granted["subagent"] && len(may) > 0 {
+		tools = append(tools, subagentToolFor(may))
 	}
 	// The floor: a run with nothing recognisable in its offer could do nothing
 	// at all, so a grant set that names no Tool still gets bash. A grant that
