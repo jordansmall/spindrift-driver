@@ -900,9 +900,10 @@ var writeTool = toolSpec{
 	},
 }
 
-// subagentTool delegates one task to a subagent chosen by name; offeredTools
-// puts it in the offer only when a roster exists. The description names no
-// agents on purpose — issue #26 owns the agent-listing wording.
+// subagentTool is the base Subagent Tool spec: the name, schema, and the
+// description with no agent listing in it. subagentToolFor adds the listing,
+// because which agents a caller may name is a property of the run, not of the
+// Tool.
 var subagentTool = toolSpec{
 	Type: "function",
 	Function: functionSpec{
@@ -917,6 +918,34 @@ var subagentTool = toolSpec{
 			"required": []string{"agent", "task"},
 		},
 	},
+}
+
+// subagentToolFor is the Subagent Tool as one caller is offered it. The copy is
+// shallow, so Parameters is shared with subagentTool — safe only as long as
+// nothing mutates the parameter schema, which would leak across every run in
+// one process.
+func subagentToolFor(entries []agentEntry) toolSpec {
+	spec := subagentTool
+	spec.Function.Description = subagentDescription(entries)
+	return spec
+}
+
+// subagentDescription renders the entries one caller may spawn into the Tool
+// description. The base sentence is read off subagentTool rather than repeated
+// here, so the offer and the base spec cannot drift apart.
+func subagentDescription(entries []agentEntry) string {
+	if len(entries) == 0 {
+		return subagentTool.Function.Description
+	}
+	listed := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Description == "" {
+			listed = append(listed, entry.Name)
+			continue
+		}
+		listed = append(listed, entry.Name+" ("+entry.Description+")")
+	}
+	return subagentTool.Function.Description + " Agents this run may spawn: " + strings.Join(listed, ", ") + "."
 }
 
 // streamOptions is the OpenAI knob that asks a streaming completion for a
