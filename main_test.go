@@ -4144,6 +4144,30 @@ func TestRunSystemPromptFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestSystemPromptNamesEveryTool: a Model only reaches for a Tool it has been told
+// exists, so a prompt naming some of the Tools is a prompt the Model answers from
+// the shell alone — edit and write sit unused while it rebuilds them as commands.
+func TestSystemPromptNamesEveryTool(t *testing.T) {
+	sys := strings.ToLower(systemPrompt)
+	for _, want := range []string{"bash", "edit", "write", "subagent"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("system prompt does not name the %q Tool:\n%s", want, systemPrompt)
+		}
+	}
+	if !near(sys, "edit", "exact", 160) {
+		t.Errorf("system prompt names edit without saying it replaces exact text:\n%s", systemPrompt)
+	}
+	if !near(sys, "write", "overwrite", 160) {
+		t.Errorf("system prompt names write without saying it writes a whole file:\n%s", systemPrompt)
+	}
+	if !near(sys, "subagent", "task", 160) {
+		t.Errorf("system prompt names subagent without saying it delegates a task:\n%s", systemPrompt)
+	}
+	if !strings.Contains(sys, "final response only") {
+		t.Errorf("system prompt no longer tells the Model to answer with the final response only:\n%s", systemPrompt)
+	}
+}
+
 // TestUsageDocumentsAgentFlag: --help is the only manual the Driver ships, so it
 // has to carry the flag in the copyable usage line and say what the entry
 // supplies — an operator who cannot tell that from -h passes --model by habit

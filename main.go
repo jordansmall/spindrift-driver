@@ -30,9 +30,16 @@ const defaultMaxTurns = 300
 const envBaseURL = "SPINDRIFT_BASE_URL"
 const envAPIKey = "SPINDRIFT_API_KEY"
 
-// systemPrompt is deliberately minimal and hardcoded: the Model gets repo context
-// via the user prompt.
-const systemPrompt = "You are a coding agent working in this repository. Answer with the final response only; it is the Driver's final result event."
+// systemPrompt is hardcoded rather than assembled per run, so it names every Tool
+// the Driver can execute. offeredTools (agents.go) stays the authority on which of
+// them a given run may actually call: the subagent Tool is in the offer only when a
+// roster exists, and this prompt does not track that.
+const systemPrompt = "You are a coding agent working in this repository. " +
+	"The tools you have: bash runs a shell command in the working directory; " +
+	"edit replaces exact text in one file, and without replace_all that text must match exactly once; " +
+	"write creates a file or overwrites one whole; " +
+	"subagent delegates one task to a subagent named in the call. " +
+	"Answer with the final response only; it is the Driver's final result event."
 
 type config struct {
 	model    string
