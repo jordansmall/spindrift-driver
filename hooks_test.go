@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -1075,5 +1076,105 @@ func TestSummarizeToolOutputCapsTheReplacementWithTheToolResultBound(t *testing.
 	}
 	if tail := long[len(long)-bashToolMaxOutput:]; !strings.HasSuffix(got, tail) {
 		t.Errorf("summary replacement = %q, want the last %d bytes of the hook's summary kept", got, bashToolMaxOutput)
+	}
+}
+
+// TestGuardReadRequestIsReadShaped pins the shape a file-Tool call is presented
+// to the chain in: the Read tool's own request, so one host rule that denies
+// reading a credential path covers the file Tools too.
+func TestGuardReadRequestIsReadShaped(t *testing.T) {
+	dir := t.TempDir()
+	received := filepath.Join(dir, "request.json")
+	target := filepath.Join(dir, "secret.txt")
+	script := writeGuardHookScript(t, "record.sh", `cat > `+received)
+
+	if got := guardRead(target, []guardHook{{path: script}}, nil); got != "" {
+		t.Fatalf("guardRead = %q, want the empty string for a silent hook", got)
+	}
+
+	raw, err := os.ReadFile(received)
+	if err != nil {
+		t.Fatalf("read what the hook received: %v", err)
+	}
+	var payload struct {
+		ToolName  string         `json:"tool_name"`
+		ToolInput map[string]any `json:"tool_input"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode what the hook received %s: %v", raw, err)
+	}
+	if payload.ToolName != "Read" {
+		t.Errorf("tool_name = %q, want Read", payload.ToolName)
+	}
+	if got := payload.ToolInput["file_path"]; got != target {
+		t.Errorf("tool_input.file_path = %v, want %q", got, target)
+	}
+	// The absence of command is what proves this is not the bash shape wearing a
+	// new name.
+	if _, ok := payload.ToolInput["command"]; ok {
+		t.Errorf("tool_input = %v, want no command key for a read request", payload.ToolInput)
+	}
+}
+
+func TestGuardReadDenies(t *testing.T) {
+	script := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	got := guardRead("/home/model/.ssh/id_ed25519", []guardHook{{path: script}}, nil)
+
+	// The same refusal text guardCommand returns for a deny: the file Tool's
+	// is_error rule reads only the "error: " prefix, so the shape is what makes
+	// this a failed Tool Result.
+	want := "error: guard hook " + script + " denied this command: credential path"
+	if got != want {
+		t.Errorf("guardRead = %q, want %q", got, want)
+	}
+}
+
+func TestGuardReadSkipsAHookThatOnlyGuardsBash(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := writeGuardHookScript(t, "bash-only.sh",
+		`: > `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"always"}}'`)
+
+	got := guardRead("/tmp/anything", []guardHook{{path: script, tools: []string{"Bash"}}}, nil)
+
+	if got != "" {
+		t.Errorf("guardRead = %q, want the empty string for a hook that guards only Bash", got)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("hook %s ran although its tools list omits Read", script)
+	}
+}
+
+func TestGuardReadGuardsAHookWithAnEmptyToolsList(t *testing.T) {
+	// An empty tools list already means every tool, so the manifest's catch-all
+	// guard is what makes a credential-path deny reach the file Tools for free.
+	script := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	got := guardRead("/tmp/anything", []guardHook{{path: script, tools: []string{}}}, nil)
+
+	if want := "error: guard hook " + script + " denied this command: credential path"; got != want {
+		t.Errorf("guardRead = %q, want %q", got, want)
+	}
+}
+
+func TestGuardReadDoesNotRefuseARewritingHookForNoRewrite(t *testing.T) {
+	// The refusing-a-silent-rewriter rule is command-only: a read has no input to
+	// rewrite, so a rewriting hook that answers a read with silence (or with an
+	// updatedInput nobody asked for) has no objection and the call proceeds.
+	for _, tc := range []struct{ name, body string }{
+		{"silent", `:`},
+		{"updatedInput offered", `echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := writeGuardHookScript(t, "sanitize.sh", tc.body)
+
+			if got := guardRead("/tmp/anything", []guardHook{{path: script, rewrites: true}}, nil); got != "" {
+				t.Errorf("guardRead = %q, want the empty string", got)
+			}
+		})
 	}
 }
