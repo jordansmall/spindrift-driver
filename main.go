@@ -428,6 +428,9 @@ func planToolCall(call toolCall, s session) toolPlan {
 	if call.Function.Name == "write" {
 		return planWriteCall(call, input, s)
 	}
+	if call.Function.Name == "edit" {
+		return planEditCall(call, input, s)
+	}
 	if call.Function.Name != "bash" {
 		name := call.Function.Name
 		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: unknown tool %q", name) }}
