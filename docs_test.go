@@ -764,3 +764,131 @@ func TestADRRecordsDriverConfig(t *testing.T) {
 		t.Errorf("%s rejects %d options in the `- **Option** — rejected: reason` form; want at least 4", name, n)
 	}
 }
+
+// TestADRRecordsNativeToolsOnly pins the decision that closes the Driver's
+// capability surface: every Tool is compiled in, nothing is negotiated or loaded,
+// and everything else reaches the Model as a CLI on PATH through the Bash Tool.
+// The record has to carry the reason that outranks convenience — a Tool that
+// arrives from outside the Driver cannot be put in front of the Guard chain in one
+// shape — plus the host-facing consequence that the Tool set is a contract and
+// therefore a code change, not a setting.
+func TestADRRecordsNativeToolsOnly(t *testing.T) {
+	ads := readADRs(t)
+
+	const name = "0006-native-tools-only.md"
+	if found := findADR(t, ads, "native", "mcp"); found != name {
+		t.Fatalf("the native Tools / no MCP claim is recorded in %q, want %s", found, name)
+	}
+	raw, ok := ads[name]
+	if !ok {
+		t.Fatalf("docs/adr/%s is missing", name)
+	}
+	text := collapseMarkdown(raw)
+
+	// MCP is ruled out as a decision, not mentioned in passing.
+	if !strings.Contains(text, "no mcp") {
+		t.Errorf("%s never states the decision itself (no MCP)", name)
+	}
+	// The Tool set is closed and compiled in, and its members are named.
+	for _, want := range []string{"`bash`", "`edit`", "`write`", "`subagent`"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s does not name the native Tool %s", name, want)
+		}
+	}
+	if !near(text, "compiled", "subagent", 240) {
+		t.Errorf("%s does not present the Tools as compiled into the Driver, subagent included", name)
+	}
+	if !near(text, "roster", "subagent", 240) {
+		t.Errorf("%s must state that subagent is offered only when a roster exists", name)
+	}
+	// Neither direction of MCP, so a reader cannot take it as "no server, client
+	// still allowed".
+	if !near(text, "server", "client", 240) {
+		t.Errorf("%s must rule out both the MCP server the Driver would expose and the MCP client it would call", name)
+	}
+	// The substitute route, named with the surface it rides.
+	if !near(text, "cli on path", "bash", 240) {
+		t.Errorf("%s does not name a CLI on PATH, reached through the Bash Tool, as the route for anything not native", name)
+	}
+	if !near(text, "filesystem", "shell", 240) {
+		t.Errorf("%s must ground that route in what the Box already ships — a shell and a filesystem", name)
+	}
+	// The reason that decides it: the Guard chain and the event grammar.
+	if !near(text, "guard", "mcp", 400) {
+		t.Errorf("%s must give the Guard chain as the reason an externally-arriving Tool is refused", name)
+	}
+	if !near(text, "guard", "chain", 200) {
+		t.Errorf("%s must name the pre-call Guard chain, not just guard hooks in general", name)
+	}
+	if !near(text, "read", "credential", 240) {
+		t.Errorf("%s does not say a file Tool is presented to the chain as the Read shape so the credential-path deny covers it", name)
+	}
+	for _, want := range []string{"tool_target", "is_error"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s does not pin the event field %s that a native Tool reports", name, want)
+		}
+	}
+	// Contract, not configuration: the host watches the `write` tool name.
+	if !near(text, "write", "strategy", 240) {
+		t.Errorf("%s does not say the host-side Strategy watches the stable `write` tool name", name)
+	}
+	if !near(text, "contract", "strategy", 320) {
+		t.Errorf("%s must frame the Tool set as the Driver's contract with its host", name)
+	}
+	if !near(text, "driver release", "setting", 240) {
+		t.Errorf("%s must state that the Tool set changes by a Driver release rather than by a setting", name)
+	}
+	// The cost, stated rather than glossed.
+	if !near(text, "ecosystem", "accepted", 240) {
+		t.Errorf("%s must state the cost — no third-party Tool ecosystem — and say it is accepted", name)
+	}
+	// House shape: the options section, and nothing but arguments under it.
+	const marker = "## Considered Options"
+	i := strings.Index(raw, marker)
+	if i < 0 {
+		t.Fatalf("%s has no %s section", name, marker)
+	}
+	section := raw[i+len(marker):]
+	if n := strings.Count(section, "— rejected:"); n < 4 {
+		t.Errorf("%s rejects %d options in the `- **Option** — rejected: reason` form; want at least 4", name, n)
+	}
+	// The rejected options have to include the two MCP shapes and the negotiated
+	// tool list, each as its own argument.
+	var rejectedServer, rejectedClient, rejectedList, rejectedCLI bool
+	for _, line := range strings.Split(section, "\n") {
+		if !strings.HasPrefix(line, "- **") || !strings.Contains(line, "— rejected:") {
+			continue
+		}
+		line = strings.ToLower(line)
+		switch {
+		case strings.Contains(line, "mcp") && strings.Contains(line, "expose"):
+			rejectedServer = true
+		case strings.Contains(line, "mcp") && strings.Contains(line, "third-party"):
+			rejectedClient = true
+		case strings.Contains(line, "manifest") || strings.Contains(line, "config-declared"):
+			rejectedList = true
+		case strings.Contains(line, "path") && strings.Contains(line, "bash"):
+			rejectedCLI = true
+		}
+	}
+	if !rejectedServer {
+		t.Errorf("%s does not reject an MCP server the Driver exposes as its own option", name)
+	}
+	if !rejectedClient {
+		t.Errorf("%s does not reject an MCP client reaching third-party servers as its own option", name)
+	}
+	if !rejectedList {
+		t.Errorf("%s does not reject a config- or manifest-declared tool list as its own option", name)
+	}
+	if !rejectedCLI {
+		t.Errorf("%s does not carry the adopted route — a CLI on PATH through the Bash Tool — as a bullet", name)
+	}
+	if strings.Contains(raw, "```") {
+		t.Errorf("%s carries a code fence; ADRs argue WHY and do not list API surface", name)
+	}
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(line, "#") {
+			t.Errorf("%s has a heading below ## Considered Options: %q", name, line)
+		}
+	}
+}
