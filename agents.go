@@ -184,13 +184,13 @@ func loadAgentDir(dir string) ([]agentEntry, error) {
 
 // offeredTools is the run's tool list, derived from the roster and nothing
 // else: an empty roster means the Model has no subagent it could name, so
-// offering the tool would only invite a call that cannot be honoured. bash is
-// always there, roster or not.
+// offering the tool would only invite a call that cannot be honoured. bash and
+// the file Tools are always there, roster or not.
 func offeredTools(agents []agentEntry) []toolSpec {
 	if len(agents) == 0 {
-		return []toolSpec{bashTool}
+		return []toolSpec{bashTool, editTool, writeTool}
 	}
-	return []toolSpec{bashTool, subagentTool}
+	return []toolSpec{bashTool, editTool, writeTool, subagentTool}
 }
 
 // findAgent resolves a --agent name against the roster. The match is exact:

@@ -628,9 +628,9 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if cfg.agent != "" {
 		// A child is never offered the Subagent Tool: a subagent able to spawn is
 		// unbounded recursion, and the roster's own spawns field is not enforcement
-		// until #26 lands. bash is the whole offer because this tree has no file
-		// Tools to add yet (#24).
-		cfg.tools = []toolSpec{bashTool}
+		// until #26 lands. The file Tools are offered: a child still works in the
+		// same working directory.
+		cfg.tools = []toolSpec{bashTool, editTool, writeTool}
 	}
 
 	prompt, err := promptFrom(positional, stdin)
@@ -833,8 +833,8 @@ type functionSpec struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// bashTool is the single tool advertised to the model: tool calling happens
-// only via the tools parameter, never by parsing model text.
+// bashTool is advertised to the model alongside the file Tools below: tool
+// calling happens only via the tools parameter, never by parsing model text.
 var bashTool = toolSpec{
 	Type: "function",
 	Function: functionSpec{
@@ -846,6 +846,43 @@ var bashTool = toolSpec{
 				"command": map[string]any{"type": "string", "description": "The shell command to run."},
 			},
 			"required": []string{"command"},
+		},
+	},
+}
+
+// editTool and writeTool are the file Tools: always in the offer, because every
+// run has a working directory to change. They are exact-text operations on
+// purpose — the Model does not need sed or a heredoc to change one occurrence.
+var editTool = toolSpec{
+	Type: "function",
+	Function: functionSpec{
+		Name:        "edit",
+		Description: "Replace an exact string in a file, failing when the text is not found or matches more than once unless replace_all is set.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":        map[string]any{"type": "string", "description": "File path, relative to the working directory."},
+				"old_string":  map[string]any{"type": "string", "description": "The exact text to replace."},
+				"new_string":  map[string]any{"type": "string", "description": "The text that replaces it."},
+				"replace_all": map[string]any{"type": "boolean", "description": "Replace every match instead of requiring a unique one."},
+			},
+			"required": []string{"path", "old_string", "new_string"},
+		},
+	},
+}
+
+var writeTool = toolSpec{
+	Type: "function",
+	Function: functionSpec{
+		Name:        "write",
+		Description: "Create or overwrite a file with the given content, creating missing parent directories.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":    map[string]any{"type": "string", "description": "File path, relative to the working directory."},
+				"content": map[string]any{"type": "string", "description": "The content the file holds afterwards."},
+			},
+			"required": []string{"path", "content"},
 		},
 	},
 }

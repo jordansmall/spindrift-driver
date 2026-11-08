@@ -435,20 +435,20 @@ func offeredNames(tools []toolSpec) []string {
 // roster to delegate to — an empty roster must never offer a call that has no
 // subagent to answer it.
 func TestOfferedTools(t *testing.T) {
-	if got := offeredNames(offeredTools(nil)); !reflect.DeepEqual(got, []string{"bash"}) {
-		t.Errorf("offeredTools(nil) = %v, want [bash]", got)
+	if got := offeredNames(offeredTools(nil)); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
+		t.Errorf("offeredTools(nil) = %v, want [bash edit write]", got)
 	}
-	if got := offeredNames(offeredTools([]agentEntry{})); !reflect.DeepEqual(got, []string{"bash"}) {
-		t.Errorf("offeredTools(empty slice) = %v, want [bash]", got)
+	if got := offeredNames(offeredTools([]agentEntry{})); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
+		t.Errorf("offeredTools(empty slice) = %v, want [bash edit write]", got)
 	}
 	roster := []agentEntry{{Name: "reviewer", Model: "m-r"}}
-	if got := offeredNames(offeredTools(roster)); !reflect.DeepEqual(got, []string{"bash", "subagent"}) {
-		t.Errorf("offeredTools(roster) = %v, want [bash subagent]", got)
+	if got := offeredNames(offeredTools(roster)); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
+		t.Errorf("offeredTools(roster) = %v, want [bash edit write subagent]", got)
 	}
 	// The entries are the package-level specs themselves, not copies that can
 	// drift from the shape the Model is taught. toolSpec carries a map, so
 	// DeepEqual is the only comparison available.
-	if got := offeredTools(roster); !reflect.DeepEqual(got, []toolSpec{bashTool, subagentTool}) {
-		t.Errorf("offeredTools(roster) = %+v, want [bashTool subagentTool]", got)
+	if got := offeredTools(roster); !reflect.DeepEqual(got, []toolSpec{bashTool, editTool, writeTool, subagentTool}) {
+		t.Errorf("offeredTools(roster) = %+v, want [bashTool editTool writeTool subagentTool]", got)
 	}
 }
