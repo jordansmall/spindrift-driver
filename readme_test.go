@@ -766,11 +766,20 @@ func TestReadmeDocumentsSubagents(t *testing.T) {
 	if !regexp.MustCompile(`one at a time|sequentially|never in parallel`).MatchString(sec) {
 		t.Error("the Subagents section does not say spawns run one at a time")
 	}
-	// The tools and spawns fields are recorded, not enforced: per-entry tool grants
-	// are not implemented, and a reader who believes otherwise ships a roster whose
-	// limits hold nothing.
-	if !regexp.MustCompile(`not (enforced|applied)`).MatchString(sec) {
-		t.Error("the Subagents section does not say the roster's tools and spawns fields are read but not enforced")
+	// The two lists bind what their names match, and the page is the only place a
+	// roster author can learn that: an entry whose tools list names nothing the
+	// Driver knows still gets Bash rather than nothing, and only its own entry
+	// bounds whom it may delegate to — the top-level run being bounded by neither.
+	if !regexp.MustCompile(`grants the tools[^.]*bash tool alone`).MatchString(sec) {
+		t.Error("the Subagents section does not say an entry's tools list grants the Tools its run is offered, the Bash Tool alone when it names none")
+	}
+	if !regexp.MustCompile(`spawns[^.]*delegate to[^.]*no .--agent. flag[^.]*unrestricted`).MatchString(sec) {
+		t.Error("the Subagents section does not say spawns limits whom a run may delegate to and that a run started with no --agent flag is unrestricted")
+	}
+	// A refusal the Model can act on: naming the permitted set turns a dead end
+	// into one corrected call rather than a guess at the roster.
+	if !regexp.MustCompile(`naming the agents[^.]*may spawn`).MatchString(sec) {
+		t.Error("the Subagents section does not say a refused spawn answers with the agents the caller may spawn")
 	}
 
 	// The flag has to appear in the fenced usage line a reader copies, not only in
@@ -926,11 +935,11 @@ func TestReadmeDocumentsFileTools(t *testing.T) {
 		t.Error("the Guard Hooks section does not say the post-call summary hook is handed Bash Tool results, so a file Tool's result reaches the Model unchanged")
 	}
 
-	// The Subagents section's "not enforced" claim has to name all three always-on
-	// Tools now, or it reads as a Bash-only offer and understates what a roster
-	// cannot restrict.
+	// What a grant cannot do is take Bash away: an entry naming no tools the Driver
+	// knows would otherwise be offered nothing at all, and the Subagents section is
+	// the only place that floor is written down.
 	subagents := markdownSectionBody(string(raw), "subagents")
-	if !regexp.MustCompile(`every run gets[^.]*bash[^.]*edit[^.]*write`).MatchString(subagents) {
-		t.Error("the Subagents section does not say every run gets the Bash, Edit and Write Tools whatever its roster says")
+	if !regexp.MustCompile(`naming no tools[^.]*bash tool alone`).MatchString(subagents) {
+		t.Error("the Subagents section does not say an entry that names no tools is offered the Bash Tool alone")
 	}
 }

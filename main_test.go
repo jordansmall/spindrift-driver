@@ -4311,8 +4311,14 @@ func TestUsageDocumentsAgentFlag(t *testing.T) {
 	if !regexp.MustCompile(`(?s)--agent <name>[^.]*system prompt`).MatchString(usage) {
 		t.Errorf("usage does not say the Agent File body is the system prompt:\n%s", usage)
 	}
-	if !regexp.MustCompile(`(?s)--agent.*never offered\s+the Subagent Tool`).MatchString(usage) {
-		t.Errorf("usage does not say a run selected by --agent is never offered the Subagent Tool:\n%s", usage)
+	if !regexp.MustCompile(`(?s)tools list limits[^.]*Bash Tool alone`).MatchString(usage) {
+		t.Errorf("usage does not say an entry's tools list limits the Tools its run is offered, the Bash Tool alone when it names none:\n%s", usage)
+	}
+	if !regexp.MustCompile(`(?s)spawns list limits[^.]*may spawn`).MatchString(usage) {
+		t.Errorf("usage does not say an entry's spawns list limits the agents its run may spawn:\n%s", usage)
+	}
+	if !regexp.MustCompile(`(?s)no --agent flag[^.]*unrestricted`).MatchString(usage) {
+		t.Errorf("usage does not say a run started with no --agent flag is unrestricted:\n%s", usage)
 	}
 }
 
