@@ -297,6 +297,181 @@ func TestReadmeDocumentsEventStreamOnStdout(t *testing.T) {
 	}
 }
 
+// TestReadmeDocumentsGoldenPassAsConformanceHandoff pins the artifact section.
+// testdata/pass.jsonl is the whole hand-off between this repo and spindrift's driverkit
+// conformance kit — this repo carries no copy of driverkit, so the file is the interface
+// — and a reader who has only the README has to learn from it what the artifact covers,
+// why its bytes are the same on every host, that it leaks nothing, and how to rewrite
+// it. Each claim below is one a reader would otherwise have to recover from
+// golden_test.go by reading it.
+func TestReadmeDocumentsGoldenPassAsConformanceHandoff(t *testing.T) {
+	const file = "README.md"
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+
+	sec := markdownSectionBody(string(raw), "the golden pass log")
+	if sec == "" {
+		t.Fatal("README.md has no section documenting the golden Pass log (testdata/pass.jsonl)")
+	}
+
+	// The artifact is the hand-off, and it is consumed as a corpus case's own
+	// pass.jsonl — a file the host-side Strategy is handed and has to pass, not a
+	// sample a reader may imitate.
+	if !strings.Contains(sec, "driverkit") || !strings.Contains(sec, "conformance") {
+		t.Error("the golden-log section does not name testdata/pass.jsonl as the hand-off to spindrift's driverkit conformance kit")
+	}
+	if !near(sec, "corpus", "pass.jsonl", 240) {
+		t.Error("the golden-log section does not say the artifact drops straight into a conformance corpus case as that case's pass.jsonl")
+	}
+	if !strings.Contains(sec, "strategy") || !strings.Contains(sec, "identity decoder") {
+		t.Error("the golden-log section does not name the host-side Strategy (data plus an identity decoder) as what consumes the artifact")
+	}
+	// The corpus scores one case against a fixed set of goldens; naming them is what
+	// tells a decoder author which of their branches this file exercises.
+	for _, golden := range []string{"classification", "usage", "transcript", "verdict", "result", "heartbeat"} {
+		if !strings.Contains(sec, golden) {
+			t.Errorf("the golden-log section does not name the %s golden the corpus case is scored against", golden)
+		}
+	}
+
+	// One scripted run, and it covers every kind — otherwise a reader cannot tell a
+	// complete artifact from a convenient example.
+	if !strings.Contains(sec, "one scripted run") {
+		t.Error("the golden-log section does not say one scripted run produces the artifact")
+	}
+	if !regexp.MustCompile(`every[^.]*kind`).MatchString(sec) {
+		t.Error("the golden-log section does not say the artifact covers every kind the Driver emits")
+	}
+
+	// The enumeration is the point of the section: all four Tools appear as
+	// tool_call/tool_result pairs, and each is named by the name the event carries.
+	if !regexp.MustCompile(`(each|all) of the four tools`).MatchString(sec) {
+		t.Error("the golden-log section does not say a tool_call/tool_result pair for each of the four Tools is in the artifact")
+	}
+	for _, tool := range []string{"bash", "edit", "write", "subagent"} {
+		if !regexp.MustCompile(`\b` + tool + `\b`).MatchString(sec) {
+			t.Errorf("the golden-log section does not name the %s Tool among the tool_call/tool_result pairs the artifact holds", tool)
+		}
+	}
+	// usage is per call, and the Model changes mid-run in this one, which is the only
+	// thing in the file that stops a decoder reading one model id for the whole run.
+	if !near(sec, "usage", "model call", 240) {
+		t.Error("the golden-log section does not state that the artifact holds one usage event per Model call")
+	}
+	if !near(sec, "model", "mid-run", 200) {
+		t.Error("the golden-log section does not state that the Model changes id mid-run inside the artifact")
+	}
+	// Both streamed channels are replayed, and the harder case is a Tool Call whose
+	// arguments are themselves split across chunks.
+	if !near(sec, "chunk", "thinking", 320) {
+		t.Error("the golden-log section does not state that the artifact replays chunked thinking reassembled into one reasoning event")
+	}
+	if !near(sec, "chunk", "prose", 320) {
+		t.Error("the golden-log section does not state that the artifact replays chunked prose reassembled into one text event")
+	}
+	if !near(sec, "chunk", "argument", 320) {
+		t.Error("the golden-log section does not state that the artifact holds a Tool Call whose arguments arrive split across chunks")
+	}
+	// The breaker's synthetic refusal is in the file: an is_error result for a call
+	// that never ran is a shape a decoder has to recognise as not-a-command-output.
+	if !near(sec, "breaker", "refus", 240) {
+		t.Error("the golden-log section does not state that the artifact holds the Repeated-Call Breaker's synthetic refusal")
+	}
+	// error and result in one file is only possible through the relay, and only
+	// because the Pass still closes with the parent's own result.
+	if !near(sec, "reset_at", "rate-limit", 240) || !near(sec, "reset_at", "child", 240) {
+		t.Error("the golden-log section does not state that a rate-limited child's error line carrying reset_at is in the artifact")
+	}
+	if !regexp.MustCompile(`clos[a-z]*[^.]*(parent|result)`).MatchString(sec) {
+		t.Error("the golden-log section does not state that the artifact still closes with the parent's own result event")
+	}
+	// The relay's attribution is two fields, and a decoder keyed on either needs the
+	// file to hold both on a child line.
+	var relayLines []string
+	for _, s := range sentencesContaining(sec, "in_subagent") {
+		if strings.Contains(s, "role") {
+			relayLines = append(relayLines, s)
+		}
+	}
+	if len(relayLines) == 0 {
+		t.Error("the golden-log section does not state that relayed child events carry role and in_subagent")
+	}
+	if !near(sec, "subagent", "names the agent", 240) {
+		t.Error("the golden-log section does not state that the Subagent tool_result names the producing agent in its subagent field")
+	}
+	// A run's totals include what it delegated: the corpus's usage golden fails on
+	// parent-only sums, so the artifact has to say it holds child-inclusive ones.
+	var totalsLines []string
+	for _, s := range sentencesContaining(sec, "totals") {
+		if strings.Contains(s, "token") && regexp.MustCompile(`child|delegat`).MatchString(s) {
+			totalsLines = append(totalsLines, s)
+		}
+	}
+	if len(totalsLines) == 0 {
+		t.Error("the golden-log section does not state that the result event's session token totals include the children's usage")
+	}
+
+	// Reproducibility: three separate mechanisms, and a reader who does not know all
+	// three reads a stable file as luck.
+	if !regexp.MustCompile(`pinn[a-z]*[^.]{0,40}clock|clock[^.]{0,40}pinn`).MatchString(sec) {
+		t.Error("the golden-log section does not state that the run stamps on a pinned clock")
+	}
+	if !strings.Contains(sec, strings.ToLower(envTestNowMS)) {
+		t.Errorf("the golden-log section does not name %s, the clock pin handed to a spawned child across the process boundary", envTestNowMS)
+	}
+	if !near(sec, strings.ToLower(envTestNowMS), "child", 240) {
+		t.Errorf("the golden-log section does not say %s pins the clock of a spawned child Driver", envTestNowMS)
+	}
+	if !strings.Contains(sec, goldenRunDir) {
+		t.Errorf("the golden-log section does not name %s, the normalised run directory", goldenRunDir)
+	}
+	if !near(sec, goldenRunDir, "absolute", 240) {
+		t.Errorf("the golden-log section does not say %s is normalised because the edit and write Tools report an absolute path", goldenRunDir)
+	}
+
+	// The artifact leaves this repo and is read by other people, so holding no
+	// credential is a property of it, produced by an obviously-fake key the run
+	// authenticates with and enforced by a scan.
+	var placeholderLines []string
+	for _, s := range sentencesContaining(sec, "placeholder") {
+		if strings.Contains(s, "credential") || strings.Contains(s, "key") {
+			placeholderLines = append(placeholderLines, s)
+		}
+	}
+	if len(placeholderLines) == 0 {
+		t.Error("the golden-log section does not state that the scripted run authenticates with an obviously-fake placeholder key that holds no credential")
+	}
+	var scanLines []string
+	for _, s := range sentencesContaining(sec, "scan") {
+		if strings.Contains(s, "credential") && strings.Contains(s, "fail") {
+			scanLines = append(scanLines, s)
+		}
+	}
+	if len(scanLines) == 0 {
+		t.Error("the golden-log section does not state that a scan test fails the artifact if anything credential-shaped turns up in it")
+	}
+
+	// How it moves: only under -update; anything else is drift. Both are pinned to
+	// this section, not just to the file, so the reader who found the artifact
+	// section learns the command there.
+	if !strings.Contains(sec, "go test -run testgoldenpasslog -update") {
+		t.Error("the golden-log section does not give the regeneration command `go test -run TestGoldenPassLog -update`")
+	}
+	if !near(sec, "testdata/pass.jsonl", "drift", 240) {
+		t.Error("the golden-log section does not state that the golden Pass log test fails on drift without -update")
+	}
+	// The field contract is asserted here, per kind, off the wire — no driverkit
+	// import, which would be a second source of truth that goes stale silently.
+	if !strings.Contains(sec, "golden_contract_test.go") {
+		t.Error("the golden-log section does not name golden_contract_test.go as the per-kind field-contract test")
+	}
+	if !strings.Contains(sec, "plain json") || !regexp.MustCompile(`no[^.]{0,40}driverkit|driverkit[^.]{0,40}import`).MatchString(sec) {
+		t.Error("the golden-log section does not state that the contract tests read the file as plain JSON with no driverkit import")
+	}
+}
+
 // TestReadmeDocumentsRepeatedCallBreaker pins the run-limit prose the breaker and the
 // error event's reset_at add. A run stopped for repeating itself and a run that ran out
 // of turns are different failures to whoever reads the exit code, so the README has to

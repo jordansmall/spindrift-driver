@@ -86,10 +86,54 @@ Progress stays on stderr and never moves to stdout: each `POST`, each retry, the
 one-line driver error. `-h`/`--help` writes its usage to stderr for the same reason, so
 stdout parses as events even there.
 
-`testdata/pass.jsonl` is the committed golden Pass log: one scripted run's whole event
-stream, byte for byte. `go test -run TestGoldenPassLog -update` regenerates it, and
-without `-update` that test fails on any drift — the artifact a host-side decoder is
-written against never moves silently.
+## The golden Pass log
+
+`testdata/pass.jsonl` is this repo's hand-off to spindrift's driverkit conformance kit:
+one scripted run's whole event stream, byte for byte, dropping straight into a
+conformance corpus case as that case's `pass.jsonl` — the log the host-side Strategy
+(data plus an identity decoder) is handed to pass. Every golden a case is scored against
+is answerable from it — classification, usage, transcript, verdict, result and heartbeat
+— beside the chunked replay and the credential scan. One scripted run produces it, and it
+covers every kind the Driver emits and every contract-relevant shape one can hold:
+
+- a `tool_call`/`tool_result` pair for each of the four Tools — `bash`, `edit`, `write`
+  and `subagent` — each with the `tool_target` that Tool reports: a command, an absolute
+  path, the roster entry's name.
+- one `usage` event per Model call that answered, with the Model changing id mid-run, so a
+  decoder reads `model` per call rather than once per run.
+- a chunked replay of both streamed channels — thinking reassembled into one `reasoning`
+  event, prose into one `text` event — including a `write` Tool Call whose arguments
+  arrive split across two chunks, which the reassembly has to join back into one call.
+- the Repeated-Call Breaker's synthetic refusal: an `is_error` `tool_result` for a call
+  that was never run, still paired with its `tool_call` like any result.
+- a rate-limited child's `error` line carrying `reset_at`, relayed inside the Subagent
+  pair it was spawned for — the one way a Pass can hold `error` and still close with the
+  parent's own `result`.
+- relayed child events carrying `role` (the agent's name) and `in_subagent`, and the
+  Subagent `tool_result` whose `subagent` field names the agent that produced it.
+- a `result` whose session `tokens` totals include the children's usage, and whose
+  `models` lists every model that answered — a child's included.
+
+Nothing in the file moves between machines, and three things are what keep it still: the
+run stamps on a pinned stepping clock; a clock pin is a function value, so the pin a
+spawned child needs travels across the process boundary as `SPINDRIFT_TEST_NOW_MS=<start>:<step>`
+in that child's environment, the environment being the only channel to a spawn; and the
+run's working directory is normalised to `/golden-run` on the way to the file, because the
+`edit` and `write` Tools report an absolute path in `tool_target` and the temporary
+directory a run writes into names the machine that produced it.
+
+The artifact holds no credential-shaped string, and the scripted run is built so that is a
+fact about the emitter rather than about a run that had nothing to leak: it authenticates
+with an obviously-fake placeholder key, which travels only as the bearer header of a
+request and never as an event field, and a scan test fails `testdata/pass.jsonl` if
+anything credential-shaped turns up in it.
+
+`go test -run TestGoldenPassLog -update` regenerates `testdata/pass.jsonl`; without
+`-update` that test compares what the Driver emits against the committed bytes and fails
+on any drift, naming the command in the failure. `golden_contract_test.go` then asserts
+driverkit's field contract per kind by reading the file as plain JSON — this repo imports
+no driverkit types, so the tests pin the wire and driverkit stays the grammar's only
+source of truth.
 
 ## Build
 
