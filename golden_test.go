@@ -21,6 +21,14 @@ import (
 // pointed anywhere else.
 const goldenRateLimitedModel = "m-scout"
 
+// goldenFakeKey is the API key the scripted golden run authenticates with: run() reads
+// it from $SPINDRIFT_API_KEY (envAPIKey) and sends it as the bearer token of every POST
+// the run makes, parent and children alike. It names no provider and matches none of
+// goldenCredentialShapes, and the run holds one all the same — which is what makes
+// TestGoldenPassCarriesNoCredentialShapedStrings a fact about the emitter rather than
+// about a run that never had a key to leak.
+const goldenFakeKey = "golden-test-placeholder"
+
 // goldenRetryAfter is the Retry-After header that scripted 429 answers with. It is
 // an absolute HTTP-date rather than delta-seconds: retryAfterMS adds a delta to
 // whatever reading of its own pinned clock the child takes at that moment, so a
@@ -164,13 +172,13 @@ func goldenPassStream(t *testing.T) []byte {
 	t.Setenv(envTestNowMS, fmt.Sprintf("%d:%d", goldenChildClockStart, goldenChildClockStep))
 	// The roster the parent's Subagent calls resolve against, and the one endpoint the
 	// parent and both children post to. The API key is a placeholder that names no
-	// provider and is shaped like no credential: this artifact is the file a host
-	// reads, and a run that records one is a leak.
+	// provider and matches no scanned credential shape: this artifact is the file a
+	// host reads, and a run that records one is a leak.
 	cfgPath := agentFixtureEntries(t,
 		agentSpec{name: "reviewer", model: "m-reviewer", description: "reviews a diff", body: "review the change and report blockers"},
 		agentSpec{name: "scout", model: "m-scout", description: "surveys a tree", body: "survey the tree and report what is in it"},
 	)
-	t.Setenv(envAPIKey, "golden-test-placeholder")
+	t.Setenv(envAPIKey, goldenFakeKey)
 
 	// The file Tools really write and really read back, so they get a directory of
 	// their own rather than the repo this test runs in. Their absolute tool_target is

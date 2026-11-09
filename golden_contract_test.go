@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -988,5 +989,524 @@ func TestGoldenPassFailureShapesStayDistinguishable(t *testing.T) {
 	}
 	if failed != exitCodeRun+refused+spawnFailed+unclassified || clean != 4 {
 		t.Errorf("%s holds %d is_error and %d clean tool_result line(s), want 4 of each — two exit-code failures, one refusal, one failed spawn, and four results that succeeded", goldenPassPath, failed, clean)
+	}
+}
+
+// goldenTokenSum is the log's own arithmetic: one running total per token field, plus
+// the addends behind each total spelled out with the line and attribution they came
+// from. A decoder that bills a session by adding the usage events it was shown has to
+// land on the result event's numbers, and a mismatch that names only those two numbers
+// cannot be checked by eye — the addends are the working.
+type goldenTokenSum struct {
+	total   map[string]float64
+	addends map[string][]string
+}
+
+// goldenSumUsage adds every usage line of the artifact, the parent's and the relayed
+// children's alike. That is the whole point of summing usage rather than result
+// totals: foldChildUsage (subagent.go) charges a relayed usage event into the parent
+// exactly as the parent charges its own, so the lines that make up the session total
+// are all of them and not the parent's share.
+func goldenSumUsage(t *testing.T, events []map[string]any) goldenTokenSum {
+	t.Helper()
+	sum := goldenTokenSum{total: map[string]float64{}, addends: map[string][]string{}}
+	for i, ev := range events {
+		line := i + 1
+		kind := goldenKindOf(t, ev, line)
+		if kind != "usage" {
+			continue
+		}
+		totals, ok := ev["tokens"].(map[string]any)
+		if !ok {
+			goldenContractFail(t, kind, line, "tokens", "= %s, want a JSON object of token fields to add into the session total", goldenJSONValue(ev["tokens"]))
+			continue
+		}
+		label := fmt.Sprintf("L%d", line)
+		if ev["in_subagent"] == true {
+			role, _ := ev["role"].(string)
+			label = fmt.Sprintf("L%d(%s)", line, role)
+		}
+		for _, name := range goldenTokenFields {
+			v, ok := totals[name].(float64)
+			if !ok {
+				goldenContractFail(t, kind, line, "tokens."+name, "= %s, want a JSON number to add into the session total", goldenJSONValue(totals[name]))
+				continue
+			}
+			sum.total[name] += v
+			sum.addends[name] = append(sum.addends[name], fmt.Sprintf("%s:%g", label, v))
+		}
+	}
+	return sum
+}
+
+// TestGoldenPassResultTokensSumEveryUsageLine states the promise a host bills on: the
+// session total is the sum of all the usage events in the log, relayed children
+// included, field by field. It holds because foldChildUsage charges each forwarded
+// usage event into the parent's delegated tally and run() closes with
+// totals.add(delegated) (main.go) — a relay that forwarded a child's spend without
+// charging it, or one that charged the child's result totals on top of its usage
+// events, would break the equality below in one direction or the other.
+func TestGoldenPassResultTokensSumEveryUsageLine(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	result := parentResult(t, raw)
+	resultLine := len(events) // parentResult pins that the parent's result is the last line
+
+	resultTokens, ok := result["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("the parent's result reports tokens as %s, want an object of the six token fields\nregenerate the artifact with: %s", goldenJSONValue(result["tokens"]), goldenRegenerateCmd)
+	}
+	sum := goldenSumUsage(t, events)
+	if len(sum.addends["input"]) == 0 {
+		t.Fatalf("%s holds no usage line to add up, so a session total cannot be reproduced from the stream\nregenerate the artifact with: %s", goldenPassPath, goldenRegenerateCmd)
+	}
+
+	for _, name := range goldenTokenFields {
+		got, present := resultTokens[name]
+		if !present {
+			goldenContractFail(t, "result", resultLine, "tokens."+name, "missing while %d usage line(s) report it: a field a decoder can sum must be a field the total states", len(sum.addends[name]))
+			continue
+		}
+		want, ok := got.(float64)
+		if !ok {
+			goldenContractFail(t, "result", resultLine, "tokens."+name, "= %s, want a JSON number, not a %T", goldenJSONValue(got), got)
+			continue
+		}
+		if sum.total[name] != want {
+			goldenContractFail(t, "result", resultLine, "tokens."+name, "= %v, want %v, the sum of every usage line in the file (%s) — the same addition a host does to bill the session, relayed children included",
+				want, sum.total[name], strings.Join(sum.addends[name], " + "))
+		}
+	}
+}
+
+// TestGoldenPassResultTokensAreNotParentOnly pins that the equality above is about the
+// children at all: on a log with no relayed usage the sum is trivially the parent's
+// own share, and the test would pass without having checked a fold. So the relayed
+// share has to be there, it has to be non-zero, and it has to be a share of at least
+// one field — otherwise dropping every relayed line would leave the total unchanged
+// and no fold would be observable.
+func TestGoldenPassResultTokensAreNotParentOnly(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	result := parentResult(t, raw)
+	resultLine := len(events)
+
+	var relayedLines []int
+	perField := map[string]float64{}
+	for i, ev := range events {
+		if goldenKindOf(t, ev, i+1) != "usage" || ev["in_subagent"] != true {
+			continue
+		}
+		relayedLines = append(relayedLines, i+1)
+		totals, _ := ev["tokens"].(map[string]any)
+		for _, name := range goldenTokenFields {
+			v, _ := totals[name].(float64)
+			perField[name] += v
+		}
+	}
+	if len(relayedLines) == 0 {
+		goldenContractFail(t, "usage", resultLine, "in_subagent", "no usage line of a relayed child exists to fold into tokens: the session total has to include spend the parent did not make itself")
+		return
+	}
+	var folded []string
+	for _, name := range goldenTokenFields {
+		if perField[name] != 0 {
+			folded = append(folded, fmt.Sprintf("%s=%g", name, perField[name]))
+		}
+	}
+	if len(folded) == 0 {
+		goldenContractFail(t, "usage", relayedLines[0], "tokens", "report zero in all six fields across %d relayed line(s): the session total (%s) is then identical with every child line dropped, so it proves nothing about folding — at least one field has to carry a child's share",
+			len(relayedLines), goldenJSONValue(result["tokens"]))
+	}
+}
+
+// TestGoldenPassResultNumTurnsCountsParentCallsOnly pins num_turns as the parent's own
+// Model calls: each start line opens one call in the process that wrote it, and a
+// relayed child's start lines belong to the child's own Pass — the child's result
+// event states its own num_turns, and counting both would charge the parent for turns
+// it never made.
+func TestGoldenPassResultNumTurnsCountsParentCallsOnly(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	result := parentResult(t, raw)
+	resultLine := len(events)
+
+	var parentStarts, allStarts int
+	for i, ev := range events {
+		if goldenKindOf(t, ev, i+1) != "start" {
+			continue
+		}
+		allStarts++
+		if ev["in_subagent"] != true {
+			parentStarts++
+		}
+	}
+	turns, ok := result["num_turns"].(float64)
+	if !ok {
+		goldenContractFail(t, "result", resultLine, "num_turns", "= %s, want a JSON number of Model calls", goldenJSONValue(result["num_turns"]))
+		return
+	}
+	if int(turns) != parentStarts {
+		goldenContractFail(t, "result", resultLine, "num_turns", "= %v, want %d, the number of start lines the parent wrote (the log holds %d start lines in all, %d of them relayed children's own calls)", turns, parentStarts, allStarts, allStarts-parentStarts)
+	}
+	if allStarts == parentStarts {
+		goldenContractFail(t, "result", resultLine, "num_turns", "cannot be shown to count the parent alone: the log holds no relayed start line, so the parent-only and whole-file counts are the same number")
+	}
+}
+
+// TestGoldenPassResultModelsIncludeTheAnsweringChild pins the run's model set as the
+// ids that answered: foldChildUsage adds a relayed usage event's model id to the set,
+// so the child model that answered appears without the parent ever having named it in
+// a completion — and the rate-limited model stays out, because a 429 leaves no usage
+// event to fold and no answer to name.
+func TestGoldenPassResultModelsIncludeTheAnsweringChild(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	result := parentResult(t, raw)
+	resultLine := len(events)
+
+	var answered []string
+	for i, ev := range events {
+		if ev["kind"] != "usage" || ev["in_subagent"] != true {
+			continue
+		}
+		model, ok := ev["model"].(string)
+		if !ok || model == "" {
+			goldenContractFail(t, "usage", i+1, "model", "= %s, want the id of the child model whose spend this event folds into the run", goldenJSONValue(ev["model"]))
+			continue
+		}
+		if !slices.Contains(answered, model) {
+			answered = append(answered, model)
+		}
+	}
+	if len(answered) == 0 {
+		goldenContractFail(t, "result", resultLine, "models", "no relayed usage line names a child model, so nothing here pins a child's id into the run's model set")
+		return
+	}
+
+	models, ok := result["models"].([]any)
+	if !ok {
+		goldenContractFail(t, "result", resultLine, "models", "= %s, want a JSON array of model ids", goldenJSONValue(result["models"]))
+		return
+	}
+	present := map[string]bool{}
+	for _, m := range models {
+		id, _ := m.(string)
+		present[id] = true
+	}
+	for _, model := range answered {
+		if !present[model] {
+			goldenContractFail(t, "result", resultLine, "models", "= %s, which omits %q: a child that answered spent tokens this run owes for, and its id belongs in the set the relay folds in", goldenJSONValue(result["models"]), model)
+		}
+	}
+	if present[goldenRateLimitedModel] {
+		goldenContractFail(t, "result", resultLine, "models", "includes %q: that spawn was rate-limited and never answered, so it earned no usage event and no id in the run's model set", goldenRateLimitedModel)
+	}
+}
+
+// goldenDecodeEventLines reads a stream the way a host that pasted the Driver's stdout
+// and stderr into one pass.jsonl has to read it: line by line, keeping every JSON
+// object in order and ignoring everything else — blank lines, and the
+// "spindrift-driver: …" notes main.go and subagent.go write.
+//
+// What counts as an event is the relay's own rule (relaySubagentOutput): the line has
+// to unmarshal into a populated object, so a truncated object, a bare "null", an array
+// and prose all fall out instead of arriving as a line with no kind.
+//
+// stdoutEvents is deliberately not this reader. It fails the run on any line that is
+// not an event, which is the promise the Driver's own stdout owes and the opposite of
+// what a merged capture can offer.
+func goldenDecodeEventLines(raw string) []map[string]any {
+	var out []map[string]any
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		var ev map[string]any
+		// The nil check is what catches a bare "null", which unmarshals into a nil map
+		// with no error at all — the same guard relaySubagentOutput needs.
+		if err := json.Unmarshal([]byte(trimmed), &ev); err != nil || ev == nil {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// goldenKindSequence spells a decoded stream as its kinds, because "9 events instead of
+// 10" tells a reader nothing about which one went missing.
+func goldenKindSequence(events []map[string]any) []string {
+	kinds := make([]string, 0, len(events))
+	for _, ev := range events {
+		kind, _ := ev["kind"].(string)
+		if kind == "" {
+			kind = "(none)"
+		}
+		kinds = append(kinds, kind)
+	}
+	return kinds
+}
+
+// goldenStderrNotes are three of the shapes the Driver writes to stderr: the POST line
+// and the retry notice from main.go — which only ever follows a 5xx or a transport
+// failure, a 429 being a non-retryable 4xx that answers with a reset — and the relay's
+// dropped-line note from subagent.go. None of them is JSON, so none may survive
+// goldenDecodeEventLines — and they have to be interleaved rather than appended, because
+// the promise is about order across a mixed stream, not about a reader that skips a
+// header.
+var goldenStderrNotes = []string{
+	"spindrift-driver: POST http://127.0.0.1:43219/v1/chat/completions",
+	"spindrift-driver: retry 2/3 in 100ms (server returned 500 Internal Server Error: upstream unavailable)",
+	`spindrift-driver: subagent "scout": dropped non-event output line: heartbeat`,
+}
+
+// goldenInterleaveStderr rewrites an event stream as a merged capture: every event line
+// followed by one of the Driver's stderr notes and a blank line, the notes cycling so
+// more than one shape is in front of the reader.
+func goldenInterleaveStderr(raw string) string {
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+		b.WriteString(goldenStderrNotes[i%len(goldenStderrNotes)])
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+// TestGoldenDecodeEventLinesSkipsNonEventLines is the unit half of the merged-capture
+// promise: of a stream whose event lines are mixed with the Driver's stderr notes,
+// blank and whitespace-only lines, a truncated object, a JSON array, a JSON string and
+// a bare null, exactly the well-formed objects come back, in file order, with their
+// values intact.
+func TestGoldenDecodeEventLinesSkipsNonEventLines(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"kind":"start","message_id":"msg-1","timestamp":1700000000250}`,
+		"spindrift-driver: POST http://127.0.0.1:43219/v1/chat/completions",
+		"",
+		"   ",
+		`{"kind":"text","message_id":"msg-1","timestamp":1700000000500,"text":"thinking out loud"}`,
+		`{"kind":"usage","message_id":"msg-1","timestamp":1700000000750`,
+		`["not","an","event"]`,
+		`"not an object"`,
+		`null`,
+		`spindrift-driver: subagent "scout": dropped non-event output line: heartbeat`,
+		`{"kind":"result","message_id":"msg-9","timestamp":1700000001000,"text":"done","num_turns":1}`,
+	}, "\n") + "\n"
+
+	got := goldenDecodeEventLines(stream)
+	want := []struct {
+		kind    string
+		message string
+		text    string
+	}{
+		{kind: "start", message: "msg-1"},
+		{kind: "text", message: "msg-1", text: "thinking out loud"},
+		{kind: "result", message: "msg-9", text: "done"},
+	}
+	wantKinds := make([]string, 0, len(want))
+	for _, w := range want {
+		wantKinds = append(wantKinds, w.kind)
+	}
+	if gotKinds := goldenKindSequence(got); strings.Join(gotKinds, ",") != strings.Join(wantKinds, ",") {
+		t.Fatalf("goldenDecodeEventLines recovered %d event(s) %v from a %d-line stream whose events are %v, want exactly those, in order",
+			len(gotKinds), strings.Join(gotKinds, ","), strings.Count(stream, "\n"), strings.Join(wantKinds, ","))
+	}
+	for i, w := range want {
+		if got[i]["message_id"] != w.message {
+			t.Errorf("%s event %d message_id = %v, want %q: a surviving object has to survive with its fields", w.kind, i+1, got[i]["message_id"], w.message)
+		}
+		if w.text != "" && got[i]["text"] != w.text {
+			t.Errorf("%s event %d text = %v, want %q", w.kind, i+1, got[i]["text"], w.text)
+		}
+	}
+}
+
+// TestGoldenPassDecodesWithStderrInterleaved is the promise a host recorder relies on:
+// paste this artifact's lines and the Driver's stderr into one file in the order they
+// arrived, and every event still decodes — same count, same order, same kinds, same
+// values. It is a property of a capture, so it is tested on a capture rather than on
+// the committed bytes: the artifact itself stays clean JSONL, which goldenReadPass and
+// stdoutEvents hold it to.
+func TestGoldenPassDecodesWithStderrInterleaved(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	merged := goldenInterleaveStderr(raw)
+
+	// That the capture is a capture: three lines per event, one event line and two
+	// non-event lines after it. Without this the assertion below could pass on a
+	// goldenInterleaveStderr that interleaved nothing.
+	if lines := strings.Count(merged, "\n"); lines != 3*len(events) {
+		t.Fatalf("the built capture holds %d line(s), want 3 per event across %d event(s): every event has to be followed by a stderr note and a blank line", lines, len(events))
+	}
+
+	got := goldenDecodeEventLines(merged)
+
+	if len(got) != len(events) {
+		t.Fatalf("a merged capture of %s decodes to %d event(s) %v, want the artifact's %d %s\nregenerate the artifact with: %s",
+			goldenPassPath, len(got), goldenKindSequence(got), len(events), strings.Join(goldenKindSequence(events), ","), goldenRegenerateCmd)
+	}
+	for i := range events {
+		if !reflect.DeepEqual(got[i], events[i]) {
+			t.Errorf("merged capture event %d is %s, want the artifact's line %d %s: interleaving stderr may not lose, reorder or alter an event",
+				i+1, goldenJSONValue(got[i]), i+1, goldenJSONValue(events[i]))
+		}
+	}
+}
+
+// goldenCredentialShapes are the shapes a log handed to somebody else has to be free
+// of: the prefixes the vendors themselves stamp on a live key (OpenAI, GitHub, AWS,
+// Slack, Google), a PEM private-key header, and the two spellings of the HTTP header a
+// token travels in. They are matched exactly and case-sensitively as the vendors spell
+// them — the aim is to catch a real key that reached the log, not to guess at mangled
+// ones, and a looser match is what goldenBenignText shows would flag ordinary output.
+var goldenCredentialShapes = []string{
+	"sk-", // OpenAI-style API key
+	"ghp_",
+	"gho_",
+	"github_pat_", // GitHub personal-access and OAuth tokens
+	"AKIA",        // AWS access key id
+	"xox",
+	"xapp", // Slack legacy and app-level tokens
+	"AIza", // Google API key
+	"Bearer ",
+	"Authorization:", // the header a token is sent in
+	"PRIVATE KEY",    // a PEM private-key header
+}
+
+// goldenCredentialShapedStrings reports which of goldenCredentialShapes occur in raw,
+// each at most once and in the order above, so the report names what to look for
+// without dumping a whole line that may itself be the secret.
+func goldenCredentialShapedStrings(raw string) []string {
+	var hits []string
+	for _, shape := range goldenCredentialShapes {
+		if strings.Contains(raw, shape) {
+			hits = append(hits, shape)
+		}
+	}
+	return hits
+}
+
+// goldenFieldHolding names which fields of an event carry a credential shape, so the
+// scan's failure points a reader at the field to fix without reprinting the value that
+// may itself be the secret.
+func goldenFieldHolding(ev map[string]any, shape string) string {
+	var fields []string
+	for name, v := range ev {
+		if strings.Contains(goldenJSONValue(v), shape) {
+			fields = append(fields, name)
+		}
+	}
+	sort.Strings(fields)
+	if len(fields) == 0 {
+		return "(whole line)"
+	}
+	return strings.Join(fields, ",")
+}
+
+// goldenCredentialSamples pair each credential shape goldenCredentialShapes scans for
+// with an obviously-fake literal of it — the examples the vendors publish in their own
+// docs, which are inert and safe to keep in a test. Every one has to be detected:
+// an undetected shape is a credential this artifact could be carrying unnoticed.
+var goldenCredentialSamples = []struct {
+	shape  string
+	sample string
+}{
+	{"sk-", "sk-test-0123456789abcdef0123456789abcdef"},
+	{"ghp_", "ghp_0123456789ABCDEFGHIJKLMNOPQRSTUVWX"},
+	{"gho_", "gho_0123456789ABCDEFGHIJKLMNOPQRSTUVWX"},
+	{"github_pat_", "github_pat_11FAKE0T0fakefake0fake_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"},
+	{"AKIA", "AKIAIOSFODNN7EXAMPLE"},
+	{"xox", "xoxb-0000000000-0000000000000-fakereplacementtoken"},
+	{"xapp", "xapp-1-A0000000000-000000000000-0000000000000000000000000000"},
+	{"Bearer ", "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.fake.jwt"},
+	{"Authorization:", "Authorization: Bearer faketoken"},
+	{"PRIVATE KEY", "-----BEGIN PRIVATE KEY-----"},
+	{"AIza", "AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0"},
+}
+
+// goldenBenignText is what this artifact actually carries and what must not read as
+// credential-shaped: a normalised path, the Driver's own prose, the base64 a Tool's
+// output can hold, a rate-limit rejection that names a quota, and a reset instant. A
+// scanner loose enough to match on words like "key", "token" or "limit" would report
+// several of these, and a scan that cries wolf is one a reader stops reading.
+var goldenBenignText = []string{
+	goldenRunDir + "/notes.txt",
+	"Wrote and edited notes.txt and delegated a review; the repeated command failed with exit code 3.",
+	"SGVsbG8gZnJvbSB0aGUgbm90ZXMgZmlsZS4gUmVhZCBpdCBiZWZvcmUgZWRpdGluZywgdGhlbiByZXBvcnQgdGhlIGRpZmYu",
+	goldenRateLimitBody,
+	"1787274123000",
+	"spindrift-driver: subagent \"scout\": dropped non-event output line: heartbeat",
+}
+
+// TestGoldenCredentialShapedStringsDetectsEveryShape is the scanner's own unit test:
+// each shape it claims to catch, it catches.
+func TestGoldenCredentialShapedStringsDetectsEveryShape(t *testing.T) {
+	if len(goldenCredentialSamples) != len(goldenCredentialShapes) {
+		t.Fatalf("%d credential shapes are scanned but %d fake samples are tested: every shape needs a sample, or the scan silently stops covering one",
+			len(goldenCredentialShapes), len(goldenCredentialSamples))
+	}
+	for _, c := range goldenCredentialSamples {
+		hits := goldenCredentialShapedStrings(c.sample)
+		if !slices.Contains(hits, c.shape) {
+			t.Errorf("goldenCredentialShapedStrings does not detect %q in a literal of it (%q): a run could leak this shape and the scan would call the log clean", c.shape, c.sample)
+		}
+	}
+}
+
+// TestGoldenCredentialShapedStringsIgnoreBenignText is the other half of the unit test:
+// the text this Driver really writes stays out of the report.
+func TestGoldenCredentialShapedStringsIgnoreBenignText(t *testing.T) {
+	for _, text := range goldenBenignText {
+		if hits := goldenCredentialShapedStrings(text); len(hits) > 0 {
+			t.Errorf("goldenCredentialShapedStrings reports %v in ordinary Driver output %q: a scan that flags the artifact's own prose is one a reader learns to ignore", hits, text)
+		}
+	}
+	if hits := goldenCredentialShapedStrings(""); len(hits) > 0 {
+		t.Errorf("goldenCredentialShapedStrings reports %v in empty text", hits)
+	}
+}
+
+// TestGoldenPassCarriesNoCredentialShapedStrings scans the committed artifact, which is
+// the file a downstream host keeps and may paste into an issue: nothing in it may read
+// as a credential.
+//
+// The scripted run does authenticate — goldenPassStream sets $SPINDRIFT_API_KEY to
+// goldenFakeKey, which is the value run() sends as the request's bearer token — so
+// nothing here is clean because the run had no key to write. The key goes out in a
+// header and never onto stdout, and that is the fact this test pins about the emitter.
+func TestGoldenPassCarriesNoCredentialShapedStrings(t *testing.T) {
+	raw, events := goldenReadPass(t)
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
+	for _, shape := range goldenCredentialShapedStrings(raw) {
+		line, kind, field := 0, "(none)", "line"
+		for i, l := range lines {
+			if !strings.Contains(l, shape) {
+				continue
+			}
+			line = i + 1
+			if line <= len(events) {
+				kind, _ = events[line-1]["kind"].(string)
+				field = goldenFieldHolding(events[line-1], shape)
+			}
+			break
+		}
+		// The offending value is deliberately not reproduced: a line reported as leaked
+		// may be the leak, and a test log is read by more people than the artifact is.
+		goldenContractFail(t, kind, line, field, "holds the credential shape %q (value elided, for the reason just stated): this file is handed to other people, and a Driver that writes a bearer token or a key into its event stream leaks every run it runs", shape)
+	}
+
+	// The run's own key, named rather than implied: were the emitter ever changed to
+	// log what it authenticates with, the scan above would only catch it if the key
+	// happened to be shaped like one of the samples, and goldenFakeKey is deliberately
+	// not.
+	if strings.Contains(raw, goldenFakeKey) {
+		t.Errorf("%s carries the API key this run authenticated with (%q): the key is a header value and belongs on no event line\nregenerate the artifact with: %s", goldenPassPath, goldenFakeKey, goldenRegenerateCmd)
+	}
+	// The placeholder is the reason the scan is meaningful, so it has to stay
+	// un-shapeable: if someone renames it to something credential-shaped, this fails
+	// before the artifact does.
+	if hits := goldenCredentialShapedStrings(goldenFakeKey); len(hits) > 0 {
+		t.Errorf("goldenFakeKey %q matches the credential shapes %v: the scripted run's placeholder must not itself read as a credential, or the scan of the artifact cannot tell a placeholder from a leak", goldenFakeKey, hits)
 	}
 }
