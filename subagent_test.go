@@ -1462,3 +1462,85 @@ func TestSubagentChildRepeatedCallCounterIsItsOwn(t *testing.T) {
 		t.Errorf("parent result text = %v, want the parent's own final answer", got)
 	}
 }
+
+// TestSubagentChildEventClockIsPinnableFromEnv is the child half of a golden
+// Pass log: the relay keeps the child's own timestamp, so the parent's stdout can
+// only compare byte for byte if the child's clock is pinnable across the process
+// boundary. The environment is the sole channel to a spawned child (see
+// subagentEnv), so the pin rides there.
+func TestSubagentChildEventClockIsPinnableFromEnv(t *testing.T) {
+	const (
+		pinnedStart = 1700000000000
+		pinnedStep  = 1000
+	)
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		parentToolCallResponse,
+		completion("child answer"),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+	t.Setenv(envTestNowMS, fmt.Sprintf("%d:%d", pinnedStart, pinnedStep))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+	raw := stdout.String()
+
+	relayed := relayedEvents(t, raw)
+	if len(relayed) == 0 {
+		t.Fatalf("stdout carries no relayed child lines: %q", raw)
+	}
+
+	// run() reads the clock once for its own run-start bookkeeping before the
+	// first event line goes out, so the child's start line carries the second tick
+	// of the pinned clock — a wall-clock millisecond is what this pins out.
+	starts := 0
+	for _, ev := range relayed {
+		if ev["kind"] != "start" {
+			continue
+		}
+		starts++
+		if ts, _ := ev["timestamp"].(float64); int64(ts) != pinnedStart+pinnedStep {
+			t.Errorf("relayed child start timestamp = %v, want the pinned tick %d: %q", ev["timestamp"], pinnedStart+pinnedStep, raw)
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("%d relayed child start lines, want exactly one: %q", starts, raw)
+	}
+
+	// Every relayed line has to sit on the pinned grid, not just the first: one
+	// wall-clock stamp anywhere in the child's stream makes the whole block
+	// uncomparable, which is the property a golden log needs rather than any
+	// particular value.
+	for i, ev := range relayed {
+		ts, ok := ev["timestamp"].(float64)
+		if !ok {
+			t.Fatalf("relayed child line %d (%v) carries no numeric timestamp: %v", i, ev["kind"], ev)
+		}
+		if v := int64(ts); v < pinnedStart || (v-pinnedStart)%pinnedStep != 0 {
+			t.Errorf("relayed child line %d (%v) timestamp = %d, want a tick of the pinned clock %d+%dn: %q", i, ev["kind"], v, pinnedStart, pinnedStep, raw)
+		}
+	}
+
+	// The durations the child derives from that same clock are pinned with it: a
+	// golden log that stamps identically every run but compares a drifting
+	// duration_ms is no more reproducible than one that does not stamp at all.
+	for _, ev := range relayed {
+		if ev["kind"] != "result" {
+			continue
+		}
+		d, ok := ev["duration_ms"].(float64)
+		if !ok {
+			t.Fatalf("relayed child result carries no numeric duration_ms: %v", ev)
+		}
+		if v := int64(d); v <= 0 || v%pinnedStep != 0 {
+			t.Errorf("relayed child result duration_ms = %d, want a positive multiple of the pinned step %d: %q", v, pinnedStep, raw)
+		}
+	}
+	if got := relayed[len(relayed)-1]["kind"]; got != "result" {
+		t.Errorf("last relayed child line kind = %v, want the child's own result: %q", got, raw)
+	}
+}
