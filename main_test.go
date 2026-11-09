@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +38,7 @@ func TestMain(m *testing.M) {
 	// that turns it into one has to sit ahead of every flag parse too — the child
 	// is handed the Driver's argv, never a test flag set.
 	if os.Getenv(subagentHelperEnv) == "1" {
+		pinChildClockFromEnv()
 		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
@@ -45,6 +47,72 @@ func TestMain(m *testing.M) {
 	// otherwise trip over the test flags it is handed.
 	goldenUpdate = flag.Bool("update", false, "rewrite the committed golden artifacts ("+goldenPassPath+") instead of comparing them")
 	os.Exit(m.Run())
+}
+
+// envTestNowMS names the pinned event clock a spawned child Driver is handed
+// through its environment: "<start>:<step>", read by pinChildClockFromEnv in the
+// child branch of TestMain.
+const envTestNowMS = "SPINDRIFT_TEST_NOW_MS"
+
+// pinChildClockFromEnv gives a spawned child Driver the stepping clock
+// pinSteppingClock gives an in-process run, so a golden Pass log can carry a
+// relayed child line byte for byte: the relay keeps the child's own timestamp
+// (relaySubagentOutput), and the environment is the only channel to a child this
+// binary starts — a clock pin has to travel that way or not at all.
+//
+// Unset or unparsable leaves the real clock running rather than failing the
+// child: a bad pin is one test's defect, and the wall-clock stamp it produces
+// fails that test's own timestamp assertion instead of stopping every spawn test
+// from running a real Driver — and a non-positive step counts as unparsable, a
+// frozen or rewinding grid stamping every relayed line identically.
+func pinChildClockFromEnv() {
+	spec, ok := os.LookupEnv(envTestNowMS)
+	if !ok {
+		return
+	}
+	startField, stepField, found := strings.Cut(spec, ":")
+	if !found {
+		return
+	}
+	start, err := strconv.ParseInt(startField, 10, 64)
+	if err != nil {
+		return
+	}
+	step, err := strconv.ParseInt(stepField, 10, 64)
+	if err != nil || step <= 0 {
+		return
+	}
+	nowMS = func() int64 {
+		v := start
+		start += step
+		return v
+	}
+}
+
+// TestPinChildClockFromEnvIgnoresANonPositiveStep: a step of 0 or less takes the
+// unparsable fallback, since a frozen or rewinding grid is no clock to relay.
+func TestPinChildClockFromEnvIgnoresANonPositiveStep(t *testing.T) {
+	for _, spec := range []string{"1700000000000:0", "1700000000000:-100"} {
+		t.Run(spec, func(t *testing.T) {
+			t.Setenv(envTestNowMS, spec)
+			real := nowMS
+			defer func() { nowMS = real }()
+			ticks, i := []int64{1, 2, 3}, 0
+			nowMS = func() int64 {
+				v := ticks[i]
+				if i < len(ticks)-1 {
+					i++
+				}
+				return v
+			}
+			pinChildClockFromEnv()
+			for _, want := range []int64{1, 2} {
+				if got := nowMS(); got != want {
+					t.Errorf("clock after pinChildClockFromEnv(%q) = %d, want the pre-existing clock %d: a step of 0 or less would freeze or rewind every stamp, so the spec must be refused and the clock left alone", spec, got, want)
+				}
+			}
+		})
+	}
 }
 
 func TestRunChatRoundTrip(t *testing.T) {
