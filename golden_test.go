@@ -24,22 +24,36 @@ const goldenPassPath = "testdata/pass.jsonl"
 // artifact that drifted is only actionable if the reader knows how to rewrite it.
 const goldenRegenerateCmd = "go test -run TestGoldenPassLog -update"
 
+// goldenRunDir is the single spelling the artifact gives the run's working
+// directory. The file Tools resolve their path argument through filepath.Abs, so
+// every write/edit tool_target and tool_output names an absolute path — and the
+// Pass writes into a t.TempDir(), which differs per run and per machine. Without
+// this substitution the committed file would record whoever generated it.
+const goldenRunDir = "/golden-run"
+
 // TestGoldenPassLog compares one scripted Pass through the whole Driver against
 // the committed golden byte for byte.
 //
 // The stream is produced in-process — run() into a bytes.Buffer with
-// pinSteppingClock fixing the clock and newScriptedChatServer fixing every
+// pinSteppingClock fixing the clock and newScriptedSSERawServer fixing every
 // response — because the nix check gives the suite bash and coreutils only (no
 // jq, no git, no network), so regeneration cannot shell out.
 //
 // The run is shaped to put every interesting event form in one Pass: a Model
 // call that streams thinking ahead of its prose and then a succeeding bash tool
-// call, three calls with no prose at all (which is why they carry no text event)
-// that send one failing bash command and then the same command verbatim twice
-// more until the repeated-call breaker refuses to run it, then a final answer.
-// That yields start, reasoning, text, usage, tool_call, tool_result in its
-// success, is_error, and refused shapes — the refused one an is_error result with
-// no exit-code line, because no command ran — and result.
+// call; a call whose answer arrives only as chunks, two content deltas and a
+// write call's arguments split across two frames, so the log pins reassembly of
+// both channels; a whole-body call that edits the file that write created; three
+// calls with no prose at all (which is why they carry no text event) that send
+// one failing bash command and then the same command verbatim twice more until
+// the repeated-call breaker refuses to run it; then a final answer. That yields
+// start, reasoning, text, usage, tool_call, tool_result in its success, is_error,
+// and refused shapes — the refused one an is_error result with no exit-code line,
+// because no command ran — and result.
+//
+// The two file Tool pairs report an absolute tool_target, so their path is
+// goldenPassStream's temporary run directory with goldenRunDir substituted for it
+// — the artifact states one path, not the machine that produced it.
 //
 // The error kind is deliberately absent from this artifact: a single Pass cannot
 // both succeed and fail, and issue #27 owns the conformance-shaped log that
@@ -73,21 +87,24 @@ func TestGoldenPassLog(t *testing.T) {
 }
 
 // goldenPassStream drives one Pass and returns its raw stdout. The scripted
-// server supplies five responses; the bash commands are printf-only, one
+// server supplies seven responses; the bash commands are printf-only, one
 // succeeds, one fails, and the same failing command runs a second time before the
 // breaker refuses it on its third consecutive send, so nothing here reads the
-// repo, the clock, or the environment.
+// repo, the clock, or the environment beyond the run directory it writes into.
 //
 // The three failing calls carry distinct tool_calls ids over byte-identical
 // arguments: the repeated-call breaker keys on the tool name and the raw
 // arguments string rather than the id, and the log has to show that instead of
 // having the test assert it.
 //
-// Only the first response is framed by hand: its thinking has to arrive as the
-// delta.reasoning_content chunks a real reasoning endpoint sends, which a whole
-// completion body cannot express. The answers themselves stay whole bodies run
-// through sseChatCompletion, so the frames behind every other event are the ones
-// this artifact has always pinned.
+// Only two responses are framed by hand. The first has to: its thinking arrives as
+// the delta.reasoning_content chunks a real reasoning endpoint sends, which a
+// whole completion body cannot express. The second has to as well: it is the
+// chunked replay, prose split into delta.content fragments and one write call's
+// arguments split across two frames, closed by the usage chunk a streaming
+// endpoint sends last — none of which sseChatCompletion can produce from a whole
+// body. The rest stay whole bodies through that helper, so the frames behind every
+// other event are the ones this artifact has always pinned.
 func goldenPassStream(t *testing.T) []byte {
 	t.Helper()
 	// A stepping clock, not a frozen one: the result event's durations have to be
@@ -96,26 +113,55 @@ func goldenPassStream(t *testing.T) []byte {
 	// second between events, a quarter second per round trip, a several-second run.
 	pinSteppingClock(t, 1700000000000, 250)
 
+	// The file Tools really write and really read back, so they get a directory of
+	// their own rather than the repo this test runs in. Their absolute tool_target is
+	// why the stream is normalised through goldenRunDir before returning.
+	runDir := t.TempDir()
+	notesPath := filepath.Join(runDir, "notes.txt")
+	// %q rather than hand-written escapes: Go's quoting of this body is legal JSON
+	// quoting, so the arguments string needs no second pass to be parseable.
+	writeArgs := fmt.Sprintf(`{"path":%q,"content":%q}`, notesPath, "# spindrift notes\nalpha line\nbeta line\n")
+	editArgs := fmt.Sprintf(`{"path":%q,"old_string":"alpha line","new_string":"ALPHA line, replaced by the edit"}`, notesPath)
+	// The write call's arguments cut at its midpoint: merge() only concatenates
+	// fragments, so the cut can fall anywhere — including inside a \n escape — and
+	// the reassembled arguments still parse to the same call.
+	writeArgsCut := len(writeArgs) / 2
+	const failingArgs = `{"command":"printf 'this one fails'; exit 3"}`
+
 	srv := newScriptedSSERawServer(t,
 		// Call 1: thinking in two fragments (so the event proves accumulation, not
 		// one frame relabelled) ahead of prose with real newlines, which the emitter
 		// must escape rather than trim, plus a bash call that succeeds.
 		sseReasoningFrames("llama-3.1-8b",
 			"reading the tree before saying anything about it; ",
-			"one safe command first, then one allowed to fail")+
+			"one safe command first, then the file work")+
 			sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":104,"completion_tokens":21,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"I will look at the repo first,\nthen report.\n","tool_calls":[{"id":"call_alpha","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'hello world'\"}"}}]}}]}`),
-		// Call 2: no content at all (so no text event, and no thinking either) and a
-		// command that exits 3.
-		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":148,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
-		// Call 3: the same tool name and the same arguments string under a fresh call
+		// Call 2: the chunked replay. Two delta.content fragments make one sentence,
+		// which the text event has to carry joined rather than as two lines; then the
+		// write call arrives as two tool_calls fragments, the id and name only in the
+		// first; then usage on a choices-less chunk of its own.
+		sseStream(
+			`{"model":"llama-3.1-8b","choices":[{"index":0,"delta":{"content":"I will write the notes file now, "}}]}`,
+			`{"choices":[{"index":0,"delta":{"content":"then patch one line of it."}}]}`,
+			fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_write","type":"function","function":{"name":"write","arguments":%q}}]}}]}`, writeArgs[:writeArgsCut]),
+			fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":%q}}]},"finish_reason":"tool_calls"}]}`, writeArgs[writeArgsCut:]),
+			`{"model":"llama-3.1-8b","choices":[],"usage":{"prompt_tokens":152,"completion_tokens":34}}`,
+		),
+		// Call 3: no content at all (so no text event) and the edit of the file call 2
+		// wrote — one old_string match, so replace_all stays off the arguments.
+		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":196,"completion_tokens":24},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_edit","type":"function","function":{"name":"edit","arguments":%q}}]}}]}`, editArgs)),
+		// Call 4: a command that exits 3.
+		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":240,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		// Call 5: the same tool name and the same arguments string under a fresh call
 		// id, so the breaker is only at two in a row and the command really runs again.
-		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":192,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
-		// Call 4: identical a third time, so the breaker refuses it — the synthetic
-		// Tool Result this log pins, handed out without bash ever being reached.
-		sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":236,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_3","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'this one fails'; exit 3\"}"}}]}}]}`),
-		// Call 5: the final answer, from a different model id, reporting cache read
-		// in the OpenAI spelling.
-		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":268,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Ran both commands; the second failed with exit code 3."}}]}`),
+		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":284,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_2","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		// Call 6: identical a third time, so the breaker refuses it — the synthetic
+		// Tool Result this log pins, handed out without bash ever being reached. One
+		// refusal only: a third in a row would end the run on an error event.
+		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":328,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_3","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		// Call 7: the final answer, from a different model id, reporting cache read in
+		// the OpenAI spelling.
+		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":372,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Wrote and edited notes.txt; the repeated command failed with exit code 3 and its third send was refused."}}]}`),
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -123,10 +169,15 @@ func goldenPassStream(t *testing.T) []byte {
 	if code != 0 {
 		t.Fatalf("golden Pass exited %d, want 0; stderr = %q", code, stderr.String())
 	}
-	if got := srv.requestBodies(t); len(got) != 5 {
-		t.Fatalf("golden Pass made %d Model call(s), want 5", len(got))
+	if got := srv.requestBodies(t); len(got) != 7 {
+		t.Fatalf("golden Pass made %d Model call(s), want 7", len(got))
 	}
-	return stdout.Bytes()
+	// The file Tools resolve their path argument to an absolute path, so runDir is
+	// written into every write and edit tool_target and tool_output. It is a
+	// t.TempDir(), which differs between runs and between machines: swapping it for
+	// goldenRunDir here — before both the -update write below and the byte compare —
+	// is what lets one committed artifact hold on any host.
+	return bytes.ReplaceAll(stdout.Bytes(), []byte(runDir), []byte(goldenRunDir))
 }
 
 // sseReasoningFrames scripts thinking as the delta.reasoning_content chunks a
@@ -173,6 +224,8 @@ func assertStreamContract(t *testing.T, raw []byte) {
 
 	wantKinds := []string{
 		"start", "reasoning", "text", "usage", "tool_call", "tool_result",
+		"start", "text", "usage", "tool_call", "tool_result",
+		"start", "usage", "tool_call", "tool_result",
 		"start", "usage", "tool_call", "tool_result",
 		"start", "usage", "tool_call", "tool_result",
 		"start", "usage", "tool_call", "tool_result",
@@ -182,9 +235,17 @@ func assertStreamContract(t *testing.T, raw []byte) {
 		t.Fatalf("kind sequence = %s, want %s", strings.Join(kinds, ","), strings.Join(wantKinds, ","))
 	}
 
-	// The three tool_result shapes the golden exists to pin: one clean, one is_error
-	// reporting a real exit code, and one is_error refusal that never ran and so
-	// carries no exit-code line at all.
+	// The artifact is machine-bound the moment the run's own directory survives into
+	// it, and the only paths a Pass can report come from the file Tools — so a line
+	// naming the test that made the temp dir means normalisation did not happen.
+	if strings.Contains(string(raw), t.Name()) {
+		t.Errorf("the stream names %q, so the run directory was not normalised to %s", t.Name(), goldenRunDir)
+	}
+
+	// The three tool_result shapes the golden exists to pin: clean ones — a command
+	// that exited 0 and the two file Tools reporting a sentence rather than command
+	// output — one is_error reporting a real exit code, and one is_error refusal that
+	// never ran and so carries no exit-code line at all.
 	var failed, clean, refused int
 	for _, ev := range events {
 		if ev["kind"] != "tool_result" {
@@ -207,15 +268,34 @@ func assertStreamContract(t *testing.T, raw []byte) {
 			refused++
 		}
 	}
-	if clean != 1 || failed != 3 {
-		t.Errorf("tool_result shapes = %d clean and %d is_error, want 1 clean and 3 is_error", clean, failed)
+	if clean != 3 || failed != 3 {
+		t.Errorf("tool_result shapes = %d clean and %d is_error, want 3 clean and 3 is_error", clean, failed)
 	}
 	if refused != 1 {
 		t.Errorf("%d tool_result(s) read as the synthetic refusal, want exactly one: is_error true, no exit code: line, and text asking for a different action", refused)
 	}
 
+	// The file Tool pairs the widened scenario exists to pin: one write and one edit
+	// of the same file, each as a tool_call/tool_result pair whose tool_target is the
+	// normalised absolute path — the proof that the substitution ran, since a real
+	// temp path here would differ on the next machine to regenerate.
+	var fileToolLines int
+	for _, ev := range events {
+		name, _ := ev["tool_name"].(string)
+		if (ev["kind"] != "tool_call" && ev["kind"] != "tool_result") || (name != "write" && name != "edit") {
+			continue
+		}
+		fileToolLines++
+		if wantTarget := goldenRunDir + "/notes.txt"; ev["tool_target"] != wantTarget {
+			t.Errorf("%s %s tool_target = %v, want %s", ev["kind"], name, ev["tool_target"], wantTarget)
+		}
+	}
+	if fileToolLines != 4 {
+		t.Errorf("%d file Tool lines, want 4: the write and the edit, each as a tool_call/tool_result pair", fileToolLines)
+	}
+
 	result := events[len(events)-1]
-	if turns, _ := result["num_turns"].(float64); int(turns) != 5 {
+	if turns, _ := result["num_turns"].(float64); int(turns) != 7 {
 		t.Errorf("result num_turns = %v, want 5 Model calls", result["num_turns"])
 	}
 	for _, name := range []string{"duration_ms", "duration_api_ms"} {
@@ -224,12 +304,13 @@ func assertStreamContract(t *testing.T, raw []byte) {
 		}
 	}
 	tokens, _ := result["tokens"].(map[string]any)
-	// 104+148+192+236+268 input, 21+18+18+18+12 output, 64 (llama.cpp spelling) +
-	// 25 (OpenAI details spelling) cache read, summed by the Driver from the usage
-	// events — the refused call included, since the Model was charged for it.
-	for name, want := range map[string]float64{"input": 948, "output": 87, "cache_read": 89} {
+	// 104+152+196+240+284+328+372 input, 21+34+24+18+18+18+12 output, and 64
+	// (llama.cpp spelling) + 25 (OpenAI details spelling) cache read, summed by the
+	// Driver from the usage events — the refused call included, since the Model was
+	// charged for it.
+	for name, want := range map[string]float64{"input": 1676, "output": 145, "cache_read": 89} {
 		if got, _ := tokens[name].(float64); got != want {
-			t.Errorf("result tokens[%s] = %v, want the five calls summed to %v", name, tokens[name], want)
+			t.Errorf("result tokens[%s] = %v, want the seven calls summed to %v", name, tokens[name], want)
 		}
 	}
 	models, _ := result["models"].([]any)
