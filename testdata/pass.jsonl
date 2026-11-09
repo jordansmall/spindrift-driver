@@ -14,18 +14,32 @@
 {"kind":"tool_call","message_id":"msg-3","timestamp":1700000005000,"tool_id":"call_edit","tool_name":"edit","tool_input":{"new_string":"ALPHA line, replaced by the edit","old_string":"alpha line","path":"/golden-run/notes.txt"},"tool_target":"/golden-run/notes.txt"}
 {"kind":"tool_result","message_id":"msg-3","timestamp":1700000005250,"tool_id":"call_edit","tool_name":"edit","tool_target":"/golden-run/notes.txt","tool_output":"edited /golden-run/notes.txt: replaced 1 match"}
 {"kind":"start","message_id":"msg-4","timestamp":1700000005500}
-{"kind":"usage","message_id":"msg-4","timestamp":1700000006250,"model":"llama-3.1-8b","tokens":{"input":240,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"tool_call","message_id":"msg-4","timestamp":1700000006500,"tool_id":"call_beta","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
-{"kind":"tool_result","message_id":"msg-4","timestamp":1700000006750,"tool_id":"call_beta","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
+{"kind":"usage","message_id":"msg-4","timestamp":1700000006250,"model":"llama-3.1-8b","tokens":{"input":240,"output":16,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-4","timestamp":1700000006500,"tool_id":"call_spawn_reviewer","tool_name":"subagent","tool_input":{"agent":"reviewer","task":"review the notes file for regressions"},"tool_target":"reviewer"}
+{"in_subagent":true,"kind":"start","message_id":"msg-1","role":"reviewer","timestamp":1700000000100}
+{"in_subagent":true,"kind":"text","message_id":"msg-1","role":"reviewer","text":"Reviewed the notes file: the heading is intact and the replaced line reads cleanly; no blockers.","timestamp":1700000000400}
+{"in_subagent":true,"kind":"usage","message_id":"msg-1","model":"m-reviewer","role":"reviewer","timestamp":1700000000500,"tokens":{"input":512,"output":32,"cache_read":64,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"duration_api_ms":100,"duration_ms":600,"in_subagent":true,"kind":"result","models":["m-reviewer"],"num_turns":1,"role":"reviewer","text":"Reviewed the notes file: the heading is intact and the replaced line reads cleanly; no blockers.","timestamp":1700000000700,"tokens":{"input":512,"output":32,"cache_read":64,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_result","message_id":"msg-4","timestamp":1700000006750,"tool_id":"call_spawn_reviewer","tool_name":"subagent","tool_target":"reviewer","subagent":"reviewer","tool_output":"Reviewed the notes file: the heading is intact and the replaced line reads cleanly; no blockers."}
 {"kind":"start","message_id":"msg-5","timestamp":1700000007000}
-{"kind":"usage","message_id":"msg-5","timestamp":1700000007750,"model":"llama-3.1-8b","tokens":{"input":284,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"tool_call","message_id":"msg-5","timestamp":1700000008000,"tool_id":"call_beta_2","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
-{"kind":"tool_result","message_id":"msg-5","timestamp":1700000008250,"tool_id":"call_beta_2","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
+{"kind":"usage","message_id":"msg-5","timestamp":1700000007750,"model":"llama-3.1-8b","tokens":{"input":284,"output":16,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-5","timestamp":1700000008000,"tool_id":"call_spawn_scout","tool_name":"subagent","tool_input":{"agent":"scout","task":"survey the repository tree"},"tool_target":"scout"}
+{"in_subagent":true,"kind":"start","message_id":"msg-1","role":"scout","timestamp":1700000000100}
+{"in_subagent":true,"kind":"error","reset_at":1787274123000,"role":"scout","text":"server returned 429 Too Many Requests: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"m-scout is over its quota\"}}","timestamp":1700000000500}
+{"kind":"tool_result","message_id":"msg-5","timestamp":1700000008250,"tool_id":"call_spawn_scout","tool_name":"subagent","tool_target":"scout","subagent":"scout","tool_output":"error: subagent \"scout\" failed: exit status 1","is_error":true}
 {"kind":"start","message_id":"msg-6","timestamp":1700000008500}
 {"kind":"usage","message_id":"msg-6","timestamp":1700000009250,"model":"llama-3.1-8b","tokens":{"input":328,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"tool_call","message_id":"msg-6","timestamp":1700000009500,"tool_id":"call_beta_3","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
-{"kind":"tool_result","message_id":"msg-6","timestamp":1700000009750,"tool_id":"call_beta_3","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"error: bash was already called 2 times in a row with these exact arguments, so it was not run again; take a different action","is_error":true}
+{"kind":"tool_call","message_id":"msg-6","timestamp":1700000009500,"tool_id":"call_beta","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
+{"kind":"tool_result","message_id":"msg-6","timestamp":1700000009750,"tool_id":"call_beta","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
 {"kind":"start","message_id":"msg-7","timestamp":1700000010000}
-{"kind":"text","message_id":"msg-7","timestamp":1700000010750,"text":"Wrote and edited notes.txt; the repeated command failed with exit code 3 and its third send was refused."}
-{"kind":"usage","message_id":"msg-7","timestamp":1700000011000,"model":"qwen2.5-coder","tokens":{"input":372,"output":12,"cache_read":25,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
-{"kind":"result","timestamp":1700000011500,"text":"Wrote and edited notes.txt; the repeated command failed with exit code 3 and its third send was refused.","tokens":{"input":1676,"output":145,"cache_read":89,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0},"duration_ms":11250,"duration_api_ms":1750,"num_turns":7,"models":["llama-3.1-8b","qwen2.5-coder"]}
+{"kind":"usage","message_id":"msg-7","timestamp":1700000010750,"model":"llama-3.1-8b","tokens":{"input":372,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-7","timestamp":1700000011000,"tool_id":"call_beta_2","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
+{"kind":"tool_result","message_id":"msg-7","timestamp":1700000011250,"tool_id":"call_beta_2","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"this one fails\nexit code: 3","is_error":true}
+{"kind":"start","message_id":"msg-8","timestamp":1700000011500}
+{"kind":"usage","message_id":"msg-8","timestamp":1700000012250,"model":"llama-3.1-8b","tokens":{"input":416,"output":18,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"tool_call","message_id":"msg-8","timestamp":1700000012500,"tool_id":"call_beta_3","tool_name":"bash","tool_input":{"command":"printf 'this one fails'; exit 3"},"tool_target":"printf 'this one fails'; exit 3"}
+{"kind":"tool_result","message_id":"msg-8","timestamp":1700000012750,"tool_id":"call_beta_3","tool_name":"bash","tool_target":"printf 'this one fails'; exit 3","tool_output":"error: bash was already called 2 times in a row with these exact arguments, so it was not run again; take a different action","is_error":true}
+{"kind":"start","message_id":"msg-9","timestamp":1700000013000}
+{"kind":"text","message_id":"msg-9","timestamp":1700000013750,"text":"Wrote and edited notes.txt and delegated a review; the repeated command failed with exit code 3 and its third send was refused."}
+{"kind":"usage","message_id":"msg-9","timestamp":1700000014000,"model":"qwen2.5-coder","tokens":{"input":460,"output":12,"cache_read":25,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0}}
+{"kind":"result","timestamp":1700000014500,"text":"Wrote and edited notes.txt and delegated a review; the repeated command failed with exit code 3 and its third send was refused.","tokens":{"input":3064,"output":209,"cache_read":153,"cache_write_5m":0,"cache_write_1h":0,"cost_usd":0},"duration_ms":14250,"duration_api_ms":2250,"num_turns":9,"models":["llama-3.1-8b","m-reviewer","qwen2.5-coder"]}
