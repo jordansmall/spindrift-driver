@@ -32,6 +32,11 @@ type modelEntry struct {
 	headers map[string]string
 	// body is the rejection body, written verbatim.
 	body string
+	// dropAfter marks the entry a connection dropped mid-body: it holds the raw
+	// frames that go out first, after which the connection is torn down under the
+	// client the way a proxy dying mid-stream does. Non-empty wins over frames, and
+	// such an entry carries no status because the reply started successfully.
+	dropAfter string
 }
 
 // replyFrames scripts one answer as raw SSE frames.
@@ -40,6 +45,10 @@ func replyFrames(frames string) modelEntry { return modelEntry{frames: frames} }
 // replyCompletion scripts one answer as a whole completion body, served as the
 // streaming frames the same answer arrives in.
 func replyCompletion(body string) modelEntry { return modelEntry{completion: body} }
+
+// dropAfterFrames scripts one answer as raw frames that reach the client before
+// the connection is dropped, so the stream is truncated rather than completed.
+func dropAfterFrames(frames string) modelEntry { return modelEntry{dropAfter: frames} }
 
 // reject scripts the endpoint refusing one request: the status, the refusal
 // headers and the error body, none of them reshaped.
@@ -91,6 +100,18 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 			// Written out by hand rather than through http.Error: that helper appends a
 			// newline, and the rejection body reaches the error event verbatim.
 			io.WriteString(w, entry.body)
+		case entry.dropAfter != "":
+			// Through writeSSE rather than a bare Write so the frames are flushed and
+			// therefore provably with the client before the tear down.
+			writeSSE(w, entry.dropAfter)
+			// This runs on the server's goroutine, so t.Errorf is all a failure here can
+			// report through; t.Fatalf would panic outside the test.
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("scripted drop cannot hijack the connection to close it: %v", err)
+				return
+			}
+			conn.Close()
 		default:
 			writeSSE(w, entry.sseBody())
 		}
@@ -408,4 +429,50 @@ func TestScriptedModelServerSingleQueueAnswersEntriesInOrder(t *testing.T) {
 func streamedText(frames string) string {
 	content, _ := streamedContent(frames)
 	return content
+}
+
+// A dropped entry scripts the flaky endpoint: the frames written before the tear
+// down really reach the client (writeSSE flush included) and the body then ends in
+// a read error instead of a clean EOF, so a run reads a truncated stream rather
+// than mistaking the cut short body for a finished answer.
+func TestScriptedModelServerDropAfterFramesClosesTheConnectionMidBody(t *testing.T) {
+	frames := sseFrame(textChunk("half an answer"))
+
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {dropAfterFrames(frames)},
+	})
+
+	status, contentType, body, err := postModelTruncated(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want 200", status)
+	}
+	if contentType != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", contentType)
+	}
+	if err == nil {
+		t.Errorf("body read error = nil, want the connection torn down mid-body; body = %q", body)
+	}
+	if body != frames {
+		t.Errorf("bytes delivered before the drop = %q, want the flushed frames %q", body, frames)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Errorf("body = %q, want no done marker: a dropped stream does not complete", body)
+	}
+	if n := len(s.requestBodies(t)); n != 1 {
+		t.Errorf("recorded %d request bodies, want 1", n)
+	}
+}
+
+// postModelTruncated posts and reports whatever the body delivered together with
+// the error that ended the read: for a dropped connection the error is the result
+// under test, so it cannot be the t.Fatalf postModel treats it as.
+func postModelTruncated(t *testing.T, url, body string) (int, string, string, error) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, resp.Header.Get("Content-Type"), string(raw), err
 }
