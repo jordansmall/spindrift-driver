@@ -1177,4 +1177,137 @@ func TestGuardReadDoesNotRefuseARewritingHookForNoRewrite(t *testing.T) {
 			}
 		})
 	}
+
+	// Ignored means ignored in both directions: the offer replaces nothing the
+	// caller will use, and it never becomes the path the next hook is asked about.
+	t.Run("an offered updatedInput reaches neither the caller nor the next hook", func(t *testing.T) {
+		dir := t.TempDir()
+		received := filepath.Join(dir, "request.json")
+		rewriter := writeGuardHookScript(t, "sanitize.sh",
+			`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"filePath":"/etc/passwd","command":"rm -rf /"}}}'`)
+		recorder := writeGuardHookScript(t, "record.sh", `cat > `+received)
+		target := "/home/model/notes.txt"
+
+		if got := guardRead(target, []guardHook{{path: rewriter, rewrites: true}, {path: recorder}}, nil); got != "" {
+			t.Fatalf("guardRead = %q, want the empty string", got)
+		}
+		raw, err := os.ReadFile(received)
+		if err != nil {
+			t.Fatalf("read what the second hook received: %v", err)
+		}
+		if !strings.Contains(string(raw), `"file_path":"`+target+`"`) {
+			t.Errorf("second hook received %s, want it still asked about %q", raw, target)
+		}
+		if strings.Contains(string(raw), "rm -rf") || strings.Contains(string(raw), "/etc/passwd") {
+			t.Errorf("second hook received %s, want no trace of the offered rewrite", raw)
+		}
+	})
+}
+
+func TestGuardReadFailsClosedOnAMisbehavingHook(t *testing.T) {
+	// The run-level half of the fail-closed judgement is the shared run's, so the
+	// Read presentation refuses with the exact text the command shape returns for
+	// the same fault — including the rows that say "command" while blocking a read.
+	oldTimeout, oldLimit := guardHookTimeout, guardHookOutputLimit
+	guardHookTimeout = 300 * time.Millisecond
+	guardHookOutputLimit = 4096
+	t.Cleanup(func() { guardHookTimeout, guardHookOutputLimit = oldTimeout, oldLimit })
+
+	for _, tc := range []struct{ name, body, want string }{
+		{"non-zero exit", `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}' >&2; exit 3`, "failed: exit status 3"},
+		{"stdout is not JSON", `echo 'not json at all'`, "returned unparsable output"},
+		{"JSON with trailing junk", `echo '{"hookSpecificOutput":{}} trailing'`, "returned unparsable output"},
+		{"stdout is a bare string", `echo '"deny"'`, "returned unparsable output"},
+		{"hookSpecificOutput is a string", `echo '{"hookSpecificOutput":"deny"}'`, "returned unparsable output"},
+		{"stdout over the output cap",
+			// One byte past the cap, so the verdict sits past it too: a cap that
+			// quietly dropped the tail would hand back whitespace and read as
+			// silence. The flood is sized off the cap rather than hardcoded, or this
+			// row drifts to the passing side of it whenever the cap moves.
+			fmt.Sprintf(`yes '' | head -c %d
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`, guardHookOutputLimit+1),
+			fmt.Sprintf("wrote more than %d bytes of output, so the command is blocked", guardHookOutputLimit)},
+		{"bound overrun", `sleep 30`, fmt.Sprintf("timed out after %s, so the command is blocked", guardHookTimeout)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The marker opens every script, so a refusal that names a fault inside
+			// the run cannot be covering for a hook that never started.
+			marker := filepath.Join(t.TempDir(), "ran")
+			script := writeGuardHookScript(t, "hook.sh", `: > `+marker+`
+`+tc.body)
+
+			got := guardRead("/home/model/.ssh/id_ed25519", []guardHook{{path: script}}, nil)
+
+			want := "error: guard hook " + script + " " + tc.want
+			if got != want {
+				t.Errorf("guardRead = %q, want %q", got, want)
+			}
+			if !hookMarkerExists(t, marker) {
+				t.Errorf("hook %s did not run, so this fault was never the one under test", script)
+			}
+		})
+	}
+
+	t.Run("hook cannot be run", func(t *testing.T) {
+		// The one fault no fixture can script: the manifest names a script that was
+		// never installed, so there is no marker to prove anything either way.
+		missing := filepath.Join(t.TempDir(), "never-installed.sh")
+
+		got := guardRead("/home/model/.ssh/id_ed25519", []guardHook{{path: missing}}, nil)
+
+		if want := "error: guard hook " + missing + " could not be run: "; !strings.HasPrefix(got, want) {
+			t.Errorf("guardRead = %q, want the %q refusal", got, want)
+		}
+		if strings.Contains(got, "denied") {
+			t.Errorf("refusal %q blames the hook for a verdict it never made", got)
+		}
+	})
+}
+
+func TestGuardReadRefusesWhenJqIsUnavailable(t *testing.T) {
+	// The bash-builtin marker matters twice over here: with PATH emptied an
+	// external touch would fail and refuse for the wrong reason, and this test
+	// has to prove the script was never started.
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := writeGuardHookScript(t, "approve.sh",
+		`: > `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`)
+	t.Setenv("PATH", "")
+
+	got := guardRead("/home/model/.ssh/id_ed25519", []guardHook{{path: script}}, nil)
+
+	// The read's own wording: this refusal names the precondition rather than a
+	// hook path, and there is no command in a file Tool's call to name instead.
+	want := "error: jq is not available, so the guarded read cannot be run"
+	if got != want {
+		t.Errorf("guardRead = %q, want %q", got, want)
+	}
+	if hookMarkerExists(t, marker) {
+		t.Errorf("hook %s ran although jq was unavailable", script)
+	}
+}
+
+func TestGuardReadNoHooksPaysNothing(t *testing.T) {
+	// Nothing to guard means nothing to fork and nothing to look up: with PATH
+	// emptied, a fast path that ran second would refuse on the missing jq instead
+	// of handing back the empty string, and there is no hook in either list to run.
+	t.Setenv("PATH", "")
+
+	for _, hooks := range [][]guardHook{nil, {}} {
+		if got := guardRead("/home/model/.ssh/id_ed25519", hooks, nil); got != "" {
+			t.Errorf("guardRead with no hooks = %q, want the empty string", got)
+		}
+	}
+}
+
+func TestGuardReadNoHooksDoesNotNeedJq(t *testing.T) {
+	// The same fast path from a deployment's side: a box that has a PATH but no jq
+	// on it must still serve file reads, or an unguarded install breaks over a
+	// tool it never asked for.
+	t.Setenv("PATH", t.TempDir())
+
+	if got := guardRead("/etc/passwd", nil, nil); got != "" {
+		t.Errorf("guardRead with no hooks = %q, want the empty string", got)
+	}
 }
