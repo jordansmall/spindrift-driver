@@ -198,22 +198,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		{Role: "system", Content: sys},
 		{Role: "user", Content: cfg.prompt},
 	}
-	// Run bookkeeping for the result event, all of it local: the Model-call
-	// index (which is the msg-<n> id every event of that call shares), the
-	// instant the run began, the accumulated round-trip milliseconds, the summed
-	// token tally and the set of model ids that answered.
-	call := 0
+	// Run bookkeeping for the result event is the one tally: the Model-call index
+	// (which is the msg-<n> id every event of that call shares), the accumulated
+	// round-trip milliseconds, the token tally and the model ids that answered.
+	tally := newRunTally()
 	// toolSeq counts Tool Calls across the whole run, so a server that sends no
 	// call id still gets pair keys that stay unique turn after turn.
 	toolSeq := 0
 	runStart := nowMS()
-	var apiMS int64
-	var totals tokenTotals
-	// delegated sums what the child Drivers this run spawns spend, kept apart from
-	// the parent's own tally so its usage events stay one per own Model call.
-	var delegated tokenTotals
-	seenModels := map[string]struct{}{}
-	sess := session{cfg: cfg, events: events, stderr: stderr, delegated: &delegated, models: seenModels}
+	sess := session{cfg: cfg, events: events, stderr: stderr, delegated: &tally.delegated, models: tally.models}
 	// Repeated-call breaker state: the last call seen and how many times in a row.
 	// These are run() locals rather than package counters because a package counter
 	// would carry across every run() in one process, and the state is per run.
@@ -223,14 +216,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// actually ran means the Model changed course, so the count starts over.
 	refusals := 0
 	for turn := 0; turn < cfg.maxTurns; turn++ {
-		call++
-		messageID := fmt.Sprintf("msg-%d", call)
+		tally.recordCall()
+		messageID := fmt.Sprintf("msg-%d", tally.calls)
 		// start goes out before the request exists, so its timestamp precedes the
 		// first byte and its message id can only be Driver-assigned (#20).
 		_ = events.emit(event{Kind: "start", MessageID: messageID})
 		apiStart := nowMS()
 		reply, err := sendChat(cfg, messages, stderr)
-		apiMS += nowMS() - apiStart
+		tally.addAPITime(nowMS() - apiStart)
 		if err != nil {
 			// A call that failed has no usage to report, so the stream stops at
 			// start here; errorExit adds the error event.
@@ -250,8 +243,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			_ = events.emit(event{Kind: "text", MessageID: messageID, Text: assistant.Content})
 		}
 		callTokens := reply.Tokens
-		totals = totals.add(callTokens)
-		seenModels[reply.Model] = struct{}{}
+		tally.addOwnUsage(reply.Model, callTokens)
 		// Exactly one usage per Model call and never a running total: the reader
 		// sums these, and a message id is what lets it dedup.
 		_ = events.emit(event{Kind: "usage", MessageID: messageID, Model: reply.Model, Tokens: &callTokens})
@@ -261,11 +253,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			_ = events.emitResult(resultPayload{
 				Kind:          "result",
 				Text:          assistant.Content,
-				NumTurns:      call,
+				NumTurns:      tally.calls,
 				DurationMs:    nowMS() - runStart,
-				DurationAPIMs: apiMS,
-				Tokens:        totals.add(delegated),
-				Models:        sortedModelIDs(seenModels),
+				DurationAPIMs: tally.apiMS,
+				Tokens:        tally.totals(),
+				Models:        tally.modelIDs(),
 			})
 			return 0
 		}
