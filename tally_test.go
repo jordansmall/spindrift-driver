@@ -69,7 +69,7 @@ func TestRunTallyOwnUsageRecordsModelUnconditionally(t *testing.T) {
 func TestRunTallyRelayedUsageFoldsIntoDelegated(t *testing.T) {
 	tally := newRunTally()
 	tally.addOwnUsage("m-parent", tokenTotals{Input: 100, Output: 20})
-	tally.addRelayedUsage(relayedUsageFields(`{"input":7,"output":1,"cost_usd":0.25}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":7,"output":1,"cost_usd":0.25}`, `"m-reviewer"`))
 
 	if got, want := tally.delegated, (tokenTotals{Input: 7, Output: 1, CostUSD: 0.25}); got != want {
 		t.Errorf("delegated tally = %+v, want %+v", got, want)
@@ -89,8 +89,8 @@ func TestRunTallyRelayedUsageFoldsIntoDelegated(t *testing.T) {
 // event at all, and the spend it already made is real.
 func TestRunTallyChargesChildThatReportedNoResult(t *testing.T) {
 	tally := newRunTally()
-	tally.addRelayedUsage(relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
-	tally.addRelayedUsage(relayedUsageFields(`{"input":3,"output":2,"cache_read":8}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":3,"output":2,"cache_read":8}`, `"m-reviewer"`))
 
 	if got, want := tally.totals(), (tokenTotals{Input: 10, Output: 3, CacheRead: 8}); got != want {
 		t.Errorf("totals() = %+v, want both usage-only child calls charged as %+v", got, want)
@@ -102,10 +102,10 @@ func TestRunTallyChargesChildThatReportedNoResult(t *testing.T) {
 // so reading its tokens too would bill the same tokens twice.
 func TestRunTallyIgnoresChildResultTotals(t *testing.T) {
 	tally := newRunTally()
-	tally.addRelayedUsage(relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
 	baseline := tally.totals()
 
-	tally.addRelayedUsage(relayedEventFields(map[string]string{
+	tally.addRelayedUsage("result", relayedEventFields(map[string]string{
 		"kind":   `"result"`,
 		"tokens": `{"input":9000,"output":9000,"cost_usd":99}`,
 		"model":  `"m-reviewer"`,
@@ -116,7 +116,7 @@ func TestRunTallyIgnoresChildResultTotals(t *testing.T) {
 
 	// A run whose only child line was a result event charged nothing at all.
 	fresh := newRunTally()
-	fresh.addRelayedUsage(relayedEventFields(map[string]string{"kind": `"result"`, "tokens": `{"input":9000}`}))
+	fresh.addRelayedUsage("result", relayedEventFields(map[string]string{"kind": `"result"`, "tokens": `{"input":9000}`}))
 	if got := fresh.totals(); got != (tokenTotals{}) {
 		t.Errorf("totals() = %+v, want a result-only child line to contribute nothing", got)
 	}
@@ -138,7 +138,7 @@ func TestRunTallyMalformedRelayedTokensContributeNothing(t *testing.T) {
 		tally.addOwnUsage("m-parent", tokenTotals{Input: 100, Output: 20})
 		before := tally.totals()
 
-		tally.addRelayedUsage(relayedUsageFields(tokens, `"m-reviewer"`))
+		tally.addRelayedUsage("usage", relayedUsageFields(tokens, `"m-reviewer"`))
 
 		if tally.delegated != (tokenTotals{}) {
 			t.Errorf("%s tokens: delegated tally = %+v, want nothing folded", name, tally.delegated)
@@ -156,14 +156,14 @@ func TestRunTallyMalformedRelayedTokensContributeNothing(t *testing.T) {
 
 func TestRunTallyModelIDsAreSortedAndRejectUnusableOnes(t *testing.T) {
 	tally := newRunTally()
-	tally.addRelayedUsage(relayedUsageFields(`{"input":1}`, `"m-reviewer"`))
-	tally.addRelayedUsage(relayedUsageFields(`{"input":1}`, `"m-planner"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":1}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":1}`, `"m-planner"`))
 	// An empty relayed model id is a key the child never filled, not a model: the
 	// result event's set would gain a blank entry a host cannot attribute.
-	tally.addRelayedUsage(relayedUsageFields(`{"input":1}`, `""`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":1}`, `""`))
 	// A model id of the wrong type is unusable the same way malformed tokens are.
-	tally.addRelayedUsage(relayedEventFields(map[string]string{"kind": `"usage"`, "tokens": `{"input":1}`, "model": `42`}))
-	tally.addRelayedUsage(relayedEventFields(map[string]string{"kind": `"usage"`, "tokens": `{"input":1}`}))
+	tally.addRelayedUsage("usage", relayedEventFields(map[string]string{"kind": `"usage"`, "tokens": `{"input":1}`, "model": `42`}))
+	tally.addRelayedUsage("usage", relayedEventFields(map[string]string{"kind": `"usage"`, "tokens": `{"input":1}`}))
 
 	if got, want := tally.modelIDs(), []string{"m-planner", "m-reviewer"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("modelIDs() = %v, want %v sorted with the blank and non-string ids excluded", got, want)
@@ -171,11 +171,11 @@ func TestRunTallyModelIDsAreSortedAndRejectUnusableOnes(t *testing.T) {
 }
 
 // TestRunTallyIgnoresRelayedKindsThatAreNotUsage: the tally listens for usage
-// only — prose, tool results and errors carry no spend to fold.
+// only — prose, tool results, errors and a kind that is not a string carry nothing.
 func TestRunTallyIgnoresRelayedKindsThatAreNotUsage(t *testing.T) {
 	tally := newRunTally()
 	for _, kind := range []string{"start", "reasoning", "text", "tool_call", "tool_result", "error", ""} {
-		tally.addRelayedUsage(relayedEventFields(map[string]string{
+		tally.addRelayedUsage(kind, relayedEventFields(map[string]string{
 			"kind":   `"` + kind + `"`,
 			"tokens": `{"input":5,"output":5}`,
 			"model":  `"m-stray"`,
@@ -216,7 +216,7 @@ func TestRunTallyProjectionFeedsResultPayload(t *testing.T) {
 	tally.recordCall()
 	tally.addAPITime(40)
 	tally.addOwnUsage("m-parent", tokenTotals{Input: 100, Output: 20})
-	tally.addRelayedUsage(relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
+	tally.addRelayedUsage("usage", relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
 
 	payload := resultPayload{
 		Kind:          "result",

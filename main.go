@@ -145,9 +145,7 @@ func (t *runTally) addOwnUsage(model string, tokens tokenTotals) {
 //
 // A tokens or model value the child spelled wrong is skipped rather than
 // fatal — one odd line on a child's stream is never a reason to fail the run.
-func (t *runTally) addRelayedUsage(fields map[string]json.RawMessage) {
-	var kind string
-	_ = json.Unmarshal(fields["kind"], &kind)
+func (t *runTally) addRelayedUsage(kind string, fields map[string]json.RawMessage) {
 	if kind != "usage" {
 		return
 	}
@@ -171,6 +169,34 @@ func (t *runTally) totals() tokenTotals { return t.own.add(t.delegated) }
 // modelIDs is the set-to-sorted projection the result event reads, so the stream
 // stays byte-stable instead of following map iteration order.
 func (t *runTally) modelIDs() []string { return sortedModelIDs(t.models) }
+
+// relayFunc is the whole reach a Subagent Tool has into the run: put one of the
+// child's event lines onto its stream attributed to that child, and charge the
+// line to the tally. kind is the caller's own decode of the line's kind field:
+// the relay does not read it again.
+type relayFunc func(agentName, kind string, fields map[string]json.RawMessage)
+
+// relayChildEvent builds a relayFunc around a writer and a tally. It stays a closure
+// because that is the only handle to the tally a Tool ever holds: the session is
+// copied into a plan closure, and the fold must still land on this one tally.
+//
+// The line goes through encode and never emit: emit restamps the clock, and the
+// child's own timestamp is the fact worth keeping. It goes as the child's raw
+// fields rather than through the event struct, which would drop every field it
+// lacks; re-encoding a map sorts its keys, so a relayed line is not byte-identical
+// to the child's own — the values are, the key order is not.
+func relayChildEvent(events eventWriter, tally *runTally) relayFunc {
+	return func(agentName, kind string, fields map[string]json.RawMessage) {
+		relayed := make(map[string]any, len(fields)+2)
+		for k, v := range fields {
+			relayed[k] = v
+		}
+		relayed["role"] = agentName
+		relayed["in_subagent"] = true
+		_ = events.encode(relayed)
+		tally.addRelayedUsage(kind, fields)
+	}
+}
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
@@ -206,7 +232,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// call id still gets pair keys that stay unique turn after turn.
 	toolSeq := 0
 	runStart := nowMS()
-	sess := session{cfg: cfg, events: events, stderr: stderr, delegated: &tally.delegated, models: tally.models}
+	sess := session{cfg: cfg, stderr: stderr, relay: relayChildEvent(events, tally)}
 	// Repeated-call breaker state: the last call seen and how many times in a row.
 	// These are run() locals rather than package counters because a package counter
 	// would carry across every run() in one process, and the state is per run.
@@ -427,18 +453,17 @@ type toolPlan struct {
 }
 
 // session is what a tool call needs from the run that made it. A Subagent Tool
-// call reaches further than the config — it relays onto the run's own event
+// call reaches further than the config — it forwards onto the run's own event
 // stream and charges the spend it delegates back to the run — so the run hands
-// over one of these instead of another parameter each time.
+// over one of these instead of another parameter each time: the Tool holds no
+// writer, no tally and no model set of its own.
 type session struct {
 	cfg    config
-	events eventWriter
 	stderr io.Writer
-	// delegated sums child spend behind a pointer because the session travels into
-	// a plan closure by value: a field of its own would add to a copy.
-	delegated *tokenTotals
-	// models is the run's model-id set, which a child's model id joins here.
-	models map[string]struct{}
+	// relay reaches the tally through a closure rather than as a field because the
+	// session travels into a plan closure by value: a tally of its own would add
+	// to a copy.
+	relay relayFunc
 }
 
 // toolResultEvent is the tool_result half of the pair. The plan brings its own
