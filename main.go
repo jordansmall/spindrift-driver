@@ -103,6 +103,75 @@ arriving may run far past it; raise it (--timeout 15m) only when the server thin
 long time before its first token, or when a proxy buffers the response.
 `
 
+// runTally is the run's bookkeeping for the result event: how many Model calls
+// were made, how long they took, what they spent and which models answered.
+//
+// own and delegated are kept apart because a child's spend arrives as relayed
+// usage events while the parent's own usage events must stay one per own Model
+// call; only the projection sums the two.
+//
+// The tally is always used through a pointer: session travels into Tool plan
+// closures by value, so a tally field of its own would add to a copy.
+type runTally struct {
+	calls     int
+	apiMS     int64
+	own       tokenTotals
+	delegated tokenTotals
+	models    map[string]struct{}
+}
+
+func newRunTally() *runTally { return &runTally{models: map[string]struct{}{}} }
+
+// recordCall opens one Model call: the count is both the run's turn count and
+// the msg-<n> index every event of that call shares.
+func (t *runTally) recordCall() { t.calls++ }
+
+// addAPITime accrues one call's round-trip milliseconds.
+func (t *runTally) addAPITime(ms int64) { t.apiMS += ms }
+
+// addOwnUsage folds one Model call's usage and records its model id
+// unconditionally: sendChat guarantees a non-empty id, so a guard here would
+// only hide a model that vanished from the result event's set — the opposite of
+// addRelayedUsage, which has no such guarantee about a child's wire.
+func (t *runTally) addOwnUsage(model string, tokens tokenTotals) {
+	t.own = t.own.add(tokens)
+	t.models[model] = struct{}{}
+}
+
+// addRelayedUsage charges one relayed child event line to the run, usage lines
+// only: a child that dies mid-run emits no result event while the spend it
+// already made is real, and a child's result totals are the sum of its own usage
+// events, so folding those too would bill the same tokens twice.
+//
+// A tokens or model value the child spelled wrong is skipped rather than
+// fatal — one odd line on a child's stream is never a reason to fail the run.
+func (t *runTally) addRelayedUsage(fields map[string]json.RawMessage) {
+	var kind string
+	_ = json.Unmarshal(fields["kind"], &kind)
+	if kind != "usage" {
+		return
+	}
+	if raw, ok := fields["tokens"]; ok {
+		var spent tokenTotals
+		if err := json.Unmarshal(raw, &spent); err == nil {
+			t.delegated = t.delegated.add(spent)
+		}
+	}
+	if raw, ok := fields["model"]; ok {
+		var model string
+		if err := json.Unmarshal(raw, &model); err == nil && model != "" {
+			t.models[model] = struct{}{}
+		}
+	}
+}
+
+// totals is the projection the result event reads: the whole run's spend.
+func (t *runTally) totals() tokenTotals { return t.own.add(t.delegated) }
+
+// modelIDs is the set-to-sorted projection the result event reads, so the stream
+// stays byte-stable instead of following map iteration order.
+func (t *runTally) modelIDs() []string { return sortedModelIDs(t.models) }
+
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
 	events := eventWriter{w: stdout}
