@@ -4061,6 +4061,15 @@ type agentSpec struct {
 func agentFixtureEntries(t *testing.T, specs ...agentSpec) string {
 	t.Helper()
 	dir := t.TempDir()
+	writeAgentFixtureFiles(t, dir, specs)
+	return writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+}
+
+// writeAgentFixtureFiles writes one Agent File per spec into dir. Every roster fixture
+// goes through here, so a change to the front-matter shape lands in all of them at
+// once rather than drifting one fixture away from what the loader accepts.
+func writeAgentFixtureFiles(t *testing.T, dir string, specs []agentSpec) {
+	t.Helper()
 	for i, s := range specs {
 		fm := []string{"name: " + s.name, "model: " + s.model}
 		if s.description != "" {
@@ -4079,7 +4088,6 @@ func agentFixtureEntries(t *testing.T, specs ...agentSpec) string {
 		contents := "---\n" + strings.Join(fm, "\n") + "\n---\n" + body + "\n"
 		writeAgentFile(t, dir, fmt.Sprintf("%d-%s.md", i, s.name), contents)
 	}
-	return writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
 }
 
 // TestParseArgsAgentSelectsRosterEntry: --agent is what makes a run a child, so
