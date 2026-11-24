@@ -2,15 +2,11 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -79,7 +75,7 @@ const goldenRunDir = "/golden-run"
 // the committed golden byte for byte.
 //
 // The stream is produced in-process — run() into a bytes.Buffer with
-// pinSteppingClock fixing the clock and newScriptedSSERawServer fixing every
+// pinSteppingClock fixing the clock and scriptedModelServer fixing every
 // response — because the nix check gives the suite bash and coreutils only (no
 // jq, no git, no network), so regeneration cannot shell out.
 //
@@ -146,7 +142,7 @@ func TestGoldenPassLog(t *testing.T) {
 // arguments string rather than the id, and the log has to show that instead of
 // having the test assert it.
 //
-// The script is keyed by model id rather than by POST index (goldenModelServer)
+// The script is keyed by model id rather than by POST index (scriptedModelServer)
 // because the two spawns share this one endpoint with their parent: the model in the
 // request body is the only thing that tells a child call from the parent's.
 //
@@ -165,20 +161,6 @@ func goldenPassStream(t *testing.T) []byte {
 	// 250ms keeps the pinned numbers plausible rather than degenerate: a quarter
 	// second between events, a quarter second per round trip, a several-second run.
 	pinSteppingClock(t, 1700000000000, 250)
-	// The children this run spawns are separate processes that pin their own clock
-	// from this spec on the way in (pinChildClockFromEnv), which is the only thing
-	// that makes a relayed child line byte-stable: the relay forwards the child's
-	// stamp rather than restamping it.
-	t.Setenv(envTestNowMS, fmt.Sprintf("%d:%d", goldenChildClockStart, goldenChildClockStep))
-	// The roster the parent's Subagent calls resolve against, and the one endpoint the
-	// parent and both children post to. The API key is a placeholder that names no
-	// provider and matches no scanned credential shape: this artifact is the file a
-	// host reads, and a run that records one is a leak.
-	cfgPath := agentFixtureEntries(t,
-		agentSpec{name: "reviewer", model: "m-reviewer", description: "reviews a diff", body: "review the change and report blockers"},
-		agentSpec{name: "scout", model: "m-scout", description: "surveys a tree", body: "survey the tree and report what is in it"},
-	)
-	t.Setenv(envAPIKey, goldenFakeKey)
 
 	// The file Tools really write and really read back, so they get a directory of
 	// their own rather than the repo this test runs in. Their absolute tool_target is
@@ -199,149 +181,101 @@ func goldenPassStream(t *testing.T) []byte {
 	writeArgsCut := len(writeArgs) / 2
 	const failingArgs = `{"command":"printf 'this one fails'; exit 3"}`
 
-	parentScript := []string{
+	parentScript := []modelEntry{
 		// Call 1: thinking in two fragments (so the event proves accumulation, not
 		// one frame relabelled) ahead of prose with real newlines, which the emitter
 		// must escape rather than trim, plus a bash call that succeeds.
-		sseReasoningFrames("llama-3.1-8b",
+		replyFrames(sseReasoningFrames("llama-3.1-8b",
 			"reading the tree before saying anything about it; ",
 			"one safe command first, then the file work") +
-			sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":104,"completion_tokens":21,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"I will look at the repo first,\nthen report.\n","tool_calls":[{"id":"call_alpha","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'hello world'\"}"}}]}}]}`),
+			sseChatCompletion(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":104,"completion_tokens":21,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"I will look at the repo first,\nthen report.\n","tool_calls":[{"id":"call_alpha","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf 'hello world'\"}"}}]}}]}`)),
 		// Call 2: the chunked replay. Two delta.content fragments make one sentence,
 		// which the text event has to carry joined rather than as two lines; then the
 		// write call arrives as two tool_calls fragments, the id and name only in the
 		// first; then usage on a choices-less chunk of its own.
-		sseStream(
+		replyFrames(sseStream(
 			`{"model":"llama-3.1-8b","choices":[{"index":0,"delta":{"content":"I will write the notes file now, "}}]}`,
 			`{"choices":[{"index":0,"delta":{"content":"then patch one line of it."}}]}`,
 			fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_write","type":"function","function":{"name":"write","arguments":%q}}]}}]}`, writeArgs[:writeArgsCut]),
 			fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":%q}}]},"finish_reason":"tool_calls"}]}`, writeArgs[writeArgsCut:]),
 			`{"model":"llama-3.1-8b","choices":[],"usage":{"prompt_tokens":152,"completion_tokens":34}}`,
-		),
+		)),
 		// Call 3: no content at all (so no text event) and the edit of the file call 2
 		// wrote — one old_string match, so replace_all stays off the arguments.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":196,"completion_tokens":24},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_edit","type":"function","function":{"name":"edit","arguments":%q}}]}}]}`, editArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":196,"completion_tokens":24},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_edit","type":"function","function":{"name":"edit","arguments":%q}}]}}]}`, editArgs)),
 		// Call 4: the Subagent call that succeeds, with no prose of its own — what the
 		// delegation produced arrives as relayed child lines inside the pair, and the
 		// Tool Result carries the child's answer.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":240,"completion_tokens":16},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_spawn_reviewer","type":"function","function":{"name":"subagent","arguments":%q}}]}}]}`, reviewerArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":240,"completion_tokens":16},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_spawn_reviewer","type":"function","function":{"name":"subagent","arguments":%q}}]}}]}`, reviewerArgs)),
 		// Call 5: the spawn whose child never gets an answer. Its model is the one the
 		// server rate-limits, so its relayed block is a start and an error.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":284,"completion_tokens":16},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_spawn_scout","type":"function","function":{"name":"subagent","arguments":%q}}]}}]}`, scoutArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":284,"completion_tokens":16},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_spawn_scout","type":"function","function":{"name":"subagent","arguments":%q}}]}}]}`, scoutArgs)),
 		// Call 6: a command that exits 3.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":328,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":328,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
 		// Call 7: the same tool name and the same arguments string under a fresh call
 		// id, so the breaker is only at two in a row and the command really runs again.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":372,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_2","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":372,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_2","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
 		// Call 8: identical a third time, so the breaker refuses it — the synthetic
 		// Tool Result this log pins, handed out without bash ever being reached. One
 		// refusal only: a third in a row would end the run on an error event.
-		sseChatCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":416,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_3","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
+		replyCompletion(fmt.Sprintf(`{"model":"llama-3.1-8b","usage":{"prompt_tokens":416,"completion_tokens":18},"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_beta_3","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`, failingArgs)),
 		// Call 9: the final answer, from a different model id, reporting cache read in
 		// the OpenAI spelling.
-		sseChatCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":460,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Wrote and edited notes.txt and delegated a review; the repeated command failed with exit code 3 and its third send was refused."}}]}`),
+		replyCompletion(`{"model":"qwen2.5-coder","usage":{"prompt_tokens":460,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":25}},"choices":[{"message":{"role":"assistant","content":"Wrote and edited notes.txt and delegated a review; the repeated command failed with exit code 3 and its third send was refused."}}]}`),
 	}
 
-	srv := newGoldenModelServer(t, map[string][]string{
+	// The children this run spawns are separate processes that pin their own clock
+	// from this spec on the way in (pinChildClockFromEnv), which is the only thing
+	// that makes a relayed child line byte-stable: the relay forwards the child's
+	// stamp rather than restamping it. The roster is what the parent's Subagent calls
+	// resolve against, and the helper's endpoint is the one the parent and both
+	// children post to. The API key is a placeholder that names no provider and
+	// matches no scanned credential shape: this artifact is the file a host reads, and
+	// a run that records one is a leak.
+	res := runDriver(t, map[string][]modelEntry{
 		// The parent's own nine calls, in the order it makes them.
 		goldenParentModel: parentScript,
 		// The reviewer child's one call: prose plus usage and no tool call, so its whole
 		// run is the start, text, usage and result block the relay forwards. Its prose
 		// is its own words, nowhere near the parent's thinking fragments.
 		"m-reviewer": {
-			sseChatCompletion(`{"model":"m-reviewer","usage":{"prompt_tokens":512,"completion_tokens":32,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"Reviewed the notes file: the heading is intact and the replaced line reads cleanly; no blockers."}}]}`),
+			replyCompletion(`{"model":"m-reviewer","usage":{"prompt_tokens":512,"completion_tokens":32,"prompt_cache_hit_tokens":64},"choices":[{"message":{"role":"assistant","content":"Reviewed the notes file: the heading is intact and the replaced line reads cleanly; no blockers."}}]}`),
 		},
-		// goldenRateLimitedModel gets no queue at all: every POST it makes is a 429.
-	})
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"inspect the repo and report", "--model", goldenParentModel, "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("golden Pass exited %d, want 0; stderr = %q", code, stderr.String())
+		// goldenRateLimitedModel's queue holds the one refusal its single POST gets, so
+		// nothing after it is scripted: the 11-request count below is what proves the
+		// child stopped at that 429 rather than burning a second entry on a retry.
+		goldenRateLimitedModel: {
+			reject(http.StatusTooManyRequests, map[string]string{"Retry-After": goldenRetryAfter}, goldenRateLimitBody),
+		},
+	}, "inspect the repo and report",
+		withFlags("--model", goldenParentModel),
+		withEnv(envAPIKey, goldenFakeKey),
+		withEnv(envTestNowMS, fmt.Sprintf("%d:%d", goldenChildClockStart, goldenChildClockStep)),
+		withRoster(
+			agentSpec{name: "reviewer", model: "m-reviewer", description: "reviews a diff", body: "review the change and report blockers"},
+			agentSpec{name: "scout", model: "m-scout", description: "surveys a tree", body: "survey the tree and report what is in it"},
+		),
+	)
+	if res.code != 0 {
+		t.Fatalf("golden Pass exited %d, want 0; stderr = %q", res.code, res.stderr)
 	}
 	// Nine parent calls and one per child — and the rate-limited child costs exactly
 	// one POST, because a 429 returns without a retry rather than burning attempts.
-	if got := srv.requestBodies(t); len(got) != 11 {
-		t.Fatalf("golden Pass made %d Model call(s), want 11: nine parent plus one each for the reviewer and the scout", len(got))
+	if len(res.requests) != 11 {
+		t.Fatalf("golden Pass made %d Model call(s), want 11: nine parent plus one each for the reviewer and the scout", len(res.requests))
 	}
 	// The file Tools resolve their path argument to an absolute path, so runDir is
 	// written into every write and edit tool_target and tool_output. It is a
 	// t.TempDir(), which differs between runs and between machines: swapping it for
 	// goldenRunDir here — before both the -update write below and the byte compare —
 	// is what lets one committed artifact hold on any host.
-	return bytes.ReplaceAll(stdout.Bytes(), []byte(runDir), []byte(goldenRunDir))
+	return bytes.ReplaceAll(res.stdout, []byte(runDir), []byte(goldenRunDir))
 }
 
 // goldenParentModel is the model id the parent sends: the argv --model value, which
 // is only ever a queue key and never the model field of a scripted response, so the
 // ids the result event reports come from what answered rather than from argv.
 const goldenParentModel = "spindrift-router"
-
-// goldenModelServer scripts a relaying Pass. Parent and children share the one
-// endpoint a spawn cannot redirect, so responses route on the model id in the
-// request body: every model has its own FIFO of raw SSE bodies, and one model is
-// answered with 429 on every POST it makes.
-//
-// An exhausted queue answers 500 naming the model rather than looping: a run that
-// asked a question nobody scripted has to fail loudly on the turn that asked it.
-type goldenModelServer struct {
-	mu      sync.Mutex
-	queues  map[string][]string
-	limited string
-	bodies  [][]byte
-	srv     *httptest.Server
-}
-
-func newGoldenModelServer(t *testing.T, queues map[string][]string) *goldenModelServer {
-	t.Helper()
-	s := &goldenModelServer{queues: queues, limited: goldenRateLimitedModel}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		s.mu.Lock()
-		s.bodies = append(s.bodies, body)
-		var req struct {
-			Model string `json:"model"`
-		}
-		_ = json.Unmarshal(body, &req)
-		rateLimited := req.Model == s.limited
-		frames, exhausted := "", false
-		if !rateLimited {
-			queue := s.queues[req.Model]
-			if len(queue) == 0 {
-				exhausted = true
-			} else {
-				s.queues[req.Model] = queue[1:]
-				frames = queue[0]
-			}
-		}
-		s.mu.Unlock()
-
-		switch {
-		case rateLimited:
-			w.Header().Set("Retry-After", goldenRetryAfter)
-			w.WriteHeader(http.StatusTooManyRequests)
-			// Written out by hand rather than through http.Error: that helper appends a
-			// newline, and the rejection body reaches the error event verbatim.
-			io.WriteString(w, goldenRateLimitBody)
-		case exhausted:
-			http.Error(w, "no scripted response left for model "+req.Model, http.StatusInternalServerError)
-		default:
-			writeSSE(w, frames)
-		}
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
-}
-
-func (s *goldenModelServer) requestBodies(t *testing.T) [][]byte {
-	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([][]byte, len(s.bodies))
-	copy(out, s.bodies)
-	return out
-}
 
 // sseReasoningFrames scripts thinking as the delta.reasoning_content chunks a
 // reasoning endpoint streams before any content. Fragments are prose written
