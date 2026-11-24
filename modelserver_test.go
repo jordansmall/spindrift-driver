@@ -23,6 +23,15 @@ type modelEntry struct {
 	// completion is a whole non-streaming completion body, framed on the way out
 	// by sseChatCompletion. It is read only when frames is empty.
 	completion string
+	// status marks the entry a rejection rather than a reply: a non-zero status is
+	// what the endpoint answers with, and it is the only discriminator an entry
+	// needs because a rejection carries no frames and a reply carries no status.
+	status int
+	// headers are set on the response before status is written, the way a real
+	// endpoint sets Retry-After before its 429.
+	headers map[string]string
+	// body is the rejection body, written verbatim.
+	body string
 }
 
 // replyFrames scripts one answer as raw SSE frames.
@@ -31,6 +40,12 @@ func replyFrames(frames string) modelEntry { return modelEntry{frames: frames} }
 // replyCompletion scripts one answer as a whole completion body, served as the
 // streaming frames the same answer arrives in.
 func replyCompletion(body string) modelEntry { return modelEntry{completion: body} }
+
+// reject scripts the endpoint refusing one request: the status, the refusal
+// headers and the error body, none of them reshaped.
+func reject(status int, headers map[string]string, body string) modelEntry {
+	return modelEntry{status: status, headers: headers, body: body}
+}
 
 // scriptedModelServer is the Model a run talks to over the wire, scripted one
 // answer per model id.
@@ -67,7 +82,18 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 		}
 		s.mu.Unlock()
 
-		writeSSE(w, entry.sseBody())
+		switch {
+		case entry.status != 0:
+			for k, v := range entry.headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(entry.status)
+			// Written out by hand rather than through http.Error: that helper appends a
+			// newline, and the rejection body reaches the error event verbatim.
+			io.WriteString(w, entry.body)
+		default:
+			writeSSE(w, entry.sseBody())
+		}
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
@@ -129,6 +155,15 @@ func TestScriptedModelServerReplyFramesAnswersExactBytesAndRecordsBody(t *testin
 // drive a run.
 func postModel(t *testing.T, url, body string) (int, string, string) {
 	t.Helper()
+	status, header, raw := postModelResponse(t, url, body)
+	return status, header.Get("Content-Type"), raw
+}
+
+// postModelResponse is postModel with the whole response header map kept: a
+// rejection carries its answer in the status and the headers as much as in the
+// body.
+func postModelResponse(t *testing.T, url, body string) (int, http.Header, string) {
+	t.Helper()
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
@@ -138,7 +173,32 @@ func postModel(t *testing.T, url, body string) (int, string, string) {
 	if err != nil {
 		t.Fatalf("read response body: %v", err)
 	}
-	return resp.StatusCode, resp.Header.Get("Content-Type"), string(raw)
+	return resp.StatusCode, resp.Header, string(raw)
+}
+
+// A rejection entry answers with the status, the headers and the body it was
+// scripted with — the shape a rate-limited or over-quota endpoint replies in.
+//
+// The body is compared byte for byte because a rejection body reaches the error
+// event verbatim: serving it through http.Error would append a newline and every
+// consumer's parse of the error JSON would be looking at what this test asserts.
+func TestScriptedModelServerRejectAnswersWithStatusHeadersAndExactBody(t *testing.T) {
+	const rejectBody = `{"error":{"message":"Rate limit reached. Please try again in 7s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
+
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, rejectBody)},
+	})
+
+	status, header, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", status)
+	}
+	if got := header.Get("Retry-After"); got != "7" {
+		t.Errorf("Retry-After = %q, want %q", got, "7")
+	}
+	if body != rejectBody {
+		t.Errorf("body = %q, want exactly the scripted rejection body %q", body, rejectBody)
+	}
 }
 
 // requestBodies reports every POST the server took, in the order they arrived,
@@ -165,6 +225,46 @@ func TestScriptedModelServerRequestBodiesKeepsEveryPostInOrder(t *testing.T) {
 	}
 }
 
+// A queue mixes kinds freely: a rejection spends the entry in front of it exactly
+// like a reply does, so a run that retries a 429 gets the next entry on its second
+// POST rather than the same refusal again (or the same reply twice).
+func TestScriptedModelServerSpendsEntriesPerPostAcrossKinds(t *testing.T) {
+	const refusal = `{"error":{"message":"slow down","type":"rate_limit_error"}}`
+
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "3"}, refusal),
+			replyFrames(sseStream(textChunk("after the retry"))),
+		},
+	})
+
+	status, header, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("first POST status = %d, want 429", status)
+	}
+	if got := header.Get("Retry-After"); got != "3" {
+		t.Errorf("first POST Retry-After = %q, want %q", got, "3")
+	}
+	if body != refusal {
+		t.Errorf("first POST body = %q, want %q", body, refusal)
+	}
+
+	status, contentType, body := postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusOK {
+		t.Fatalf("second POST status = %d, want 200", status)
+	}
+	if contentType != "text/event-stream" {
+		t.Errorf("second POST Content-Type = %q, want text/event-stream", contentType)
+	}
+	if got := streamedText(body); got != "after the retry" {
+		t.Errorf("second POST answered %q, want %q", got, "after the retry")
+	}
+
+	if n := len(s.requestBodies(t)); n != 2 {
+		t.Errorf("recorded %d request bodies, want 2", n)
+	}
+}
+
 // Two model ids answered from their own FIFOs, interleaved in the order the POSTs
 // arrived: m-a's second entry waits behind m-a's first while m-b answers its own
 // request from its own queue. A POST-index server hands m-b whatever turn count it
@@ -188,6 +288,40 @@ func TestScriptedModelServerRoutesEachModelToItsOwnQueue(t *testing.T) {
 		if text != step.want {
 			t.Errorf("POST %d to %s answered %q, want %q", i, step.model, text, step.want)
 		}
+	}
+}
+
+// A rejection spends one entry on the refused model's queue and leaves every other
+// queue where it was: scripting "rate-limited on one model, answered on the other"
+// must not renumber the queue that keeps answering.
+func TestScriptedModelServerRejectionSpendsOnlyItsOwnModelsQueue(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-refused": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "1"}, `{"error":{"message":"no quota"}}`)},
+		"m-ok":      {replyFrames(sseStream(textChunk("ok-one"))), replyFrames(sseStream(textChunk("ok-two")))},
+	})
+
+	status, _, _ := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-refused","messages":[]}`)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("refused model status = %d, want 429", status)
+	}
+
+	for i, want := range []string{"ok-one", "ok-two"} {
+		status, contentType, body := postModel(t, s.url()+"/chat/completions", `{"model":"m-ok","messages":[]}`)
+		if status != http.StatusOK {
+			t.Fatalf("m-ok POST %d status = %d, want 200", i, status)
+		}
+		if contentType != "text/event-stream" {
+			t.Errorf("m-ok POST %d Content-Type = %q, want text/event-stream", i, contentType)
+		}
+		if got := streamedText(body); got != want {
+			t.Errorf("m-ok POST %d answered %q, want %q", i, got, want)
+		}
+	}
+
+	// The refused model's own queue is the one that drained, so its second POST no
+	// longer carries the scripted refusal.
+	if status, _, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-refused","messages":[]}`); status == http.StatusTooManyRequests {
+		t.Errorf("second POST to m-refused still answered the spent rejection: %d %q", status, body)
 	}
 }
 
