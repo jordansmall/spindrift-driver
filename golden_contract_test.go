@@ -1004,8 +1004,9 @@ type goldenTokenSum struct {
 
 // goldenSumUsage adds every usage line of the artifact, the parent's and the relayed
 // children's alike. That is the whole point of summing usage rather than result
-// totals: foldChildUsage (subagent.go) charges a relayed usage event into the parent
-// exactly as the parent charges its own, so the lines that make up the session total
+// totals: runTally.addRelayedUsage (main.go), reached through relayChildEvent,
+// charges a relayed usage event into the parent exactly as the parent charges its
+// own, so the lines that make up the session total
 // are all of them and not the parent's share.
 func goldenSumUsage(t *testing.T, events []map[string]any) goldenTokenSum {
 	t.Helper()
@@ -1041,11 +1042,11 @@ func goldenSumUsage(t *testing.T, events []map[string]any) goldenTokenSum {
 
 // TestGoldenPassResultTokensSumEveryUsageLine states the promise a host bills on: the
 // session total is the sum of all the usage events in the log, relayed children
-// included, field by field. It holds because foldChildUsage charges each forwarded
-// usage event into the parent's delegated tally and run() closes with
-// totals.add(delegated) (main.go) — a relay that forwarded a child's spend without
-// charging it, or one that charged the child's result totals on top of its usage
-// events, would break the equality below in one direction or the other.
+// included, field by field. It holds because relayChildEvent charges each forwarded
+// usage event into the parent's delegated tally (runTally.addRelayedUsage) and run()
+// closes with tally.totals() (main.go) — a relay that forwarded a child's spend
+// without charging it, or one that charged the child's result totals on top of its
+// usage events, would break the equality below in one direction or the other.
 func TestGoldenPassResultTokensSumEveryUsageLine(t *testing.T) {
 	raw, events := goldenReadPass(t)
 	result := parentResult(t, raw)
@@ -1152,8 +1153,8 @@ func TestGoldenPassResultNumTurnsCountsParentCallsOnly(t *testing.T) {
 }
 
 // TestGoldenPassResultModelsIncludeTheAnsweringChild pins the run's model set as the
-// ids that answered: foldChildUsage adds a relayed usage event's model id to the set,
-// so the child model that answered appears without the parent ever having named it in
+// ids that answered: runTally.addRelayedUsage adds a relayed usage event's model id
+// to the set, so the child model that answered appears without the parent ever having named it in
 // a completion — and the rate-limited model stays out, because a 429 leaves no usage
 // event to fold and no answer to name.
 func TestGoldenPassResultModelsIncludeTheAnsweringChild(t *testing.T) {

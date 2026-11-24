@@ -802,7 +802,7 @@ func TestSubagentRelayDropsNonObjectLines(t *testing.T) {
 	stream := "not an event at all\nnull\n" +
 		`{"kind":"result","timestamp":1234567890123,"text":"child answer","num_turns":1}` + "\n"
 
-	text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut))
+	text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
 	if !sawResult || text != "child answer" {
 		t.Errorf("relay returned text %q sawResult %v, want the result event's text", text, sawResult)
 	}
@@ -949,8 +949,8 @@ func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
 // accounting are separate jobs.
 func TestSubagentRelayIgnoresUnusableUsageTokens(t *testing.T) {
 	var out, errOut bytes.Buffer
-	var spent tokenTotals
-	s := session{events: eventWriter{w: &out}, stderr: &errOut, delegated: &spent, models: map[string]struct{}{}}
+	tally := newRunTally()
+	s := relaySession(&out, &errOut, tally)
 	stream := strings.Join([]string{
 		`{"kind":"usage","timestamp":1,"model":"m-reviewer"}`,
 		`{"kind":"usage","timestamp":2,"tokens":"not an object"}`,
@@ -961,16 +961,34 @@ func TestSubagentRelayIgnoresUnusableUsageTokens(t *testing.T) {
 	if _, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", s); sawResult {
 		t.Errorf("sawResult = true, want false: the stream carries no result event")
 	}
-	if spent != (tokenTotals{}) {
-		t.Errorf("delegated tally = %+v, want unusable usage lines to contribute nothing", spent)
+	if got := tally.totals(); got != (tokenTotals{}) {
+		t.Errorf("tally totals = %+v, want unusable usage lines to contribute nothing", got)
 	}
 	// A model id is a separate fact from the tokens, so the one line that carried
 	// it still counts.
-	if _, ok := s.models["m-reviewer"]; !ok {
-		t.Errorf("model set = %v, want the usage event's model id recorded", s.models)
+	if got, want := tally.modelIDs(), []string{"m-reviewer"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("model set = %v, want the usage event's model id recorded as %v", got, want)
 	}
 	if events := stdoutEvents(t, out.String()); len(events) != 4 {
 		t.Errorf("parent stdout got %d lines, want all four usage events relayed: %q", len(events), out.String())
+	}
+}
+
+// TestSubagentRelayChargesNothingForAKindThatIsNotAString: the kind the relay loop
+// parses is its only read — a non-string kind charges nothing and still relays.
+func TestSubagentRelayChargesNothingForAKindThatIsNotAString(t *testing.T) {
+	var out, errOut bytes.Buffer
+	tally := newRunTally()
+	stream := `{"kind":42,"timestamp":1,"tokens":{"input":9,"output":9},"model":"m-reviewer"}` + "\n"
+
+	if _, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, tally)); sawResult {
+		t.Errorf("sawResult = true, want false: a kind of 42 is no child's result event")
+	}
+	if got := tally.totals(); got != (tokenTotals{}) {
+		t.Errorf("tally totals = %+v, want an unusable kind to charge nothing", got)
+	}
+	if events := stdoutEvents(t, out.String()); len(events) != 1 {
+		t.Errorf("parent stdout got %d lines, want the line relayed: %q", len(events), out.String())
 	}
 }
 
@@ -984,7 +1002,7 @@ func TestSubagentRelayResultWithoutText(t *testing.T) {
 		`{"kind":"result","timestamp":2,"text":42,"num_turns":1}` + "\n",
 	} {
 		var out, errOut bytes.Buffer
-		text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut))
+		text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
 		if !sawResult {
 			t.Errorf("sawResult = false, want true: the child did finish with a result event (%s)", stream)
 		}
@@ -1013,7 +1031,7 @@ func TestSubagentRelayDrainsAfterOverLongLine(t *testing.T) {
 	stream := io.MultiReader(append(parts, strings.NewReader("\n"+`{"kind":"result","timestamp":1,"text":"late answer"}`+"\n"))...)
 
 	var out, errOut bytes.Buffer
-	text, sawResult := relaySubagentOutput(stream, "reviewer", relaySession(&out, &errOut))
+	text, sawResult := relaySubagentOutput(stream, "reviewer", relaySession(&out, &errOut, newRunTally()))
 	if sawResult || text != "" {
 		t.Errorf("relay returned text %q sawResult %v, want the result after the broken line to be lost", text, sawResult)
 	}
@@ -1030,10 +1048,123 @@ func TestSubagentRelayDrainsAfterOverLongLine(t *testing.T) {
 	}
 }
 
+// TestSubagentRelayFunctionKeepsTheChildTimestamp pins the forwarding half of the
+// one function a Subagent Tool gets from the run: the child's line goes back out
+// whole, so the clock the child stamped survives (an emit would restamp it) and
+// every field the child wrote survives (an event struct drops what it lacks).
+func TestSubagentRelayFunctionKeepsTheChildTimestamp(t *testing.T) {
+	var out bytes.Buffer
+	relayChildEvent(eventWriter{w: &out}, newRunTally())("reviewer", "text", relayedEventFields(map[string]string{
+		"kind":       `"text"`,
+		"timestamp":  `1234567890123`,
+		"message_id": `"msg-1"`,
+		"text":       `"child prose"`,
+	}))
+
+	if line := out.String(); !strings.Contains(line, `"timestamp":1234567890123`) {
+		t.Errorf("relayed line restamped or rewrote the child timestamp: %q", line)
+	}
+	events := stdoutEvents(t, out.String())
+	if len(events) != 1 {
+		t.Fatalf("relay wrote %d lines, want exactly one: %q", len(events), out.String())
+	}
+	if events[0]["role"] != "reviewer" || events[0]["in_subagent"] != true {
+		t.Errorf("relayed line = %v, want role reviewer and in_subagent true", events[0])
+	}
+	if events[0]["message_id"] != "msg-1" || events[0]["text"] != "child prose" {
+		t.Errorf("relayed line dropped a field the child wrote: %v", events[0])
+	}
+}
+
+// TestSubagentRelayFunctionFoldsUsageIntoTheTally pins the accounting half: the
+// relay is the only way a child's spend reaches the run, and what it charged is
+// read back through the projections the result event reads.
+func TestSubagentRelayFunctionFoldsUsageIntoTheTally(t *testing.T) {
+	var out bytes.Buffer
+	tally := newRunTally()
+
+	relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "usage", relayedUsageFields(`{"input":7,"output":1,"cost_usd":0.25}`, `"m-reviewer"`))
+
+	if got, want := tally.totals(), (tokenTotals{Input: 7, Output: 1, CostUSD: 0.25}); got != want {
+		t.Errorf("totals() = %+v, want the relayed usage projected as %+v", got, want)
+	}
+	if got, want := tally.modelIDs(), []string{"m-reviewer"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("modelIDs() = %v, want the child model that answered as %v", got, want)
+	}
+	if events := stdoutEvents(t, out.String()); len(events) != 1 {
+		t.Errorf("relay wrote %d lines, want the usage line once: %q", len(events), out.String())
+	}
+}
+
+// TestSubagentRelayFunctionFoldsNothingFromANonUsageLine: a child's result carries
+// the same tokens its usage events already did, so folding anything but usage
+// would bill them twice — and the line still gets relayed.
+func TestSubagentRelayFunctionFoldsNothingFromANonUsageLine(t *testing.T) {
+	var out bytes.Buffer
+	tally := newRunTally()
+
+	relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "result", relayedEventFields(map[string]string{
+		"kind":      `"result"`,
+		"timestamp": `1`,
+		"tokens":    `{"input":9000,"output":9}`,
+		"model":     `"m-reviewer"`,
+	}))
+
+	if got := tally.totals(); got != (tokenTotals{}) {
+		t.Errorf("totals() = %+v, want a non-usage line to fold nothing", got)
+	}
+	if got := tally.modelIDs(); len(got) != 0 {
+		t.Errorf("modelIDs() = %v, want a non-usage line to record no model", got)
+	}
+	if events := stdoutEvents(t, out.String()); len(events) != 1 || events[0]["kind"] != "result" {
+		t.Errorf("relay wrote %q, want the child's result line relayed", out.String())
+	}
+}
+
+// TestSubagentRelayFunctionFoldsNothingFromUnusableUsageTokens: one odd child line
+// is never a reason to corrupt the totals or to withhold a line — but a model id
+// is its own fact and still counts when the tokens beside it are not.
+func TestSubagentRelayFunctionFoldsNothingFromUnusableUsageTokens(t *testing.T) {
+	for _, tokens := range []string{"", "null", `"not an object"`, `{"input":"seven"}`} {
+		var out bytes.Buffer
+		tally := newRunTally()
+
+		relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "usage", relayedUsageFields(tokens, `"m-reviewer"`))
+
+		if got := tally.totals(); got != (tokenTotals{}) {
+			t.Errorf("tokens %q: totals() = %+v, want nothing folded", tokens, got)
+		}
+		if got, want := tally.modelIDs(), []string{"m-reviewer"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("tokens %q: modelIDs() = %v, want the model id still recorded as %v", tokens, got, want)
+		}
+		if events := stdoutEvents(t, out.String()); len(events) != 1 {
+			t.Errorf("tokens %q: relay wrote %d lines, want the usage line relayed: %q", tokens, len(events), out.String())
+		}
+	}
+}
+
+// TestSubagentRelayFunctionWritesOneLineInItsOwnKeyOrder pins the wire shape:
+// re-encoding a map sorts its keys, so a relayed line carries the parent's key
+// order and the child's values, one object per line.
+func TestSubagentRelayFunctionWritesOneLineInItsOwnKeyOrder(t *testing.T) {
+	var out bytes.Buffer
+	relay := relayChildEvent(eventWriter{w: &out}, newRunTally())
+
+	relay("reviewer", "usage", relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
+	relay("planner", "text", relayedEventFields(map[string]string{"kind": `"text"`, "timestamp": `2`}))
+
+	want := "{\"in_subagent\":true,\"kind\":\"usage\",\"model\":\"m-reviewer\",\"role\":\"reviewer\",\"tokens\":{\"input\":7,\"output\":1}}\n" +
+		"{\"in_subagent\":true,\"kind\":\"text\",\"role\":\"planner\",\"timestamp\":2}\n"
+	if got := out.String(); got != want {
+		t.Errorf("relay wrote %q, want %q", got, want)
+	}
+}
+
 // relaySession builds the session a test needs when it calls the relay directly
-// rather than through a whole run.
-func relaySession(out, errOut io.Writer) session {
-	return session{events: eventWriter{w: out}, stderr: errOut, delegated: &tokenTotals{}, models: map[string]struct{}{}}
+// rather than through a whole run: the tally it hands the relay is how such a test
+// reads back what a child's lines were charged.
+func relaySession(out, errOut io.Writer, tally *runTally) session {
+	return session{stderr: errOut, relay: relayChildEvent(eventWriter{w: out}, tally)}
 }
 
 // withUsage attaches a model id and one Model call's usage to a scripted

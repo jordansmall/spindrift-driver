@@ -115,10 +115,9 @@ func runSubagentTool(entry agentEntry, task string, s session) string {
 // child's own result event — or, when that event carries no text, an error: message,
 // because a child that cannot hand over an answer has not succeeded.
 //
-// Lines go through eventWriter.encode and never through emit: emit restamps the
-// clock, and the child's own timestamp is the fact worth keeping. Re-encoding a
-// map sorts its keys, so a relayed line is not byte-identical to the child's own
-// — the values are, the key order is not.
+// Each line is handed to s.relay, the one function a Subagent Tool holds: it puts
+// the line on the run's stream with the child's own timestamp and charges a usage
+// line to the run's tally, so neither the writer nor the bookkeeping is here.
 //
 // A child line larger than sseMaxLineBytes, and anything that is not a JSON
 // object, is reported on stderr rather than dropped quietly: stdout carries only
@@ -141,23 +140,14 @@ func relaySubagentOutput(r io.Reader, agentName string, s session) (string, bool
 			fmt.Fprintf(s.stderr, "spindrift-driver: subagent %q: dropped non-event output line: %s\n", agentName, boundBody(line))
 			continue
 		}
-		relayed := make(map[string]any, len(fields)+2)
-		for k, v := range fields {
-			relayed[k] = v
-		}
-		relayed["role"] = agentName
-		relayed["in_subagent"] = true
-		_ = s.events.encode(relayed)
-
 		var kind string
 		_ = json.Unmarshal(fields["kind"], &kind)
-		switch kind {
-		case "usage":
-			foldChildUsage(fields, s)
-		case "result":
-			// sawResult reports that the child finished, which is a separate fact from
-			// whether it had an answer: a result with no text, or text that is not a
-			// string, would otherwise come back as an empty successful delegation.
+		s.relay(agentName, kind, fields)
+
+		// sawResult reports that the child finished, which is a separate fact from
+		// whether it had an answer: a result with no text, or text that is not a
+		// string, would otherwise come back as an empty successful delegation.
+		if kind == "result" {
 			sawResult = true
 			var answer string
 			if err := json.Unmarshal(fields["text"], &answer); err != nil {
@@ -180,30 +170,4 @@ func relaySubagentOutput(r io.Reader, agentName string, s session) (string, bool
 		_, _ = io.Copy(io.Discard, r)
 	}
 	return text, sawResult
-}
-
-// foldChildUsage charges one relayed usage event to the parent: its tokens into
-// the delegated tally and its model id into the run's model set.
-//
-// Usage events are folded rather than the child's result totals because a child
-// that fails never emits a result event while the spend it made up to that point
-// is real, and because folding per usage event is exactly how the parent builds
-// its own tally — parent and child are then accounted the same way. Folding the
-// child's result totals on top of this would count the same tokens twice.
-//
-// A line whose tokens key is missing or is not a token object contributes
-// nothing: one odd child line must not corrupt the parent's totals.
-func foldChildUsage(fields map[string]json.RawMessage, s session) {
-	if raw, ok := fields["tokens"]; ok {
-		var spent tokenTotals
-		if err := json.Unmarshal(raw, &spent); err == nil {
-			*s.delegated = s.delegated.add(spent)
-		}
-	}
-	if raw, ok := fields["model"]; ok {
-		var model string
-		if err := json.Unmarshal(raw, &model); err == nil && model != "" {
-			s.models[model] = struct{}{}
-		}
-	}
 }
