@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +68,11 @@ type scriptedModelServer struct {
 	mu     sync.Mutex
 	queues map[string][]modelEntry
 	bodies [][]byte
+	// missed names, in arrival order, the models a POST asked for that no queue
+	// could answer — exhausted or never scripted. The handler only records them:
+	// it runs on the server's goroutines, where t.Fatalf would panic, so the test
+	// that owns the server reads this and fails itself.
+	missed []string
 	srv    *httptest.Server
 }
 
@@ -85,13 +91,24 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 		_ = json.Unmarshal(body, &req)
 		queue := s.queues[req.Model]
 		var entry modelEntry
-		if len(queue) > 0 {
+		// A queue that is empty and a model never scripted are the same mistake: an
+		// answer nobody wrote. Serving the zero-value entry instead would hand the run
+		// an empty SSE stream, which reads as a finished reply that said nothing.
+		missed := len(queue) == 0
+		if missed {
+			s.missed = append(s.missed, req.Model)
+		} else {
 			entry = queue[0]
 			s.queues[req.Model] = queue[1:]
 		}
 		s.mu.Unlock()
 
 		switch {
+		case missed:
+			// http.Error rather than a hand-written body: unlike a scripted rejection,
+			// nobody parses this one, so the trailing newline costs nothing next to the
+			// status line and Content-Type a failing run gets for free.
+			http.Error(w, "no scripted response left for model "+req.Model, http.StatusInternalServerError)
 		case entry.status != 0:
 			for k, v := range entry.headers {
 				w.Header().Set(k, v)
@@ -112,6 +129,10 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 				return
 			}
 			conn.Close()
+		case entry.frames == "" && entry.completion == "":
+			// No constructor builds an entry with neither field, so reaching this means a
+			// new entry kind forgot its discriminator in the switch above.
+			http.Error(w, "model "+req.Model+" has a scripted entry with no reply in it", http.StatusInternalServerError)
 		default:
 			writeSSE(w, entry.sseBody())
 		}
@@ -138,6 +159,24 @@ func (s *scriptedModelServer) requestBodies(t *testing.T) [][]byte {
 	out := make([][]byte, len(s.bodies))
 	copy(out, s.bodies)
 	return out
+}
+
+// unscriptedModels returns the model ids that got a POST no queue could answer,
+// in arrival order: exhausted queues and models never scripted alike.
+func (s *scriptedModelServer) unscriptedModels() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.missed)
+}
+
+// checkNoUnscriptedRequests fails the calling test for every POST the queues could
+// not answer. A run-driven test cannot assert at the moment of the miss — the miss
+// happens on a server goroutine mid-run — so it calls this once the run is over.
+func (s *scriptedModelServer) checkNoUnscriptedRequests(t *testing.T) {
+	t.Helper()
+	for _, model := range s.unscriptedModels() {
+		t.Errorf("model %q was asked for with no scripted response left", model)
+	}
 }
 
 // A reply entry written as raw frames reaches the caller as exactly those bytes
@@ -421,6 +460,35 @@ func TestScriptedModelServerSingleQueueAnswersEntriesInOrder(t *testing.T) {
 	if n := len(s.requestBodies(t)); n != 3 {
 		t.Errorf("recorded %d request bodies, want 3", n)
 	}
+	// A run that stayed inside its script is silent: the check only fires on a miss.
+	s.checkNoUnscriptedRequests(t)
+}
+
+// The unscripted-request case: a model id no queue was ever written for is met the
+// same way an exhausted one is — 500 naming that model, and the miss on the record
+// — while a model that is scripted keeps answering from its own queue untouched.
+func TestScriptedModelServerUnscriptedModelFailsLoudlyNamingIt(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(textChunk("scripted")))},
+	})
+
+	status, _, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-never","messages":[]}`)
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", status)
+	}
+	if !strings.Contains(body, "m-never") {
+		t.Errorf("body = %q, want it to name the unscripted model m-never", body)
+	}
+
+	// The miss neither drains nor poisons the queue that does exist.
+	_, _, body = postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if got := streamedText(body); got != "scripted" {
+		t.Errorf("m-a answered %q, want %q", got, "scripted")
+	}
+
+	if got := s.unscriptedModels(); !slices.Equal(got, []string{"m-never"}) {
+		t.Errorf("unscriptedModels = %q, want [m-never]", got)
+	}
 }
 
 // streamedText reads the first delta of a streamed reply — all these tests
@@ -475,4 +543,49 @@ func postModelTruncated(t *testing.T, url, body string) (int, string, string, er
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, resp.Header.Get("Content-Type"), string(raw), err
+}
+
+// An exhausted queue is a scripting mistake, not an answer: the server replies 500
+// naming the model and records the miss, so a run that asks for more than the test
+// scripted fails the test instead of reading an empty stream as a finished reply.
+func TestScriptedModelServerExhaustedQueueFailsLoudlyNamingTheModel(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(textChunk("only one")))},
+	})
+
+	_, _, firstBody := postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if got := streamedText(firstBody); got != "only one" {
+		t.Fatalf("first POST answered %q, want %q", got, "only one")
+	}
+
+	status, _, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusInternalServerError {
+		t.Errorf("second POST status = %d, want 500", status)
+	}
+	if !strings.Contains(body, "m-a") {
+		t.Errorf("second POST body = %q, want it to name the model m-a", body)
+	}
+
+	if got := s.unscriptedModels(); !slices.Equal(got, []string{"m-a"}) {
+		t.Errorf("unscriptedModels = %q, want [m-a]", got)
+	}
+	if n := len(s.requestBodies(t)); n != 2 {
+		t.Errorf("recorded %d request bodies, want 2: a miss is still a request", n)
+	}
+}
+
+// A bare modelEntry is the one literal no constructor builds, and it carries no
+// reply: it is refused naming the model, not answered with an empty stream.
+func TestScriptedModelServerEntryWithNoReplyFailsLoudly(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {{}},
+	})
+
+	status, _, body := postModelResponse(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", status)
+	}
+	if !strings.Contains(body, "m-a") {
+		t.Errorf("body = %q, want it to name the model m-a", body)
+	}
 }
