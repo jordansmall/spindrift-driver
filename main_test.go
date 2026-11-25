@@ -274,19 +274,16 @@ func TestRunSubMillisecondAnswerStillStatesDurationFields(t *testing.T) {
 // a reader never mistakes "answered nothing" for "field not reported" — the
 // same rule that keeps the duration fields on the wire at 0ms.
 func TestRunEmptyFinalAnswerStatesEmptyResultText(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"model":"m-a","choices":[{"message":{"role":"assistant","content":""}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyCompletion(`{"model":"m-a","choices":[{"message":{"role":"assistant","content":""}}]}`)},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	text, ok := resultEvent(t, stdout.String())["text"]
+	text, ok := resultEvent(t, string(got.stdout))["text"]
 	if !ok {
-		t.Fatalf("result event omits %q on an empty answer, want it stated as %q: %q", "text", "", stdout.String())
+		t.Fatalf("result event omits %q on an empty answer, want it stated as %q: %q", "text", "", got.stdout)
 	}
 	if s, _ := text.(string); s != "" {
 		t.Errorf("result text = %v, want the empty string", text)
@@ -298,25 +295,26 @@ func TestRunEmptyFinalAnswerStatesEmptyResultText(t *testing.T) {
 // running total — and the result event carries their sum plus the models that
 // answered.
 func TestRunEmitsExactlyOneUsageEventPerModelCall(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"model":"m-a","usage":{"prompt_tokens":10,"completion_tokens":2},"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`,
-		`{"model":"m-b","usage":{"prompt_tokens":20,"completion_tokens":5},"choices":[{"message":{"role":"assistant","content":"done"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// The queue is keyed on the model REQUESTED (--model m), while the two replies
+	// name m-a and m-b: those ids are what the events report, not what was asked for.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"model":"m-a","usage":{"prompt_tokens":10,"completion_tokens":2},"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`),
+			replyCompletion(`{"model":"m-b","usage":{"prompt_tokens":20,"completion_tokens":5},"choices":[{"message":{"role":"assistant","content":"done"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
 	var usageEvents []map[string]any
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] == "usage" {
 			usageEvents = append(usageEvents, ev)
 		}
 	}
 	if len(usageEvents) != 2 {
-		t.Fatalf("stdout carries %d usage event(s), want one per Model call: %q", len(usageEvents), stdout.String())
+		t.Fatalf("stdout carries %d usage event(s), want one per Model call: %q", len(usageEvents), got.stdout)
 	}
 	wantCall := []struct {
 		messageID string
@@ -341,7 +339,7 @@ func TestRunEmitsExactlyOneUsageEventPerModelCall(t *testing.T) {
 		}
 	}
 
-	result := resultEvent(t, stdout.String())
+	result := resultEvent(t, string(got.stdout))
 	if turns, _ := result["num_turns"].(float64); int(turns) != 2 {
 		t.Errorf("result num_turns = %v, want 2 Model calls", result["num_turns"])
 	}
@@ -1076,42 +1074,38 @@ func (s *statusSequenceServer) gaps() []time.Duration {
 
 func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	// three rounds: tool call, tool call, final answer
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo again\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"do the thing", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	//
+	// An empty HOME is what keeps "no Subagent Tool" meaning no roster: the helper
+	// runs on real os.LookupEnv, so without it the run could resolve a home that
+	// holds Agent Files and grow the offer.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo again\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`),
+		},
+	}, "do the thing", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "all done" {
-		t.Errorf("result event text = %q, want the final answer with no added newline", got)
+	if text := resultText(t, string(got.stdout)); text != "all done" {
+		t.Errorf("result event text = %q, want the final answer with no added newline", text)
 	}
 
-	bodies := srv.requestBodies(t)
-	if len(bodies) != 3 {
-		t.Fatalf("POSTs = %d, want 3", len(bodies))
+	if len(got.requests) != 3 {
+		t.Fatalf("POSTs = %d, want 3", len(got.requests))
 	}
 
 	// every request must advertise the whole offer, and no Subagent Tool without
 	// a roster to name
 	wantOffer := []string{"bash", "edit", "write"}
-	for i, body := range bodies {
-		var parsed struct {
-			Tools []toolSpec `json:"tools"`
-		}
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			t.Fatalf("unmarshal request %d: %v", i+1, err)
-		}
-		if got := offeredNames(parsed.Tools); !reflect.DeepEqual(got, wantOffer) {
-			t.Errorf("request %d tools = %v, want %v", i+1, got, wantOffer)
+	for i, req := range got.requests {
+		if offer := postedToolNames(t, req.body); !reflect.DeepEqual(offer, wantOffer) {
+			t.Errorf("request %d tools = %v, want %v", i+1, offer, wantOffer)
 		}
 	}
 
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 
 	// request 2 carries the assistant tool_calls message plus the tool result
 	want2 := []recordedMessage{
@@ -1134,9 +1128,9 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	}
 
 	// one progress line per POST
-	stderrLines := strings.Count(strings.TrimSuffix(stderr.String(), "\n"), "\n") + 1
+	stderrLines := strings.Count(strings.TrimSuffix(got.stderr, "\n"), "\n") + 1
 	if stderrLines != 3 {
-		t.Errorf("stderr has %d lines, want 3 progress lines: %q", stderrLines, stderr.String())
+		t.Errorf("stderr has %d lines, want 3 progress lines: %q", stderrLines, got.stderr)
 	}
 }
 
@@ -1145,18 +1139,17 @@ func TestRunAutonomousLoopFullSequence(t *testing.T) {
 // usage event and before the next start, so a reader can attribute the pair to
 // msg-1 and never mistake a tool's output for assistant prose.
 func TestRunEmitsToolCallAndToolResultPair(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"all done"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := got.events
 	var kinds []string
 	for _, ev := range events {
 		kinds = append(kinds, fmt.Sprint(ev["kind"]))
@@ -1165,7 +1158,7 @@ func TestRunEmitsToolCallAndToolResultPair(t *testing.T) {
 	// tool pair; the pair sits between that usage and the next start.
 	wantKinds := []string{"start", "usage", "tool_call", "tool_result", "start", "text", "usage", "result"}
 	if !reflect.DeepEqual(kinds, wantKinds) {
-		t.Fatalf("stdout kinds = %v, want %v: %q", kinds, wantKinds, stdout.String())
+		t.Fatalf("stdout kinds = %v, want %v: %q", kinds, wantKinds, got.stdout)
 	}
 
 	callEv, resultEv := events[2], events[3]
@@ -1185,7 +1178,7 @@ func TestRunEmitsToolCallAndToolResultPair(t *testing.T) {
 
 	// tool_output is the Tool Result the Model got, byte for byte: same bounded
 	// string with its exit-code line, not a re-derived summary of it.
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 2 {
 		t.Fatalf("POSTs = %d, want 2", len(msgs))
 	}
@@ -1205,20 +1198,19 @@ func TestRunEmitsToolCallAndToolResultPair(t *testing.T) {
 // state the key at all while a non-zero exit states it — both on one turn, so
 // neither can be mistaken for the other's tool.
 func TestRunToolResultIsErrorTracksExitCode(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_ok","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo ok\"}"}},{"id":"call_fail","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 3\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a failing command is an ordinary result); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_ok","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo ok\"}"}},{"id":"call_fail","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 3\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failing command is an ordinary result); stderr = %q", got.code, got.stderr)
 	}
 
 	var order []string
 	results := map[string]map[string]any{}
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] != "tool_result" {
 			continue
 		}
@@ -1227,7 +1219,7 @@ func TestRunToolResultIsErrorTracksExitCode(t *testing.T) {
 		results[id] = ev
 	}
 	if !reflect.DeepEqual(order, []string{"call_ok", "call_fail"}) {
-		t.Fatalf("tool_result order = %v, want the call order [call_ok call_fail]: %q", order, stdout.String())
+		t.Fatalf("tool_result order = %v, want the call order [call_ok call_fail]: %q", order, got.stdout)
 	}
 	if ev, ok := results["call_ok"]["is_error"]; ok {
 		t.Errorf("a succeeding tool_result states is_error = %v, want the key absent (absence is false): %v", ev, results["call_ok"])
@@ -1317,17 +1309,19 @@ func TestToolResultEventCarriesTheStatedVerdict(t *testing.T) {
 // A run that delegates to nobody must look exactly like the run it was before
 // the field existed: no event line may grow a subagent key.
 func TestRunWithNoSubagentNeverStatesSubagent(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// The empty HOME keeps the run roster-free the way the old no-op lookupEnv stub
+	// did: with Agent Files on hand the Subagent Tool would be on offer, and the
+	// absence below would only prove the Model never reached for it.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if v, ok := ev["subagent"]; ok {
 			t.Errorf("%v states subagent = %v for a run with no delegation, want the key absent", ev["kind"], v)
 		}
