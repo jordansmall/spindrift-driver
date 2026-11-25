@@ -569,59 +569,59 @@ func TestSubagentFailureIsAnErrorToolResult(t *testing.T) {
 // Tools, so its offer is the bash floor — the grant is what limits it, and the
 // Subagent Tool is nothing it was given, which is where recursion stops.
 func TestSubagentChildIsNotOfferedTheSubagentTool(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 3 {
-		t.Fatalf("POSTs = %d, want parent, child, parent", len(sent))
+	if len(got.requests) != 3 {
+		t.Fatalf("POSTs = %d, want parent, child, parent", len(got.requests))
 	}
-	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
-		t.Errorf("parent offer = %v, want [bash edit write subagent]", got)
+	if names := postedToolNames(t, got.requests[0].body); !reflect.DeepEqual(names, []string{"bash", "edit", "write", "subagent"}) {
+		t.Errorf("parent offer = %v, want [bash edit write subagent]", names)
 	}
-	if got := postedToolNames(t, sent[1]); !reflect.DeepEqual(got, []string{"bash"}) {
-		t.Errorf("child offer = %v, want [bash] — an entry granting nothing leaves only the floor", got)
+	if names := postedToolNames(t, got.requests[1].body); !reflect.DeepEqual(names, []string{"bash"}) {
+		t.Errorf("child offer = %v, want [bash] — an entry granting nothing leaves only the floor", names)
 	}
 }
 
 // TestSubagentUnknownAgentIsAnOrdinaryResult: a name off the roster is an answer
 // for the Model, never a crash and never a spawn.
 func TestSubagentUnknownAgentIsAnOrdinaryResult(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"ghost\",\"task\":\"do the impossible\"}"}}]}}]}`,
-		completion("parent answer"),
+	// Only the parent's two turns are scripted: a queue for the roster's own model
+	// would answer a spawn this test is asserting never happens.
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"ghost\",\"task\":\"do the impossible\"}"}}]}}]}`),
+			replyCompletion(completion("parent answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 2 {
-		t.Fatalf("POSTs = %d, want the parent's two turns only — no spawn may be attempted", len(sent))
+	if len(got.requests) != 2 {
+		t.Fatalf("POSTs = %d, want the parent's two turns only — no spawn may be attempted", len(got.requests))
 	}
-	for i, raw := range sent {
-		if got := postedSpawn(t, raw).Model; got != "m-parent" {
-			t.Errorf("POST %d sent model %q, want only the parent's model", i, got)
+	for i, req := range got.requests {
+		if model := postedSpawn(t, req.body).Model; model != "m-parent" {
+			t.Errorf("POST %d sent model %q, want only the parent's model", i, model)
 		}
 	}
-	if relayed := relayedEvents(t, stdout.String()); len(relayed) != 0 {
+	if relayed := relayedEvents(t, string(got.stdout)); len(relayed) != 0 {
 		t.Errorf("stdout carries relayed child events for an unknown agent: %v", relayed)
 	}
-	_, resultEv := spawnPair(t, stdout.String())
+	_, resultEv := spawnPair(t, string(got.stdout))
 	out, _ := resultEv["tool_output"].(string)
 	if !strings.HasPrefix(out, "error:") || !strings.Contains(out, "ghost") {
 		t.Errorf("tool_output = %q, want an error:-prefixed result naming the unknown agent", out)
@@ -629,8 +629,8 @@ func TestSubagentUnknownAgentIsAnOrdinaryResult(t *testing.T) {
 	if resultEv["is_error"] != true {
 		t.Errorf("is_error = %v, want true", resultEv["is_error"])
 	}
-	if got := parentResult(t, stdout.String())["text"]; got != "parent answer" {
-		t.Errorf("parent result text = %v, want the run to continue", got)
+	if text := parentResult(t, string(got.stdout))["text"]; text != "parent answer" {
+		t.Errorf("parent result text = %v, want the run to continue", text)
 	}
 }
 
@@ -869,23 +869,23 @@ func TestSubagentRelayDropsNonObjectLines(t *testing.T) {
 // TestSubagentChildTurnDoesNotBumpParentNumTurns keeps num_turns what it has
 // always been: this process's own Model calls, however many a child made.
 func TestSubagentChildTurnDoesNotBumpParentNumTurns(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		withUsage(parentToolCallResponse, "m-parent", 100, 20),
-		usageCompletion("m-reviewer", "child answer", 7, 1),
-		usageCompletion("m-parent", "parent answer", 30, 5),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(withUsage(parentToolCallResponse, "m-parent", 100, 20)),
+			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
+		},
+		"m-reviewer": {replyCompletion(usageCompletion("m-reviewer", "child answer", 7, 1))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 	// The child ran a whole turn of its own inside the pair; the parent still
 	// counts only its two Model calls.
-	if got, _ := parentResult(t, stdout.String())["num_turns"].(float64); int(got) != 2 {
-		t.Errorf("parent result num_turns = %v, want the parent's own two Model calls", got)
+	if turns, _ := parentResult(t, string(got.stdout))["num_turns"].(float64); int(turns) != 2 {
+		t.Errorf("parent result num_turns = %v, want the parent's own two Model calls", turns)
 	}
 }
 
@@ -893,22 +893,22 @@ func TestSubagentChildTurnDoesNotBumpParentNumTurns(t *testing.T) {
 // result through the tally, never through a usage event the parent invents — a
 // reader that sums the usage events it sees must still get one per parent call.
 func TestSubagentRollUpAddsNoUsageEventOfTheParents(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		withUsage(parentToolCallResponse, "m-parent", 100, 20),
-		usageCompletion("m-reviewer", "child answer", 7, 1),
-		usageCompletion("m-parent", "parent answer", 30, 5),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(withUsage(parentToolCallResponse, "m-parent", 100, 20)),
+			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
+		},
+		"m-reviewer": {replyCompletion(usageCompletion("m-reviewer", "child answer", 7, 1))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
 	own, relayedUsage := 0, 0
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] != "usage" {
 			continue
 		}
@@ -927,10 +927,10 @@ func TestSubagentRollUpAddsNoUsageEventOfTheParents(t *testing.T) {
 		}
 	}
 	if own != 2 {
-		t.Errorf("stdout carries %d non-relayed usage events, want exactly one per parent Model call: %q", own, stdout.String())
+		t.Errorf("stdout carries %d non-relayed usage events, want exactly one per parent Model call: %q", own, got.stdout)
 	}
 	if relayedUsage != 1 {
-		t.Errorf("stdout carries %d relayed usage events, want the child's one: %q", relayedUsage, stdout.String())
+		t.Errorf("stdout carries %d relayed usage events, want the child's one: %q", relayedUsage, got.stdout)
 	}
 }
 
@@ -1280,50 +1280,50 @@ func resultStrings(t *testing.T, ev map[string]any, field string) []string {
 // criterion: the parent's result states what the whole session cost, child
 // Model calls included.
 func TestSubagentChildUsageRollsIntoParentResultTotals(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		withUsage(parentToolCallResponse, "m-parent", 100, 20),
-		usageCompletion("m-reviewer", "child answer", 7, 1),
-		usageCompletion("m-parent", "parent answer", 30, 5),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(withUsage(parentToolCallResponse, "m-parent", 100, 20)),
+			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
+		},
+		"m-reviewer": {replyCompletion(usageCompletion("m-reviewer", "child answer", 7, 1))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	got := resultTokenFields(t, parentResult(t, stdout.String()))
+	tokens := resultTokenFields(t, parentResult(t, string(got.stdout)))
 	want := map[string]float64{"input": 137, "output": 26, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0, "cost_usd": 0}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("parent result tokens = %v, want parent 130/25 plus child 7/1 = %v", got, want)
+	if !reflect.DeepEqual(tokens, want) {
+		t.Errorf("parent result tokens = %v, want parent 130/25 plus child 7/1 = %v", tokens, want)
 	}
-	if got["input"] == 130 && got["output"] == 25 {
-		t.Errorf("parent result tokens are the parent's own %v; the child's spend is missing", got)
+	if tokens["input"] == 130 && tokens["output"] == 25 {
+		t.Errorf("parent result tokens are the parent's own %v; the child's spend is missing", tokens)
 	}
 }
 
 // TestSubagentChildModelRollsIntoParentResultModels: a model that answered the
 // session answered it, whoever delegated the call to it.
 func TestSubagentChildModelRollsIntoParentResultModels(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		withUsage(parentToolCallResponse, "m-parent", 100, 20),
-		usageCompletion("m-reviewer", "child answer", 7, 1),
-		usageCompletion("m-parent", "parent answer", 30, 5),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(withUsage(parentToolCallResponse, "m-parent", 100, 20)),
+			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
+		},
+		"m-reviewer": {replyCompletion(usageCompletion("m-reviewer", "child answer", 7, 1))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
 	// Sorted, because sortedModelIDs is the only order the result contract has.
-	if got := resultStrings(t, parentResult(t, stdout.String()), "models"); !reflect.DeepEqual(got, []string{"m-parent", "m-reviewer"}) {
-		t.Errorf("parent result models = %v, want both model ids sorted", got)
+	if models := resultStrings(t, parentResult(t, string(got.stdout)), "models"); !reflect.DeepEqual(models, []string{"m-parent", "m-reviewer"}) {
+		t.Errorf("parent result models = %v, want both model ids sorted", models)
 	}
 }
 
