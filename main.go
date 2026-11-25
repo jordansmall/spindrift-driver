@@ -483,10 +483,18 @@ func planToolCall(call toolCall, s session) toolPlan {
 	if call.Function.Name == "edit" {
 		return planEditCall(call, input, s)
 	}
-	if call.Function.Name != "bash" {
-		name := call.Function.Name
-		return toolPlan{input: input, run: func() toolResult { return failedResult("error: unknown tool %q", name) }}
+	if call.Function.Name == "bash" {
+		return planBashCall(call, input, s)
 	}
+	name := call.Function.Name
+	return toolPlan{input: input, run: func() toolResult { return failedResult("error: unknown tool %q", name) }}
+}
+
+// planBashCall plans one bash Tool call, lifted out of planToolCall so a table
+// row can name it the way planSubagentCall, planWriteCall and planEditCall are
+// named. Planning only reads the command out of the arguments; the work itself
+// belongs to run.
+func planBashCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Command string `json:"command"`
 	}
