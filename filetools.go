@@ -28,28 +28,20 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return fileErrorPlan(input, "error: cannot parse tool arguments: %v", err)
+		return fileErrorPlan(input, unparseableArgs, err)
 	}
 	resolved, err := resolveFilePath(args.Path)
 	if err != nil {
 		return fileErrorPlan(input, "error: %v", err)
 	}
-	// The verdict travels as a value the closure reads back, the way bash and the
-	// Subagent Tool carry theirs: only run knows whether the Guard refused and
-	// what the write itself answered.
-	var failed bool
 	return toolPlan{
-		input:   input,
-		target:  resolved,
-		isError: func(string) bool { return failed },
-		run: func() string {
+		input:  input,
+		target: resolved,
+		run: func() toolResult {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
-				failed = true
-				return refusal
+				return toolResult{text: refusal, failed: true}
 			}
-			res := writeFileTool(resolved, args.Content)
-			failed = res.failed
-			return res.text
+			return writeFileTool(resolved, args.Content)
 		},
 	}
 }
@@ -83,7 +75,7 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 		ReplaceAll bool   `json:"replace_all"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return fileErrorPlan(input, "error: cannot parse tool arguments: %v", err)
+		return fileErrorPlan(input, unparseableArgs, err)
 	}
 	// Refused rather than counted: strings.Count(s, "") is len(s)+1, so an empty
 	// old string reads as a file full of matches and a replace_all would scatter
@@ -95,22 +87,14 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 	if err != nil {
 		return fileErrorPlan(input, "error: %v", err)
 	}
-	// The verdict travels as a value the closure reads back, the way bash and the
-	// Subagent Tool carry theirs: only run knows whether the Guard refused and
-	// what the edit itself answered.
-	var failed bool
 	return toolPlan{
-		input:   input,
-		target:  resolved,
-		isError: func(string) bool { return failed },
-		run: func() string {
+		input:  input,
+		target: resolved,
+		run: func() toolResult {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
-				failed = true
-				return refusal
+				return toolResult{text: refusal, failed: true}
 			}
-			res := editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
-			failed = res.failed
-			return res.text
+			return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
 		},
 	}
 }
@@ -143,14 +127,11 @@ func editFileTool(path, oldString, newString string, replaceAll bool) toolResult
 	return toolResult{text: fmt.Sprintf("edited %s: replaced %d %s", path, count, noun)}
 }
 
-// fileErrorPlan is a file Tool plan that never touches the filesystem, so it
-// states its own verdict outright rather than leaving isError nil: the inherited
-// toolResultIsError answers true for these messages only because they lack an
-// exit-code line, and a rule that works by accident is one a reword can silently
-// turn into a reported success.
+// fileErrorPlan is a file Tool plan that never touches the filesystem: nothing
+// ran, so the plan states the failure the call text reports rather than leaving a
+// verdict to be inferred from how that text reads.
 func fileErrorPlan(input any, format string, a ...any) toolPlan {
-	msg := fmt.Sprintf(format, a...)
-	return toolPlan{input: input, isError: func(string) bool { return true }, run: func() string { return msg }}
+	return toolPlan{input: input, run: func() toolResult { return failedResult(format, a...) }}
 }
 
 // writeFileTool writes content over path, creating the parents the Model did not

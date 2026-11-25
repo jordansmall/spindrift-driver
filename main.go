@@ -316,25 +316,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			} else {
 				lastKey, repeat = key, 1
 			}
-			var output string
+			var result toolResult
 			refused := repeat >= repeatedCallRefuseLimit
 			if refused {
 				refusals++
-				output = repeatedCallRefusal(tc.Function.Name, repeat)
+				result = toolResult{text: repeatedCallRefusal(tc.Function.Name, repeat)}
 			} else {
 				// Only the breaker's own refusals chain. A call a Guard Hook blocked comes
 				// back through plan.run() like any other result, and the Model does get to
 				// react to it, so it breaks the streak rather than feeding the counter.
 				refusals = 0
-				output = plan.run()
+				result = plan.run()
 			}
-			result := toolResultEvent(messageID, toolID, tc.Function.Name, plan, output)
+			ev := toolResultEvent(messageID, toolID, tc.Function.Name, plan, result)
 			if refused {
-				// The plan's own rule cannot judge a refusal: the bash rule closes over a
-				// verdict only plan.run() writes, and a refused call never got there.
-				result.IsError = true
+				// The breaker's refusal is the one Tool Result the loop authors instead of
+				// receiving from a Tool, so it is the one verdict no Tool stated and the loop
+				// has to. Moving the breaker behind a plan of its own is its own change.
+				ev.IsError = true
 			}
-			_ = events.emit(result)
+			_ = events.emit(ev)
 			if refusals >= repeatedCallEndLimit {
 				// Returning before the replay leaves the refusal out of the conversation
 				// the run is ending over, and any later call of this batch never got a
@@ -345,7 +346,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			}
 			// The replayed Tool Result message is unchanged, idless calls included:
 			// the synthesised tool id belongs to the event stream, not to the Model.
-			messages = append(messages, chatMessage{Role: "tool", Content: output, ToolCallID: tc.ID})
+			messages = append(messages, chatMessage{Role: "tool", Content: result.text, ToolCallID: tc.ID})
 		}
 	}
 	turnLimit := fmt.Errorf("reached the turn limit of %d without a final answer", cfg.maxTurns)
@@ -448,15 +449,9 @@ type toolPlan struct {
 	// subagent is the agent a Subagent Tool call acted on, and "" for every other
 	// tool, so the subagent key stays off every ordinary tool_result line.
 	subagent string
-	// isError is the rule that decides is_error for this plan's output; nil means
-	// toolResultIsError, so a tool whose verdict is not that suffix test states its
-	// own: a Subagent Tool Result is the child's answer, and a Bash Tool Result is
-	// judged on what the command exited with, before any summary hook replaces the
-	// text.
-	isError func(output string) bool
-	// run produces the exact Tool Result string that goes back into the
-	// conversation.
-	run func() string
+	// run produces the Tool Result: the text the Model is sent and the verdict the
+	// Tool states.
+	run func() toolResult
 }
 
 // session is what a tool call needs from the run that made it. A Subagent Tool
@@ -473,23 +468,18 @@ type session struct {
 	relay relayFunc
 }
 
-// toolResultEvent is the tool_result half of the pair. The plan brings its own
-// is_error rule because the exit-code suffix rule describes a command and
-// nothing else: a result with no exit-code line — a subagent's answer — would
-// otherwise be reported as a failure on every success.
-func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, output string) event {
-	isError := plan.isError
-	if isError == nil {
-		isError = toolResultIsError
-	}
+// toolResultEvent is the tool_result half of the pair. It only copies the verdict
+// the Tool stated: no rule reads the text to re-guess it, so a Tool Result that is
+// prose — a subagent's answer, a summary — carries the verdict its Tool knew.
+func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, result toolResult) event {
 	return event{
 		Kind:       "tool_result",
 		MessageID:  messageID,
 		ToolID:     toolID,
 		ToolName:   toolName,
 		ToolTarget: plan.target,
-		ToolOutput: output,
-		IsError:    isError(output),
+		ToolOutput: result.text,
+		IsError:    result.failed,
 		Subagent:   plan.subagent,
 	}
 }
@@ -514,6 +504,18 @@ func repeatedCallRefusal(toolName string, repeat int) string {
 	return fmt.Sprintf("error: %s was already called %d times in a row with these exact arguments, so it was not run again; take a different action", toolName, repeat-1)
 }
 
+// unparseableArgs is the answer every Tool gives when its own arguments do not
+// parse: shared because the Model reads this text to correct itself, so one
+// Tool's parse failure must never drift from another's wording.
+const unparseableArgs = "error: cannot parse tool arguments: %v"
+
+// failedResult is the Tool Result of a call that never got as far as running:
+// with nothing executed there is no outcome to read back, so the plan states the
+// failure alongside the text the Model is told.
+func failedResult(format string, a ...any) toolResult {
+	return toolResult{text: fmt.Sprintf(format, a...), failed: true}
+}
+
 // planToolCall parses one tool call without executing it. An unknown tool and
 // unparseable arguments are ordinary results rather than crashes, so the plan
 // answers with the very error text the Model has always received.
@@ -534,13 +536,13 @@ func planToolCall(call toolCall, s session) toolPlan {
 	}
 	if call.Function.Name != "bash" {
 		name := call.Function.Name
-		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: unknown tool %q", name) }}
+		return toolPlan{input: input, run: func() toolResult { return failedResult("error: unknown tool %q", name) }}
 	}
 	var args struct {
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: cannot parse tool arguments: %v", err) }}
+		return toolPlan{input: input, run: func() toolResult { return failedResult(unparseableArgs, err) }}
 	}
 	// The Guard chain runs when the call runs, not when it is planned: a hook is a
 	// script bounded by guardHookTimeout, and planning must stay parsing so the
@@ -550,28 +552,22 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// runBashTool is never reached. A rewrite is host policy on what executes, so
 	// it replaces the command runBashTool is handed while tool_target keeps
 	// reporting the command the Model asked for.
-	// is_error stays the command's own verdict: a summary replaces only the Tool
-	// Result text, and prose cannot say whether the command exited cleanly. The
-	// rule closes over failed, which run writes from the pre-summary value — an
-	// ordering that is load bearing, because the run loop calls plan.run() before
-	// it hands the output to toolResultEvent.
-	var failed bool
 	return toolPlan{
-		input:   input,
-		target:  args.Command,
-		isError: func(string) bool { return failed },
-		run: func() string {
+		input:  input,
+		target: args.Command,
+		run: func() toolResult {
 			command, refusal := s.cfg.hooks.guardCommand(args.Command, call.Function.Name, s.stderr)
 			if refusal != "" {
 				// A refused call never ran, so there is no exit status to read a verdict
 				// from: the denial is itself the failure. With nothing to summarise, the
 				// summary hook is not asked.
-				failed = true
-				return refusal
+				return toolResult{text: refusal, failed: true}
 			}
 			res := runBashTool(command)
-			failed = res.failed
-			return s.cfg.hooks.summarize(call.Function.Name, command, res.text, s.stderr)
+			// The verdict is taken before the summary hook is asked, because its prose may
+			// replace the text and prose cannot say what a command exited with.
+			res.text = s.cfg.hooks.summarize(call.Function.Name, command, res.text, s.stderr)
+			return res
 		},
 	}
 }
@@ -586,22 +582,6 @@ func decodeToolArguments(raw string) any {
 		return raw
 	}
 	return v
-}
-
-// toolResultIsError is the is_error test: a Tool Result always closes with an
-// exit-code line, so anything that is not a clean 0 — a non-zero exit, a signal,
-// a timeout, or an error prefix that never ran a command — reads as the tool
-// having failed. A succeeding command leaves is_error false, which omitempty
-// keeps off the wire entirely.
-//
-// Gotcha: the clean-0 literal lives in runBashTool's success return, not here,
-// and this match is a suffix test on the last line it appends. Reword that
-// suffix there and every tool still planned by this rule flips to is_error true
-// silently — the two sites have to change together. toolResultEvent is the
-// third: it is where a plan opts out of this rule, so a new tool that needs a
-// different verdict sets toolPlan.isError rather than bending the suffix here.
-func toolResultIsError(output string) bool {
-	return !strings.HasSuffix(output, "\nexit code: 0")
 }
 
 func main() {
