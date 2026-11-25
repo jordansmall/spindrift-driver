@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -203,6 +204,61 @@ func TestRunDriverReportsWireFactsAndArrivalGaps(t *testing.T) {
 	}
 }
 
+// A migrated run test asserts on the conversation each POST carried rather than on
+// raw JSON: messageBodies returns one []recordedMessage per POST, in arrival order,
+// read off the same recorded requests the wire facts come from, and
+// requestMessages reads one of those bodies on its own.
+func TestRunDriverResultExposesPostedMessages(t *testing.T) {
+	bashTurn := replyCompletion(fmt.Sprintf(`{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":%q}}]}}]}`,
+		`{"command":"echo one"}`))
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {bashTurn, replyCompletion(`{"choices":[{"index":0,"message":{"role":"assistant","content":"all done"},"finish_reason":"stop"}]}`)},
+	}, "summarise the diff", withFlags("--model", "m"))
+
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
+	}
+	if len(got.requests) != 2 {
+		t.Fatalf("server recorded %d request(s), want the 2 the Tool loop made: %v", len(got.requests), got.requests)
+	}
+
+	bodies := got.messageBodies(t)
+
+	// The first POST carries only the opening turn the run started from.
+	first := bodies[0]
+	if len(first) != 2 {
+		t.Fatalf("first POST carries %d message(s), want the opening system and user turns: %+v", len(first), first)
+	}
+	if first[0].Role != "system" {
+		t.Errorf("first POST opens with role %q, want %q", first[0].Role, "system")
+	}
+	if first[1].Role != "user" || first[1].Content != "summarise the diff" {
+		t.Errorf("first POST user turn = %+v, want role %q with the prompt %q as content", first[1], "user", "summarise the diff")
+	}
+
+	// Arrival order, not a reroll: the second POST is that same conversation with
+	// the first turn's Tool Call and its result appended.
+	second := bodies[1]
+	if len(second) <= len(first) {
+		t.Fatalf("second POST carries %d message(s), want the first POST's %d plus the Tool turn: %+v", len(second), len(first), second)
+	}
+	if !reflect.DeepEqual(second[:len(first)], first) {
+		t.Errorf("second POST does not start with the first POST's conversation:\nfirst  = %+v\nsecond = %+v", first, second)
+	}
+	if sent := second[len(first)]; sent.Role != "assistant" || len(sent.ToolCalls) != 1 || sent.ToolCalls[0].ID != "call_1" {
+		t.Errorf("second POST continues with %+v, want the assistant turn calling call_1", sent)
+	}
+	if last := second[len(second)-1]; last.Role != "tool" || last.ToolCallID != "call_1" {
+		t.Errorf("second POST ends with %+v, want the tool result answering call_1", last)
+	}
+
+	// The single-body counterpart reads the same conversation out of one recorded
+	// body, for a test that only inspects one POST.
+	if one := requestMessages(t, got.requests[1].body); !reflect.DeepEqual(one, second) {
+		t.Errorf("requestMessages of the second POST = %+v, want the same conversation messageBodies reported: %+v", one, second)
+	}
+}
+
 // runDriverConfig writes the ONE Driver Config a helper-driven run reads and
 // hands back its path, so a roster and a Hook Manifest are configured the way an
 // operator configures them — two keys of one file — rather than through any
@@ -255,6 +311,31 @@ func TestRunDriverExtraFlagsReachTheDriver(t *testing.T) {
 	if !strings.Contains(string(got.stdout), "the b answer") {
 		t.Errorf("stdout = %q, want m-b's answer", got.stdout)
 	}
+}
+
+// messageBodies returns the conversation each POST sent, one []recordedMessage per
+// entry of r.requests and in the same arrival order — the message-level view a
+// migrated run test asserts on where it used to read the old fake's rawBodies.
+func (r runResult) messageBodies(t *testing.T) [][]recordedMessage {
+	t.Helper()
+	out := make([][]recordedMessage, 0, len(r.requests))
+	for _, req := range r.requests {
+		out = append(out, requestMessages(t, req.body))
+	}
+	return out
+}
+
+// requestMessages reads the messages out of one recorded request body, failing the
+// test on a body that is not valid JSON the way the old fake's accessor did.
+func requestMessages(t *testing.T, raw []byte) []recordedMessage {
+	t.Helper()
+	var body struct {
+		Messages []recordedMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("recorded request body %q is not JSON: %v", raw, err)
+	}
+	return body.Messages
 }
 
 // requestModel reads the model id out of one recorded request body, which is the
