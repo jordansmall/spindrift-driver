@@ -1624,43 +1624,43 @@ func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
 }
 
 func TestRunTurnCap(t *testing.T) {
-	srv := newScriptedChatServer(t) // server runs dry on purpose; cap must hit first
+	// One reply per turn the cap allows: the run has to stop on --max-turns rather
+	// than on the script running dry, so the queue holds exactly max-turns entries.
 	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
-	srv.responses = []string{forever, forever, forever, forever}
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--max-turns", "3", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(forever), replyCompletion(forever), replyCompletion(forever)},
+	}, "p", withFlags("--model", "m", "--max-turns", "3"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", got.code, got.stderr)
 	}
-	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "turn limit") {
-		t.Errorf("error event text = %q, want the turn-limit sentence", got)
+	if text := oneErrorEvent(t, string(got.stdout)); !strings.Contains(text, "turn limit") {
+		t.Errorf("error event text = %q, want the turn-limit sentence", text)
 	}
-	if bodies := srv.requestBodies(t); len(bodies) != 3 {
-		t.Errorf("POSTs = %d, want exactly max-turns 3", len(bodies))
+	if len(got.requests) != 3 {
+		t.Errorf("POSTs = %d, want exactly max-turns 3", len(got.requests))
 	}
-	if !strings.Contains(stderr.String(), "turn") {
-		t.Errorf("stderr = %q, want a message about exhausting the turns", stderr.String())
+	if !strings.Contains(got.stderr, "turn") {
+		t.Errorf("stderr = %q, want a message about exhausting the turns", got.stderr)
 	}
 }
 
 // The turn cap is a non-zero exit like any other, so it owes an error event
 // that states the limit and its number rather than just the count of POSTs.
 func TestRunTurnCapEmitsErrorEventNamingTheLimit(t *testing.T) {
-	srv := newScriptedChatServer(t)
+	// Two turns is the limit, and a turn is one POST, so two replies are all the run
+	// can spend before the cap stops it.
 	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
-	srv.responses = []string{forever, forever, forever}
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--max-turns", "2", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(forever), replyCompletion(forever)},
+	}, "p", withFlags("--model", "m", "--max-turns", "2"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 on turn cap; stderr = %q", got.code, got.stderr)
 	}
-	if got := oneErrorEvent(t, stdout.String()); got != "reached the turn limit of 2 without a final answer" {
-		t.Errorf("error event text = %q, want the turn-limit sentence naming the limit 2", got)
+	if text := oneErrorEvent(t, string(got.stdout)); text != "reached the turn limit of 2 without a final answer" {
+		t.Errorf("error event text = %q, want the turn-limit sentence naming the limit 2", text)
 	}
-	if !strings.Contains(stderr.String(), "reached the turn limit of 2 without a final answer") {
-		t.Errorf("stderr = %q, want the turn-limit line as today", stderr.String())
+	if !strings.Contains(got.stderr, "reached the turn limit of 2 without a final answer") {
+		t.Errorf("stderr = %q, want the turn-limit line as today", got.stderr)
 	}
 }
 
@@ -1670,19 +1670,22 @@ func TestRunTurnCapEmitsErrorEventNamingTheLimit(t *testing.T) {
 // points it at a different action. A refusal is a Tool Result and not a run
 // failure, so the run still reaches its final answer.
 func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
+	// Three identical calls plus the answer that closes the run: the third call is
+	// refused on the Driver side, so the Model gets a fourth turn to move on.
 	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
-	srv := newScriptedChatServer(t,
-		forever, forever, forever,
-		`{"choices":[{"message":{"role":"assistant","content":"moved on"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(forever),
+			replyCompletion(forever),
+			replyCompletion(forever),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"moved on"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	events := stdoutEvents(t, raw)
+	raw := string(got.stdout)
+	events := got.events
 	var results []map[string]any
 	for i, ev := range events {
 		if ev["kind"] != "tool_result" {
@@ -1716,15 +1719,15 @@ func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
 	}
 	// The refusal is the conversation's Tool Result verbatim, so the Model is told
 	// exactly what the event stream reported.
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 4 {
 		t.Fatalf("POSTs = %d, want 4 (three calls plus the final answer)", len(msgs))
 	}
 	if last := msgs[3][len(msgs[3])-1]; last.Role != "tool" || last.Content != refusal {
 		t.Errorf("replayed tool message = %+v, want role tool carrying the refusal %q", last, refusal)
 	}
-	if got := resultText(t, raw); got != "moved on" {
-		t.Errorf("result event text = %q, want the run's own final answer", got)
+	if text := resultText(t, raw); text != "moved on" {
+		t.Errorf("result event text = %q, want the run's own final answer", text)
 	}
 }
 
@@ -1734,19 +1737,24 @@ func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
 func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
 	callA := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
 	callB := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo other\"}"}}]}}]}`
-	srv := newScriptedChatServer(t,
-		callA, callA, callB, callA, callA,
-		`{"choices":[{"message":{"role":"assistant","content":"no call was a third in a row"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// Five calls that never reach three identical in a row, plus the closing answer:
+	// one reply per POST the run makes.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(callA),
+			replyCompletion(callA),
+			replyCompletion(callB),
+			replyCompletion(callA),
+			replyCompletion(callA),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"no call was a third in a row"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
+	raw := string(got.stdout)
 	var results []map[string]any
-	for _, ev := range stdoutEvents(t, raw) {
+	for _, ev := range got.events {
 		if ev["kind"] == "tool_result" {
 			results = append(results, ev)
 		}
@@ -1768,8 +1776,8 @@ func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
 	if !strings.Contains(raw, "other") {
 		t.Errorf("stdout = %q, want call B's real output so the alternating call ran too", raw)
 	}
-	if got := resultText(t, raw); got != "no call was a third in a row" {
-		t.Errorf("result event text = %q, want the run's own final answer", got)
+	if text := resultText(t, raw); text != "no call was a third in a row" {
+		t.Errorf("result event text = %q, want the run's own final answer", text)
 	}
 }
 
@@ -1779,21 +1787,28 @@ func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
 func TestRunThreeConsecutiveRefusalsEndTheRun(t *testing.T) {
 	const wantErr = "repeated the same bash call so often it was refused 3 times in a row, so the run ended"
 	forever := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
-	srv := newScriptedChatServer(t, forever, forever, forever, forever, forever)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 after three refusals in a row; stderr = %q", code, stderr.String())
+	// Two turns that run the command, then three that are refused before the run ends
+	// it — five replies, which is fewer than the default turn cap would allow.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(forever),
+			replyCompletion(forever),
+			replyCompletion(forever),
+			replyCompletion(forever),
+			replyCompletion(forever),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 after three refusals in a row; stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	if got := oneErrorEvent(t, raw); got != wantErr {
-		t.Errorf("error event text = %q, want %q", got, wantErr)
+	raw := string(got.stdout)
+	if text := oneErrorEvent(t, raw); text != wantErr {
+		t.Errorf("error event text = %q, want %q", text, wantErr)
 	}
-	if !strings.Contains(stderr.String(), wantErr) {
-		t.Errorf("stderr = %q, want the breaker sentence the error event carries", stderr.String())
+	if !strings.Contains(got.stderr, wantErr) {
+		t.Errorf("stderr = %q, want the breaker sentence the error event carries", got.stderr)
 	}
-	events := stdoutEvents(t, raw)
+	events := got.events
 	var results []map[string]any
 	for i, ev := range events {
 		if ev["kind"] != "tool_result" {
@@ -1817,8 +1832,8 @@ func TestRunThreeConsecutiveRefusalsEndTheRun(t *testing.T) {
 	if last["is_error"] != true {
 		t.Errorf("last tool_result is_error = %v, want true: %v", last["is_error"], last)
 	}
-	if bodies := srv.requestBodies(t); len(bodies) != 5 {
-		t.Errorf("POSTs = %d, want 5: the run stopped on the third refusal, not at the turn cap", len(bodies))
+	if len(got.requests) != 5 {
+		t.Errorf("POSTs = %d, want 5: the run stopped on the third refusal, not at the turn cap", len(got.requests))
 	}
 }
 
@@ -3689,17 +3704,16 @@ func TestChatRequestWireShape(t *testing.T) {
 
 	// The same fields must be on the body the Driver actually POSTs, not just
 	// on a hand-built struct: sendChat owns the envelope.
-	drv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", drv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	sent := drv.requestBodies(t)
-	if len(sent) != 1 {
-		t.Fatalf("POSTs = %d, want 1", len(sent))
+	if len(got.requests) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(got.requests))
 	}
-	assertStreamFields(t, "sent request body", sent[0])
+	assertStreamFields(t, "sent request body", got.requests[0].body)
 
 	// exactly one function tool, named bash, with a command:string schema
 	tools, ok := top["tools"].([]any)
