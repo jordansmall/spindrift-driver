@@ -1884,17 +1884,20 @@ func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
 	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
-	srv := newStatusSequenceServer(t, "recovered after retries", 500, 500)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 after the transient 5xxs; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered after retries"}}]}`),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 after the transient 5xxs; stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "recovered after retries" {
-		t.Errorf("result event text = %q, want exactly the final answer", got)
+	if text := resultText(t, string(got.stdout)); text != "recovered after retries" {
+		t.Errorf("result event text = %q, want exactly the final answer", text)
 	}
-	if n := srv.postCount(); n != 3 {
+	if n := len(got.requests); n != 3 {
 		t.Errorf("POSTs = %d, want 3 (two retried 500s plus the success)", n)
 	}
 }
@@ -1907,25 +1910,27 @@ func TestRunRetryBackoffSpacesAttempts(t *testing.T) {
 	chatRetryAttempts, chatRetryBackoff = 3, 60*time.Millisecond
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
-	srv := newStatusSequenceServer(t, "slow and steady", 500, 500)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"slow and steady"}}]}`),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	gaps := srv.gaps()
-	if len(gaps) != 2 {
-		t.Fatalf("gaps between POSTs = %d, want 2 (3 POSTs); got %v", len(gaps), gaps)
+	if len(got.gaps) != 2 {
+		t.Fatalf("gaps between POSTs = %d, want 2 (3 POSTs); got %v", len(got.gaps), got.gaps)
 	}
-	if gaps[0] < 60*time.Millisecond {
-		t.Errorf("first retry waited %s, want at least the injected backoff 60ms", gaps[0])
+	if got.gaps[0] < 60*time.Millisecond {
+		t.Errorf("first retry waited %s, want at least the injected backoff 60ms", got.gaps[0])
 	}
-	if gaps[1] < 120*time.Millisecond {
-		t.Errorf("second retry waited %s, want at least double the injected backoff 120ms", gaps[1])
+	if got.gaps[1] < 120*time.Millisecond {
+		t.Errorf("second retry waited %s, want at least double the injected backoff 120ms", got.gaps[1])
 	}
-	if gaps[1] <= gaps[0] {
-		t.Errorf("waits = %v, want the second strictly longer than the first (doubling)", gaps)
+	if got.gaps[1] <= got.gaps[0] {
+		t.Errorf("waits = %v, want the second strictly longer than the first (doubling)", got.gaps)
 	}
 }
 
