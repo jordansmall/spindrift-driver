@@ -2508,21 +2508,18 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
 	}()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", "200")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"choices":[`)
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err == nil {
-			conn.Close()
-		}
-	}))
-	defer srv.Close()
+	// Driven through run() directly rather than runDriver: both assertions read the
+	// endpoint URL out of the diagnostic, and runResult exposes no URL.
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {dropAfterFrames(`{"choices":[`)},
+	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	// The queue holds the one drop entry and chatRetryAttempts is 1, so a second
+	// POST would be an unscripted request -- and runDriver, which checks this for
+	// its callers, is not in play here.
+	srv.checkNoUnscriptedRequests(t)
 
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the response body is cut short; stderr = %q", stderr.String())
@@ -2530,7 +2527,7 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "read response:") {
 		t.Errorf("error event text = %q, want the read-response leg named", got)
 	}
-	got := driverErrorLine(stderr.String(), srv.URL+"/chat/completions")
+	got := driverErrorLine(stderr.String(), srv.url()+"/chat/completions")
 	if !strings.Contains(got, "read response:") {
 		t.Errorf("error line = %q, want the read-response leg named", got)
 	}
