@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // modelEntry is one scripted answer a scriptedModelServer holds for a model id.
@@ -67,7 +68,7 @@ func reject(status int, headers map[string]string, body string) modelEntry {
 type scriptedModelServer struct {
 	mu     sync.Mutex
 	queues map[string][]modelEntry
-	bodies [][]byte
+	reqs   []recordedRequest
 	// missed names, in arrival order, the models a POST asked for that no queue
 	// could answer — exhausted or never scripted. The handler only records them:
 	// it runs on the server's goroutines, where t.Fatalf would panic, so the test
@@ -84,7 +85,13 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 		// The handler runs on the server's goroutines, so recording and spending
 		// share one critical section with requestBodies.
 		s.mu.Lock()
-		s.bodies = append(s.bodies, body)
+		s.reqs = append(s.reqs, recordedRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			header: r.Header.Clone(),
+			at:     time.Now(),
+			body:   body,
+		})
 		var req struct {
 			Model string `json:"model"`
 		}
@@ -151,13 +158,51 @@ func (e modelEntry) sseBody() string {
 
 func (s *scriptedModelServer) url() string { return s.srv.URL }
 
+// recordedRequest is one POST as it arrived on the wire, body and all: the facts a
+// test asserts about how it asked, not only what it asked.
+//
+// header is a clone taken under the handler's hands. Keeping r.Header itself would
+// hand the record a map the net/http read loop owns and may still be writing, so
+// an absence checked after the run finished would be a verdict on nothing.
+type recordedRequest struct {
+	method string
+	path   string
+	header http.Header
+	at     time.Time
+	body   []byte
+}
+
 // requestBodies returns every recorded request body in arrival order.
 func (s *scriptedModelServer) requestBodies(t *testing.T) [][]byte {
 	t.Helper()
+	recs := s.recordedRequests(t)
+	out := make([][]byte, len(recs))
+	for i, rec := range recs {
+		out[i] = rec.body
+	}
+	return out
+}
+
+// recordedRequests returns every POST taken, in arrival order, with its wire facts
+// intact.
+func (s *scriptedModelServer) recordedRequests(t *testing.T) []recordedRequest {
+	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([][]byte, len(s.bodies))
-	copy(out, s.bodies)
+	return slices.Clone(s.reqs)
+}
+
+// gaps returns the wait between consecutive POST arrivals, one entry per pair, so
+// len(gaps) counts waits rather than requests. The timestamps are taken in the same
+// critical section that spends the queue, so a gap is the wait between two entries
+// being handed out and cannot straddle an unrecorded request.
+func (s *scriptedModelServer) gaps() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]time.Duration, 0, len(s.reqs))
+	for i := 1; i < len(s.reqs); i++ {
+		out = append(out, s.reqs[i].at.Sub(s.reqs[i-1].at))
+	}
 	return out
 }
 
@@ -282,6 +327,92 @@ func TestScriptedModelServerRequestBodiesKeepsEveryPostInOrder(t *testing.T) {
 		if got := string(bodies[i]); got != want {
 			t.Errorf("body %d = %q, want %q", i, got, want)
 		}
+	}
+}
+
+// The headers are cloned rather than kept by reference: `_, ok :=
+// header["Authorization"]` is only a verdict on a request if nothing hands the
+// map out again after the handler returns.
+func TestScriptedModelServerRecordsMethodPathAndHeadersOfEachPost(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(textChunk("one"))), replyFrames(sseStream(textChunk("two")))},
+	})
+
+	postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	postModelWithBearer(t, s.url()+"/chat/completions", "secret-token", `{"model":"m-a","messages":[]}`)
+
+	recs := s.recordedRequests(t)
+	if len(recs) != 2 {
+		t.Fatalf("recorded %d requests, want 2", len(recs))
+	}
+	for i, rec := range recs {
+		if rec.method != http.MethodPost {
+			t.Errorf("request %d method = %q, want POST", i, rec.method)
+		}
+		if rec.path != "/chat/completions" {
+			t.Errorf("request %d path = %q, want /chat/completions", i, rec.path)
+		}
+		if got := rec.header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("request %d Content-Type = %q, want application/json", i, got)
+		}
+		if !json.Valid(rec.body) {
+			t.Errorf("request %d body = %q, want the raw request body alongside the wire facts", i, rec.body)
+		}
+	}
+	if _, ok := recs[0].header["Authorization"]; ok {
+		t.Errorf("request 0 carries Authorization %q, want the header absent from the record entirely", recs[0].header.Get("Authorization"))
+	}
+	vals, ok := recs[1].header["Authorization"]
+	if !ok || len(vals) != 1 || vals[0] != "Bearer secret-token" {
+		t.Errorf("request 1 Authorization = %v (present %v), want the one value %q", vals, ok, "Bearer secret-token")
+	}
+}
+
+// postModelWithBearer posts with the Authorization header the Driver sends its
+// requests under, so a test can tell an absent header in the record from a
+// present one.
+func postModelWithBearer(t *testing.T, url, bearer, body string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build POST %s: %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+}
+
+// gaps reports one duration per pair of consecutive arrivals, so a backoff test
+// counts waits rather than requests — which is also why a lone POST reports no
+// gap at all instead of a zero one.
+func TestScriptedModelServerGapsReportsWaitBetweenArrivals(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(textChunk("one"))), replyFrames(sseStream(textChunk("two")))},
+	})
+
+	postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if got := s.gaps(); len(got) != 0 {
+		t.Fatalf("gaps after one POST = %v, want none", got)
+	}
+
+	// The bound sits well under what is slept on purpose: this pins that an
+	// arrival gap is measured at all, not how quickly this machine sleeps.
+	time.Sleep(20 * time.Millisecond)
+	postModel(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+
+	got := s.gaps()
+	if len(got) != 1 {
+		t.Fatalf("gaps after two POSTs = %d, want 1: %v", len(got), got)
+	}
+	if got[0] < 10*time.Millisecond {
+		t.Errorf("gap = %v, want at least the 10ms floor below the 20ms slept", got[0])
 	}
 }
 

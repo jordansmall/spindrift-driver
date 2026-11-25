@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // runResult is what one helper-driven run reports back: everything a run can be
@@ -22,8 +23,14 @@ type runResult struct {
 	// events is stdout read back through stdoutEvents.
 	events []map[string]any
 	stderr string
-	// requests holds every request body the scripted server took, in arrival order.
-	requests [][]byte
+	// requests holds every request the scripted server took, in arrival order, wire
+	// facts and body together: the body and the headers a test asserts on belong to
+	// the same POST, so they are read off one entry.
+	requests []recordedRequest
+	// gaps holds the wait between consecutive request arrivals, so a backoff test
+	// reads the spacing the run actually left rather than reconstructing it from the
+	// arrival times.
+	gaps []time.Duration
 }
 
 // runOption configures one aspect of a helper-driven run.
@@ -109,7 +116,8 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 		stdout:   []byte(raw),
 		events:   stdoutEvents(t, raw),
 		stderr:   stderr.String(),
-		requests: srv.requestBodies(t),
+		requests: srv.recordedRequests(t),
+		gaps:     srv.gaps(),
 	}
 }
 
@@ -154,10 +162,44 @@ func TestRunDriverReturnsCodeEventsStderrAndRequests(t *testing.T) {
 	}
 
 	if len(got.requests) != 1 {
-		t.Fatalf("server recorded %d request(s), want 1: %s", len(got.requests), got.requests)
+		t.Fatalf("server recorded %d request(s), want 1: %v", len(got.requests), got.requests)
 	}
-	if model := requestModel(t, got.requests[0]); model != "m-a" {
+	if model := requestModel(t, got.requests[0].body); model != "m-a" {
 		t.Errorf("recorded request model = %q, want %q", model, "m-a")
+	}
+}
+
+// The wire facts a run test asserts about how the Model was asked for come back on
+// the run's own result: one record per POST holding method, path and request
+// headers next to the body, so the body and the headers never come from two
+// different entries. A run that POSTed once asked for nothing a gap could measure,
+// so gaps stays empty even though the record is full.
+func TestRunDriverReportsWireFactsAndArrivalGaps(t *testing.T) {
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyCompletion(`{"choices":[{"index":0,"message":{"role":"assistant","content":"wire facts"}}]}`)},
+	}, "p", withFlags("--model", "m-a"))
+
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
+	}
+	if len(got.requests) != 1 {
+		t.Fatalf("server recorded %d request(s), want 1", len(got.requests))
+	}
+	rec := got.requests[0]
+	if rec.method != "POST" {
+		t.Errorf("recorded method = %q, want POST", rec.method)
+	}
+	if rec.path != "/chat/completions" {
+		t.Errorf("recorded path = %q, want /chat/completions", rec.path)
+	}
+	if ct := rec.header.Get("Content-Type"); ct == "" {
+		t.Errorf("recorded Content-Type is empty, want the JSON type the run sent: %v", rec.header)
+	}
+	if model := requestModel(t, rec.body); model != "m-a" {
+		t.Errorf("recorded request model = %q, want %q", model, "m-a")
+	}
+	if len(got.gaps) != 0 {
+		t.Errorf("gaps = %v, want none for a run that POSTed once", got.gaps)
 	}
 }
 
@@ -207,7 +249,7 @@ func TestRunDriverExtraFlagsReachTheDriver(t *testing.T) {
 	if len(got.requests) != 1 {
 		t.Fatalf("server recorded %d request(s), want 1", len(got.requests))
 	}
-	if model := requestModel(t, got.requests[0]); model != "m-b" {
+	if model := requestModel(t, got.requests[0].body); model != "m-b" {
 		t.Errorf("recorded request model = %q, want %q: the flag never reached the Driver", model, "m-b")
 	}
 	if !strings.Contains(string(got.stdout), "the b answer") {
@@ -250,7 +292,7 @@ func TestRunDriverCallerEnvReachesTheRun(t *testing.T) {
 	if len(got.requests) != 1 {
 		t.Fatalf("server recorded %d request(s), want 1", len(got.requests))
 	}
-	if model := requestModel(t, got.requests[0]); model != "m-reviewer" {
+	if model := requestModel(t, got.requests[0].body); model != "m-reviewer" {
 		t.Errorf("recorded request model = %q, want the roster entry's model %q", model, "m-reviewer")
 	}
 
@@ -295,13 +337,13 @@ func TestRunDriverRosterOptionSelectsTheEntry(t *testing.T) {
 	if len(got.requests) != 1 {
 		t.Fatalf("server recorded %d request(s), want 1", len(got.requests))
 	}
-	if model := requestModel(t, got.requests[0]); model != "m-reviewer" {
+	if model := requestModel(t, got.requests[0].body); model != "m-reviewer" {
 		t.Errorf("recorded request model = %q, want the roster entry's model %q", model, "m-reviewer")
 	}
 	// The Agent File's body is the run's system prompt, so the prompt the endpoint
 	// saw carries it — the entry was read, not just looked up by name.
-	if !strings.Contains(string(got.requests[0]), "review the change and report blockers") {
-		t.Errorf("recorded request = %q, want the entry's body as the system prompt", got.requests[0])
+	if !strings.Contains(string(got.requests[0].body), "review the change and report blockers") {
+		t.Errorf("recorded request = %q, want the entry's body as the system prompt", got.requests[0].body)
 	}
 }
 
