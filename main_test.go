@@ -2040,23 +2040,27 @@ func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
 	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
-	srv := newDroppedConnServer(t, "recovered after dropped conn")
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 after the dropped connection; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			// One delta and no sseDone: the stream has to break mid-body the way a
+			// dying proxy breaks one, not close as a reply that finished saying nothing.
+			dropAfterFrames(sseFrame(textChunk("stale partial answer"))),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered after dropped conn"}}]}`),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 after the dropped connection; stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "recovered after dropped conn" {
-		t.Errorf("result event text = %q, want exactly the final answer", got)
+	if text := resultText(t, string(got.stdout)); text != "recovered after dropped conn" {
+		t.Errorf("result event text = %q, want exactly the final answer", text)
 	}
 	// One POST per attempt: the dropped request never reached a response, and
 	// Go's own transparent rewind-retry only applies to reused connections.
-	if n := srv.postCount(); n != 2 {
+	if n := len(got.requests); n != 2 {
 		t.Errorf("POSTs = %d, want 2 (the dropped one plus the success)", n)
 	}
-	if !strings.Contains(stderr.String(), "retry") {
-		t.Errorf("stderr = %q, want the retry to be reported to the operator", stderr.String())
+	if !strings.Contains(got.stderr, "retry") {
+		t.Errorf("stderr = %q, want the retry to be reported to the operator", got.stderr)
 	}
 }
 
