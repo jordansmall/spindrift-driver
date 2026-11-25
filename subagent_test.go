@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1539,23 +1538,23 @@ const repeatedCallBreakerText = "error: bash was already called 2 times in a row
 // down — so a child refuses its own third identical call with the very text the
 // top-level golden stream pins, as a synthetic Tool Result the run answers past.
 func TestSubagentChildInheritsRepeatedCallBreaker(t *testing.T) {
-	cfgPath := agentFixtureEntries(t, agentSpec{name: "worker", model: "m-worker", tools: "bash"})
-	srv := newScriptedChatServer(t,
-		bashCallTurn("call_1", "echo one"),
-		bashCallTurn("call_2", "echo one"),
-		bashCallTurn("call_3", "echo one"),
-		completion("child answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-worker": {
+			replyCompletion(bashCallTurn("call_1", "echo one")),
+			replyCompletion(bashCallTurn("call_2", "echo one")),
+			replyCompletion(bashCallTurn("call_3", "echo one")),
+			replyCompletion(completion("child answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "worker", model: "m-worker", tools: "bash"}),
+		withFlags("--agent", "worker"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--agent", "worker", "p", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 — a refusal is a Tool Result the run answers past, not a failed run; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a refusal is a Tool Result the run answers past, not a failed run; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
-	if sent := srv.requestBodies(t); len(sent) != 4 {
-		t.Fatalf("POSTs = %d, want three call turns and the answer: the third call must not be sent again, but the refusal is only a Tool Result: stdout = %q", len(sent), raw)
+	raw := string(got.stdout)
+	if len(got.requests) != 4 {
+		t.Fatalf("POSTs = %d, want three call turns and the answer: the third call must not be sent again, but the refusal is only a Tool Result: stdout = %q", len(got.requests), raw)
 	}
 
 	var results, refused int
@@ -1601,27 +1600,29 @@ func TestSubagentChildInheritsRepeatedCallBreaker(t *testing.T) {
 // lets that call run. The intervening subagent call resets the parent's own
 // streak, so what is pinned is that the child's counts never reach the parent.
 func TestSubagentChildRepeatedCallCounterIsItsOwn(t *testing.T) {
-	cfgPath := agentFixtureEntries(t, agentSpec{name: "worker", model: "m-worker", tools: "bash"})
-	srv := newScriptedChatServer(t,
-		bashCallTurn("call_p1", "echo same"),
-		spawnAgentCall("worker"),
-		bashCallTurn("call_c1", "echo same"),
-		bashCallTurn("call_c2", "echo same"),
-		bashCallTurn("call_c3", "echo same"),
-		completion("child answer"),
-		bashCallTurn("call_p2", "echo same"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(bashCallTurn("call_p1", "echo same")),
+			replyCompletion(spawnAgentCall("worker")),
+			replyCompletion(bashCallTurn("call_p2", "echo same")),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-worker": {
+			replyCompletion(bashCallTurn("call_c1", "echo same")),
+			replyCompletion(bashCallTurn("call_c2", "echo same")),
+			replyCompletion(bashCallTurn("call_c3", "echo same")),
+			replyCompletion(completion("child answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "worker", model: "m-worker", tools: "bash"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
-	if sent := srv.requestBodies(t); len(sent) != 8 {
-		t.Fatalf("POSTs = %d, want the script of 8 in full (the refusal must not stop either run short): stdout = %q", len(sent), raw)
+	raw := string(got.stdout)
+	if len(got.requests) != 8 {
+		t.Fatalf("POSTs = %d, want the script of 8 in full (the refusal must not stop either run short): stdout = %q", len(got.requests), raw)
 	}
 
 	// The child did refuse its third identical call, and it did so inside itself —
@@ -1677,21 +1678,21 @@ func TestSubagentChildEventClockIsPinnableFromEnv(t *testing.T) {
 		pinnedStart = 1700000000000
 		pinnedStep  = 1000
 	)
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withEnv(envTestNowMS, fmt.Sprintf("%d:%d", pinnedStart, pinnedStep)),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-	t.Setenv(envTestNowMS, fmt.Sprintf("%d:%d", pinnedStart, pinnedStep))
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
+	raw := string(got.stdout)
 
 	relayed := relayedEvents(t, raw)
 	if len(relayed) == 0 {
