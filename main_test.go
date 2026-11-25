@@ -116,39 +116,25 @@ func TestPinChildClockFromEnvIgnoresANonPositiveStep(t *testing.T) {
 }
 
 func TestRunChatRoundTrip(t *testing.T) {
-	// mutex: the handler goroutine writes, the test goroutine reads
-	var mu sync.Mutex
-	var gotReq *http.Request
-	var gotRaw []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		gotReq, gotRaw = r, body
-		mu.Unlock()
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`))
-	}))
-	defer srv.Close()
-
 	// prompt before flags: the issue's argv shape, end to end
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"fix the flaky test", "--model", "gpt-4o-mini", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"gpt-4o-mini": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)},
+	}, "fix the flaky test", withFlags("--model", "gpt-4o-mini"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	mu.Lock()
-	req, reqRaw := gotReq, gotRaw
-	mu.Unlock()
-	if req == nil {
-		t.Fatal("Driver sent no request to the fake server")
+	if len(got.requests) != 1 {
+		t.Fatalf("server recorded %d request(s), want 1", len(got.requests))
 	}
-	if req.Method != http.MethodPost {
-		t.Errorf("method = %q, want POST", req.Method)
+	req := got.requests[0]
+	if req.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", req.method)
 	}
-	if req.URL.Path != "/chat/completions" {
-		t.Errorf("path = %q, want /chat/completions", req.URL.Path)
+	if req.path != "/chat/completions" {
+		t.Errorf("path = %q, want /chat/completions", req.path)
 	}
-	if ct := req.Header.Get("Content-Type"); ct != "application/json" {
+	if ct := req.header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 
@@ -159,8 +145,8 @@ func TestRunChatRoundTrip(t *testing.T) {
 			Content string `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(reqRaw, &reqBody); err != nil {
-		t.Fatalf("request body is not valid JSON: %v; body = %q", err, reqRaw)
+	if err := json.Unmarshal(req.body, &reqBody); err != nil {
+		t.Fatalf("request body is not valid JSON: %v; body = %q", err, req.body)
 	}
 	if reqBody.Model != "gpt-4o-mini" {
 		t.Errorf("model = %q, want %q", reqBody.Model, "gpt-4o-mini")
@@ -175,15 +161,15 @@ func TestRunChatRoundTrip(t *testing.T) {
 		t.Errorf("user message = %+v, want prompt %q", reqBody.Messages[1], "fix the flaky test")
 	}
 
-	if got := resultText(t, stdout.String()); got != "here is the fix" {
-		t.Errorf("result event text = %q, want exactly the response text with no added newline", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "here is the fix" {
+		t.Errorf("result event text = %q, want exactly the response text with no added newline", gotText)
 	}
-	stderrLines := strings.Count(strings.TrimSuffix(stderr.String(), "\n"), "\n") + 1
+	stderrLines := strings.Count(strings.TrimSuffix(got.stderr, "\n"), "\n") + 1
 	if stderrLines != 1 {
-		t.Errorf("stderr has %d lines, want 1 progress line: %q", stderrLines, stderr.String())
+		t.Errorf("stderr has %d lines, want 1 progress line: %q", stderrLines, got.stderr)
 	}
-	if !strings.Contains(stderr.String(), "/chat/completions") {
-		t.Errorf("stderr = %q, want a progress line naming the request target", stderr.String())
+	if !strings.Contains(got.stderr, "/chat/completions") {
+		t.Errorf("stderr = %q, want a progress line naming the request target", got.stderr)
 	}
 }
 
@@ -418,72 +404,44 @@ func TestRunUsageEventCarriesZeroTokensWhenServerReportsNone(t *testing.T) {
 // With SPINDRIFT_API_KEY unset the driver must send no Authorization header at
 // all — an empty one is as wrong as a wrong one.
 func TestRunSendsNoAuthorizationWithoutAPIKey(t *testing.T) {
-	var mu sync.Mutex
-	var gotReq *http.Request
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		gotReq = r
-		mu.Unlock()
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// An empty value stands in for the unset one: withEnv lands after the helper's
+	// pinned key, so the run sees SPINDRIFT_API_KEY present but empty, and the config
+	// reader treats that as no key — falling through to the Driver Config file, which
+	// the helper writes as `{}` with no api_key of its own to fall back on.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p", withFlags("--model", "m"), withEnv(envAPIKey, ""))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	mu.Lock()
-	req := gotReq
-	mu.Unlock()
-	if req == nil {
-		t.Fatal("Driver sent no request to the fake server")
+	if len(got.requests) != 1 {
+		t.Fatalf("server recorded %d request(s), want 1: the header check below has nothing to judge", len(got.requests))
 	}
-	if _, ok := req.Header["Authorization"]; ok {
-		t.Errorf("Authorization = %q, want the header absent when no API key is configured", req.Header.Get("Authorization"))
+	if _, ok := got.requests[0].header["Authorization"]; ok {
+		t.Errorf("Authorization = %q, want the header absent when no API key is configured", got.requests[0].header.Get("Authorization"))
 	}
 	if !strings.Contains(usage, envAPIKey) {
 		t.Errorf("usage does not document %s the way it documents %s:\n%s", envAPIKey, envBaseURL, usage)
 	}
 }
 
+// The endpoint is the helper's to own, so this run cannot also show `--base-url`
+// winning over a stale SPINDRIFT_BASE_URL; TestParseArgsBaseURLPrecedence pins
+// that precedence.
 func TestRunSendsAuthorizationBearerWithAPIKey(t *testing.T) {
-	var mu sync.Mutex
-	var gotReq *http.Request
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		gotReq = r
-		mu.Unlock()
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
-	}))
-	defer srv.Close()
-
-	// the stub is keyed by name: the key answers only for SPINDRIFT_API_KEY
-	env := func(name string) (string, bool) {
-		switch name {
-		case envAPIKey:
-			return "sk-test-123", true
-		case envBaseURL:
-			return "http://env:9/v1", true
-		}
-		return "", false
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p", withFlags("--model", "m"), withEnv(envAPIKey, "sk-test-123"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, env)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	if len(got.requests) != 1 {
+		t.Fatalf("server recorded %d request(s), want 1: the bearer check below has nothing to judge", len(got.requests))
 	}
-
-	mu.Lock()
-	req := gotReq
-	mu.Unlock()
-	if req == nil {
-		t.Fatal("Driver sent no request to the fake server")
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer sk-test-123" {
-		t.Errorf("Authorization = %q, want %q", got, "Bearer sk-test-123")
+	if sent := got.requests[0].header.Get("Authorization"); sent != "Bearer sk-test-123" {
+		t.Errorf("Authorization = %q, want %q", sent, "Bearer sk-test-123")
 	}
 }
 
