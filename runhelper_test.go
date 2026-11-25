@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -52,6 +53,9 @@ type runSettings struct {
 	// asked for one" apart from the empty default.
 	manifest    string
 	manifestSet bool
+	// stdoutFile, when set, is where the run's event stream goes instead of the
+	// helper's buffer, because something running during the run reads it there.
+	stdoutFile string
 }
 
 // withFlags appends extra Driver flags after the prompt in argv — --model,
@@ -84,6 +88,14 @@ func withHookManifest(contents string) runOption {
 	}
 }
 
+// withStdoutFile sends the run's event stream to path rather than capturing it in
+// memory, for a run whose own mid-run witness — a Hook grepping the stream while
+// the guarded call executes — has to open it. The run's reported stdout and events
+// are that file read back once the run returns.
+func withStdoutFile(path string) runOption {
+	return func(s *runSettings) { s.stdoutFile = path }
+}
+
 // runDriver runs the Driver in-process against a scripted Model and reports what
 // came of it.
 //
@@ -107,11 +119,37 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 	}
 	subagentEnv(t, cfgPath, srv.url())
 
+	// A caller whose run has to show something INSIDE the run its own event stream —
+	// a Guard Hook that greps the wire while the call is executing — names a file to
+	// write it to instead of the buffer below, and the result is read back off disk.
 	var stdout, stderr bytes.Buffer
-	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	out := io.Writer(&stdout)
+	var outFile *os.File
+	if st.stdoutFile != "" {
+		f, err := os.Create(st.stdoutFile)
+		if err != nil {
+			t.Fatalf("create the run's stdout file %s: %v", st.stdoutFile, err)
+		}
+		defer f.Close()
+		outFile, out = f, f
+	}
+	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv)
 	srv.checkNoUnscriptedRequests(t)
 
 	raw := stdout.String()
+	if outFile != nil {
+		// Closed here rather than left to the deferred Close, so the read-back never
+		// depends on the run's writer staying unbuffered. The mid-run Hook grep is what
+		// witnesses that property, and fails on its own if it ever stops holding.
+		if err := outFile.Close(); err != nil {
+			t.Fatalf("close the run's stdout file %s: %v", st.stdoutFile, err)
+		}
+		b, err := os.ReadFile(st.stdoutFile)
+		if err != nil {
+			t.Fatalf("read back the run's stdout file %s: %v", st.stdoutFile, err)
+		}
+		raw = string(b)
+	}
 	return runResult{
 		code:     code,
 		stdout:   []byte(raw),
