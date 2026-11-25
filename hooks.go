@@ -48,12 +48,16 @@ type summaryHook struct {
 	tools []string
 }
 
-// hookManifest is what one Hook Manifest file holds: the pre-call Guard Hooks in
-// run order and the one post-call summary hook, nil when the file names none.
+// guardChain is one Hook Manifest read into the value the Driver guards a call
+// with: the pre-call Guard Hooks in run order and the one post-call summary
+// hook, nil when the file names none.
 //
 // A struct rather than a second return value so a future field does not grow the
-// return tuple again.
-type hookManifest struct {
+// return tuple again. It is held through a pointer the way runTally is, because a
+// nil *guardChain is a value of its own: the run that configured no Hook Manifest
+// carries no chain at all, and every guard method answers it without a jq lookup
+// or a fork.
+type guardChain struct {
 	pre     []guardHook
 	summary *summaryHook
 }
@@ -73,10 +77,10 @@ var (
 	knownSummaryFields  = []string{"path", "tools"}
 )
 
-// loadHookManifest reads exactly one Hook Manifest and returns its pre-call
-// Guard Hooks in manifest order — the run order is the file order and nothing
-// here sorts them — together with the one post-call summary hook, nil when the
-// file names none.
+// loadHookManifest reads exactly one Hook Manifest and returns the guard chain
+// it describes: the pre-call Guard Hooks in manifest order — the run order is the
+// file order and nothing here sorts them — together with the one post-call summary
+// hook, nil when the file names none.
 //
 // Unlike loadDriverConfig this takes an explicit path and never resolves a
 // default: which file the manifest is stays the caller's decision (issue #22's,
@@ -86,45 +90,45 @@ var (
 // null or an empty file included, which json would otherwise hand back as a nil
 // map and read as "no hooks"), and any unknown field are all errors naming the
 // path.
-func loadHookManifest(path string) (hookManifest, error) {
+func loadHookManifest(path string) (guardChain, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return hookManifest{}, fmt.Errorf("hook manifest %s: cannot read: %v", path, err)
+		return guardChain{}, fmt.Errorf("hook manifest %s: cannot read: %v", path, err)
 	}
 	// Checked before decoding for the reason loadDriverConfig gives: the decode
 	// error alone cannot tell "no file content" from "content of the wrong
 	// shape", and the second reading must not quietly mean no hooks.
 	if kind := jsonKind(raw); kind != "object" {
-		return hookManifest{}, fmt.Errorf("hook manifest %s: malformed JSON: top-level value is %s, want an object", path, kind)
+		return guardChain{}, fmt.Errorf("hook manifest %s: malformed JSON: top-level value is %s, want an object", path, kind)
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return hookManifest{}, fmt.Errorf("hook manifest %s: malformed JSON: %v", path, err)
+		return guardChain{}, fmt.Errorf("hook manifest %s: malformed JSON: %v", path, err)
 	}
 	// Sorted before the unknown-key scan so a file with several complaints always
 	// reports the same one: map iteration order would otherwise pick at random.
 	for _, k := range sortedKeys(fields) {
 		if !slices.Contains(knownManifestFields, k) {
-			return hookManifest{}, fmt.Errorf("hook manifest %s: unknown field %q", path, k)
+			return guardChain{}, fmt.Errorf("hook manifest %s: unknown field %q", path, k)
 		}
 	}
 	// Both keys are optional, and each is read independently: a manifest that
 	// names only post-call work still gets its summary hook parsed, so neither
 	// key's absence may short-circuit the other.
-	var manifest hookManifest
+	var manifest guardChain
 	if rawPre, ok := fields["pre"]; ok {
 		if kind := jsonKind(rawPre); kind != "array" {
-			return hookManifest{}, fmt.Errorf("hook manifest %s: field %q must be an array, got %s", path, "pre", kind)
+			return guardChain{}, fmt.Errorf("hook manifest %s: field %q must be an array, got %s", path, "pre", kind)
 		}
 		var entries []json.RawMessage
 		if err := json.Unmarshal(rawPre, &entries); err != nil {
-			return hookManifest{}, fmt.Errorf("hook manifest %s: field %q: %v", path, "pre", err)
+			return guardChain{}, fmt.Errorf("hook manifest %s: field %q: %v", path, "pre", err)
 		}
 		manifest.pre = make([]guardHook, 0, len(entries))
 		for i, entry := range entries {
 			hook, err := parseGuardHook(path, i, entry)
 			if err != nil {
-				return hookManifest{}, err
+				return guardChain{}, err
 			}
 			manifest.pre = append(manifest.pre, hook)
 		}
@@ -132,7 +136,7 @@ func loadHookManifest(path string) (hookManifest, error) {
 	if rawPost, ok := fields["post"]; ok {
 		summary, err := parseSummaryHook(path, rawPost)
 		if err != nil {
-			return hookManifest{}, err
+			return guardChain{}, err
 		}
 		manifest.summary = &summary
 	}
@@ -452,20 +456,33 @@ func encodeRefusal(err error) string {
 	return fmt.Sprintf("error: guard hook request could not be built: %v", err)
 }
 
-// guardCommand runs command through the Guard chain as a bash-shaped call and
-// returns the command to run together with the refusal. It is the one shape
-// whose subject feeds forward: a hook that answers with updatedInput replaces
-// the command the rest of the chain sees and the command the caller runs. The
+// guardCommand runs command through the chain as a bash-shaped call and returns
+// the command to run together with the refusal. It is the one shape whose
+// subject feeds forward: a hook that answers with updatedInput replaces the
+// command the rest of the chain sees and the command the caller runs. The
 // chain's fail-closed judgement is guardThrough's.
-func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
+//
+// A nil chain is the run that configured no Hook Manifest, and it answers before
+// the jq lookup guardThrough makes: there is nothing to guard, so the command
+// goes through as asked.
+func (c *guardChain) guardCommand(command, driverTool string, stderr io.Writer) (string, string) {
+	if c == nil {
+		return command, ""
+	}
 	protocolName := hookToolName(driverTool)
-	return guardThrough(hooks, guardPresentation{
+	return guardThrough(c.pre, guardPresentation{
 		protocolName: protocolName,
 		subject:      command,
 		encode:       func(subject string) ([]byte, error) { return encodeHookRequest(protocolName, subject) },
 		jqMissing:    "error: jq is not available, so the guarded command cannot be run",
 		feedsRewrite: true,
 	}, stderr)
+}
+
+// guardCommand is the pre-chain entry point Slice D removes once the run carries
+// the chain: it wraps hooks in a one-link chain and asks that.
+func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
+	return (&guardChain{pre: hooks}).guardCommand(command, driverTool, stderr)
 }
 
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
@@ -508,8 +525,8 @@ func encodeHookReadRequest(path string) ([]byte, error) {
 	return encodeHookPayload(hookRequest{ToolName: "Read", ToolInput: hookToolInput{FilePath: path}})
 }
 
-// guardRead runs filePath through the Guard chain as a Read-shaped call and
-// returns the refusal to hand back as the Tool Result, "" for "no objection".
+// guardRead runs filePath through the chain as a Read-shaped call and returns
+// the refusal to hand back as the Tool Result, "" for "no objection".
 // The call is presented as the Read tool's own request — tool_name "Read" for
 // both file Tools, not two new protocol names — so one host rule that denies
 // reading a credential path covers Edit and Write as well as bash without being
@@ -519,8 +536,14 @@ func encodeHookReadRequest(path string) ([]byte, error) {
 // With feedsRewrite off the chain stops at the verdicts: a read has no input to
 // rewrite, so the rule that refuses a silent rewriter is command-only policy,
 // and any updatedInput a hook answers a read with is ignored.
-func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
-	_, refusal := guardThrough(hooks, guardPresentation{
+//
+// A nil chain has no hook to ask about the read, so it answers "" — the same
+// fast path guardCommand takes, before any jq lookup.
+func (c *guardChain) guardRead(filePath string, stderr io.Writer) string {
+	if c == nil {
+		return ""
+	}
+	_, refusal := guardThrough(c.pre, guardPresentation{
 		protocolName: "Read",
 		subject:      filePath,
 		// Takes no subject: a path has nothing to rewrite, so every hook in the
@@ -530,6 +553,12 @@ func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
 		feedsRewrite: false,
 	}, stderr)
 	return refusal
+}
+
+// guardRead is the pre-chain entry point Slice D removes once the run carries
+// the chain: it wraps hooks in a one-link chain and asks that.
+func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
+	return (&guardChain{pre: hooks}).guardRead(filePath, stderr)
 }
 
 // encodeHookPostRequest builds the stdin the summary hook is handed for a
@@ -670,9 +699,9 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 	return response, fmt.Sprintf("error: guard hook %s denied this command: %s", hook.path, reason)
 }
 
-// summarizeToolOutput hands a finished Tool Result to the manifest's one
-// post-call summary hook and returns its replacement, or output whenever the
-// summary could not be had.
+// summarize hands a finished Tool Result to the chain's one post-call summary
+// hook and returns its replacement, or output whenever the summary could not be
+// had.
 //
 // Fail open, where the pre-call chain fails closed — and it is the same
 // hook mechanics underneath, so the shared helper's refusal is dropped
@@ -683,23 +712,24 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 // the run its summary and must not cost it the answer. The same doubt about a
 // hook resolves the other way because the default action differs.
 //
-// So every one of these returns output untouched: no summary hook configured or
-// one whose tools list omits this tool (the script never runs), a script that
-// cannot be started, a run past guardHookTimeout, a non-zero exit, stdout past
-// guardHookOutputLimit, stdout that is not readable JSON, an absent
-// hookSpecificOutput, and an absent or empty updatedToolOutput — a summary of
-// nothing would replace a real result with the empty string, which is the loss
-// this function exists to prevent.
+// So every one of these returns output untouched: no chain at all, no summary
+// hook configured, or one whose tools list omits this tool (the script never
+// runs), a script that cannot be started, a run past guardHookTimeout, a
+// non-zero exit, stdout past guardHookOutputLimit, stdout that is not readable
+// JSON, an absent hookSpecificOutput, and an absent or empty updatedToolOutput
+// — a summary of nothing would replace a real result with the empty string,
+// which is the loss this function exists to prevent.
 //
 // A replacement is capped by truncateToolOutput, the very bound runBashTool
 // applies, so a hook that summarises upwards cannot hand the Model a longer
 // result than the command itself was allowed. Nothing re-appends the exit-code
 // line: the replacement is the Tool Result verbatim, and planToolCall keeps the
 // command's own verdict for is_error.
-func summarizeToolOutput(driverTool, command, output string, hook *summaryHook, stderr io.Writer) string {
-	if hook == nil {
+func (c *guardChain) summarize(driverTool, command, output string, stderr io.Writer) string {
+	if c == nil || c.summary == nil {
 		return output
 	}
+	hook := c.summary
 	protocolName := hookToolName(driverTool)
 	if !hook.appliesTo(protocolName) {
 		return output
@@ -718,6 +748,13 @@ func summarizeToolOutput(driverTool, command, output string, hook *summaryHook, 
 		return output
 	}
 	return truncateToolOutput(summary)
+}
+
+// summarizeToolOutput is the pre-chain entry point Slice D removes once the run
+// carries the chain: it wraps hook in a chain with no pre-call links and asks
+// that.
+func summarizeToolOutput(driverTool, command, output string, hook *summaryHook, stderr io.Writer) string {
+	return (&guardChain{summary: hook}).summarize(driverTool, command, output, stderr)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason
