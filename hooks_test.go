@@ -1204,6 +1204,69 @@ func TestGuardReadDoesNotRefuseARewritingHookForNoRewrite(t *testing.T) {
 	})
 }
 
+func TestGuardThroughBuildsANonRewritingRequestOnceForTheChain(t *testing.T) {
+	// A shape whose subject no hook can replace keeps the request the whole chain
+	// is asked about identical, so it is built once — and a request that cannot be
+	// built is refused even when no hook in the chain applies to the shape.
+	const target = "/home/model/notes.txt"
+	readPresentation := func(encode func(string) ([]byte, error)) guardPresentation {
+		return guardPresentation{
+			protocolName: "Read",
+			subject:      target,
+			encode:       encode,
+			jqMissing:    "error: jq is not available, so the guarded read cannot be run",
+		}
+	}
+
+	t.Run("one request for every hook in the chain", func(t *testing.T) {
+		dir := t.TempDir()
+		first := filepath.Join(dir, "first.json")
+		second := filepath.Join(dir, "second.json")
+		encodes := 0
+		hooks := []guardHook{
+			{path: writeGuardHookScript(t, "record-first.sh", `cat > `+first)},
+			{path: writeGuardHookScript(t, "record-second.sh", `cat > `+second)},
+		}
+
+		if _, refusal := guardThrough(hooks, readPresentation(func(string) ([]byte, error) {
+			encodes++
+			return encodeHookReadRequest(target)
+		}), nil); refusal != "" {
+			t.Fatalf("guardThrough = refusal %q, want none", refusal)
+		}
+		if encodes != 1 {
+			t.Errorf("the request was encoded %d times for a chain with nothing to rewrite, want once", encodes)
+		}
+		// Once must still mean every hook is asked: the shared request reaches both.
+		for _, name := range []string{first, second} {
+			raw, err := os.ReadFile(name)
+			if err != nil {
+				t.Fatalf("read what %s received: %v", name, err)
+			}
+			if !strings.Contains(string(raw), `"file_path":"`+target+`"`) {
+				t.Errorf("hook received %s, want it asked about %q", raw, target)
+			}
+		}
+	})
+
+	t.Run("an unbuilt request refuses with no hook applying", func(t *testing.T) {
+		encodes := 0
+
+		_, refusal := guardThrough([]guardHook{{path: "never-runs.sh", tools: []string{"Bash"}}},
+			readPresentation(func(string) ([]byte, error) {
+				encodes++
+				return nil, fmt.Errorf("boom")
+			}), nil)
+
+		if want := "error: guard hook request could not be built: boom"; refusal != want {
+			t.Errorf("guardThrough = refusal %q, want %q", refusal, want)
+		}
+		if encodes != 1 {
+			t.Errorf("encode ran %d times, want once before the chain is asked", encodes)
+		}
+	})
+}
+
 func TestGuardReadFailsClosedOnAMisbehavingHook(t *testing.T) {
 	// The run-level half of the fail-closed judgement is the shared run's, so the
 	// Read presentation refuses with the exact text the command shape returns for
