@@ -1338,16 +1338,14 @@ func TestSubagentChildModelRollsIntoParentResultModels(t *testing.T) {
 	}
 }
 
-// denyHookRosterFixture writes the three files a guarded roster needs — one Agent
-// File for reviewer, a real Guard Hook script that denies only a command
-// containing the word "denied" for a reason naming a credential path, and the
-// Hook Manifest naming that script for Bash — and hands back the paths so each
-// test composes its own Driver Config. Only the config joins them, which is what
-// lets the contrast test below drop one key and nothing else.
-func denyHookRosterFixture(t *testing.T, reason string) (agentsDir, hookPath, manifestPath string) {
+// denyHookRosterFixture writes the real Guard Hook script a guarded roster needs:
+// one that denies only a command containing the word "denied", for a reason
+// naming a credential path. The roster and the Hook Manifest naming this script
+// are the runs' to compose — the first through withRoster, the second through
+// withHookManifest — so the contrast test below passes no manifest at all and
+// nothing else changes.
+func denyHookRosterFixture(t *testing.T, reason string) (hookPath string) {
 	t.Helper()
-	agentsDir = t.TempDir()
-	writeAgentFile(t, agentsDir, "reviewer.md", "---\nname: reviewer\nmodel: m-reviewer\n---\nreview things\n")
 	// The hook reads the protocol payload on stdin, so the match is on the command
 	// text the child asked for and not on anything the shell would expand.
 	hookPath = writeGuardHookScript(t, "deny-credential-path.sh",
@@ -1355,8 +1353,7 @@ func denyHookRosterFixture(t *testing.T, reason string) (agentsDir, hookPath, ma
 	case "$input" in
 	  *denied*) echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"`+reason+`"}}' ;;
 	esac`)
-	manifestPath = writeHookManifest(t, `{"pre":[{"path":"`+hookPath+`","tools":["Bash"]}]}`)
-	return agentsDir, hookPath, manifestPath
+	return hookPath
 }
 
 // childGuardTurnResponse scripts the child's one turn as a single assistant
@@ -1392,8 +1389,7 @@ func relayedToolResults(t *testing.T, raw string) map[string]map[string]any {
 // the environment it inherits, so nothing here hands the manifest to the child by
 // any channel of its own.
 func TestSubagentChildHonoursTheConfiguredDenyHook(t *testing.T) {
-	agentsDir, hookPath, manifestPath := denyHookRosterFixture(t, "reads the credential path /run/secrets/spindrift/token")
-	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`","hook_manifest":"`+manifestPath+`"}`)
+	hookPath := denyHookRosterFixture(t, "reads the credential path /run/secrets/spindrift/token")
 
 	dir := t.TempDir()
 	deniedMarker := filepath.Join(dir, "denied-credential-read.marker")
@@ -1401,20 +1397,24 @@ func TestSubagentChildHonoursTheConfiguredDenyHook(t *testing.T) {
 	deniedCmd := "printf nope > " + deniedMarker
 	cleanCmd := "printf clean-ran | tee " + cleanMarker
 
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		childGuardTurnResponse(deniedCmd, cleanCmd),
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {
+			replyCompletion(childGuardTurnResponse(deniedCmd, cleanCmd)),
+			replyCompletion(completion("child answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withHookManifest(`{"pre":[{"path":"`+hookPath+`","tools":["Bash"]}]}`),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 — a refusal inside a child is a Tool Result, not a failed run; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a refusal inside a child is a Tool Result, not a failed run; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
+	raw := string(got.stdout)
 
 	// The side effects are the verdict that matters: the guard stopped the denied
 	// command and only the denied command.
@@ -1476,32 +1476,36 @@ func TestSubagentChildHonoursTheConfiguredDenyHook(t *testing.T) {
 }
 
 // TestSubagentChildGuardComesFromTheConfiguredManifest is the config half of the
-// criterion: with the same roster, the same hook script and manifest still on
-// disk, and the same scripted child turn, a Driver Config that names no
-// hook_manifest leaves the child unguarded. Since the parent hands the child
+// criterion: with the same roster, the same hook script still on disk, and the
+// same scripted child turn, a Driver Config that names no hook_manifest leaves
+// the child unguarded. Since the parent hands the child
 // nothing but argv and the environment, the key the two runs differ by is the
 // only thing that can have guarded the child in the test above.
 func TestSubagentChildGuardComesFromTheConfiguredManifest(t *testing.T) {
-	agentsDir, hookPath, _ := denyHookRosterFixture(t, "credential path")
-	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`"}`)
+	hookPath := denyHookRosterFixture(t, "credential path")
 
 	marker := filepath.Join(t.TempDir(), "unguarded-denied-ran.marker")
 	deniedCmd := "printf ran > " + marker
 
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		childGuardTurnResponse(deniedCmd, deniedCmd),
-		completion("child answer"),
-		completion("parent answer"),
+	// No withHookManifest: the missing hook_manifest key is all that separates this
+	// run from the guarded one above.
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {
+			replyCompletion(childGuardTurnResponse(deniedCmd, deniedCmd)),
+			replyCompletion(completion("child answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
+	raw := string(got.stdout)
 
 	if !hookMarkerExists(t, marker) {
 		t.Errorf("marker %s does not exist: a child guarded with no hook_manifest configured is a guard that does not come from the config", marker)
