@@ -5073,18 +5073,6 @@ func TestRunGuardHookFiresAfterToolCallEvent(t *testing.T) {
 	}
 }
 
-// readRunStdout reads back a run whose stdout was handed to an open file, which
-// is the only way a hook of another test can be shown what the wire held at the
-// moment it fired.
-func readRunStdout(t *testing.T, f *os.File) string {
-	t.Helper()
-	b, err := os.ReadFile(f.Name())
-	if err != nil {
-		t.Fatalf("read back stdout %s: %v", f.Name(), err)
-	}
-	return string(b)
-}
-
 // TestRunGuardHookRefusalReachesModel pins the other half of the contract: the
 // refusal is not only reported on the wire, it is the very Tool Result the Model
 // reads on the next request, so the Model can stop asking for that command.
