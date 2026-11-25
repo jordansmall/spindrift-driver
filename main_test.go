@@ -2252,25 +2252,24 @@ func TestRunRateLimitRejectionFillsResetAt(t *testing.T) {
 	const pinned int64 = 1700000000000
 	pinClock(t, pinned)
 	const body = "slow down"
-	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, body)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, body)},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", got.code, got.stderr)
 	}
-	ev := lastErrorEvent(t, stdout.String())
+	ev := lastErrorEvent(t, string(got.stdout))
 	if want := "server returned 429 Too Many Requests: " + body; ev["text"] != want {
 		t.Errorf("error event text = %v, want %q", ev["text"], want)
 	}
 	reset, ok := ev["reset_at"]
 	if !ok {
-		t.Fatalf("error event %q carries no reset_at, want the Retry-After instant", stdout.String())
+		t.Fatalf("error event %q carries no reset_at, want the Retry-After instant", got.stdout)
 	}
-	if got, _ := reset.(float64); int64(got) != pinned+7000 {
+	if ms, _ := reset.(float64); int64(ms) != pinned+7000 {
 		t.Errorf("reset_at = %v, want %d (pinned clock + 7s)", reset, pinned+7000)
 	}
-	if n := posts(); n != 1 {
+	if n := len(got.requests); n != 1 {
 		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
 	}
 }
@@ -2281,38 +2280,36 @@ func TestRunRateLimitResetAtAcceptsHTTPDate(t *testing.T) {
 	pinClock(t, 1700000000000)
 	const date = "Wed, 15 Nov 2023 08:12:01 GMT"
 	want := time.Date(2023, time.November, 15, 8, 12, 1, 0, time.UTC).UnixMilli()
-	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": date}, "rate limited")
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": date}, "rate limited")},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
-	reset, ok := lastErrorEvent(t, stdout.String())["reset_at"]
+	reset, ok := lastErrorEvent(t, string(got.stdout))["reset_at"]
 	if !ok {
-		t.Fatalf("error event %q carries no reset_at, want the instant %q names", stdout.String(), date)
+		t.Fatalf("error event %q carries no reset_at, want the instant %q names", got.stdout, date)
 	}
-	if got, _ := reset.(float64); int64(got) != want {
+	if ms, _ := reset.(float64); int64(ms) != want {
 		t.Errorf("reset_at = %v, want %d (%s in epoch milliseconds)", reset, want, date)
 	}
-	if n := posts(); n != 1 {
+	if n := len(got.requests); n != 1 {
 		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
 	}
 }
 
 func TestRunRateLimitWithoutRetryAfterOmitsResetAt(t *testing.T) {
 	pinClock(t, 1700000000000)
-	srv, posts := rejectionServer(t, http.StatusTooManyRequests, nil, "rate limited")
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusTooManyRequests, nil, "rate limited")},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
-	if _, ok := lastErrorEvent(t, stdout.String())["reset_at"]; ok {
-		t.Errorf("error event %q carries reset_at, want the key absent when no reset was named", stdout.String())
+	if _, ok := lastErrorEvent(t, string(got.stdout))["reset_at"]; ok {
+		t.Errorf("error event %q carries reset_at, want the key absent when no reset was named", got.stdout)
 	}
-	if n := posts(); n != 1 {
+	if n := len(got.requests); n != 1 {
 		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
 	}
 }
@@ -2322,17 +2319,16 @@ func TestRunRateLimitResetAtIgnoresUnrepresentableDelta(t *testing.T) {
 	// milliseconds: wrapped, it reads back as a plausible instant for a reset that
 	// never existed, so an unrepresentable delta has to be treated as no reset.
 	pinClock(t, 1700000000000)
-	srv, posts := rejectionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "2305843009213693952"}, "rate limited")
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "2305843009213693952"}, "rate limited")},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
-	if got, ok := lastErrorEvent(t, stdout.String())["reset_at"]; ok {
-		t.Errorf("error event carries reset_at %v, want the key absent for a delta too large to represent", got)
+	if reset, ok := lastErrorEvent(t, string(got.stdout))["reset_at"]; ok {
+		t.Errorf("error event carries reset_at %v, want the key absent for a delta too large to represent", reset)
 	}
-	if n := posts(); n != 1 {
+	if n := len(got.requests); n != 1 {
 		t.Errorf("%d POSTs, want exactly 1: a 429 is not retried", n)
 	}
 }
@@ -2341,16 +2337,15 @@ func TestRunRateLimitResetAtIgnoresUnrepresentableDelta(t *testing.T) {
 // here would make the host's copy differ from the bytes the server sent.
 func TestRunRejectionWhitespaceSurvivesInErrorEvent(t *testing.T) {
 	const body = "\ncontext length exceeded\n"
-	srv, _ := rejectionServer(t, http.StatusBadRequest, nil, body)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusBadRequest, nil, body)},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
 	want := "server returned 400 Bad Request: " + body
-	if got := oneErrorEvent(t, stdout.String()); got != want {
-		t.Errorf("error event text = %q, want the rejection with its whitespace intact %q", got, want)
+	if text := oneErrorEvent(t, string(got.stdout)); text != want {
+		t.Errorf("error event text = %q, want the rejection with its whitespace intact %q", text, want)
 	}
 }
 
