@@ -1944,43 +1944,40 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
 	filler := strings.Repeat("x", 400)
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "first line\nspindrift-driver: FORGED 1\n%s", filler)
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code == 0 {
+	body := "first line\nspindrift-driver: FORGED 1\n" + filler
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusInternalServerError, nil, body),
+			reject(http.StatusInternalServerError, nil, body),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code == 0 {
 		t.Errorf("exit code = 0, want non-zero when every attempt 500s")
 	}
 	// The body does reach stdout now, but only as the text of the closing error
 	// event: oneErrorEvent fails unless every stdout line is a JSON object, so a
 	// forged second line here would be caught.
-	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "server returned 500") {
-		t.Errorf("error event text = %q, want the 5xx status the run failed on", got)
+	if ev := oneErrorEvent(t, string(got.stdout)); !strings.Contains(ev, "server returned 500") {
+		t.Errorf("error event text = %q, want the 5xx status the run failed on", ev)
 	}
-	for _, line := range strings.Split(stderr.String(), "\n") {
+	for _, line := range strings.Split(got.stderr, "\n") {
 		if line == "" {
 			continue
 		}
 		if !strings.HasPrefix(line, "spindrift-driver: ") {
-			t.Fatalf("stderr line %q does not start with the driver prefix; body leaked raw into the progress log: %q", line, stderr.String())
+			t.Fatalf("stderr line %q does not start with the driver prefix; body leaked raw into the progress log: %q", line, got.stderr)
 		}
 	}
-	if !strings.Contains(stderr.String(), "server returned 500") {
-		t.Errorf("stderr = %q, want the existing %q wording", stderr.String(), "server returned 500")
+	if !strings.Contains(got.stderr, "server returned 500") {
+		t.Errorf("stderr = %q, want the existing %q wording", got.stderr, "server returned 500")
 	}
-	if strings.Contains(stderr.String(), filler) {
-		t.Errorf("stderr = %q, want the oversized body truncated", stderr.String())
+	if strings.Contains(got.stderr, filler) {
+		t.Errorf("stderr = %q, want the oversized body truncated", got.stderr)
 	}
 	// The forged text has the driver prefix too, so the loop above alone cannot
 	// tell it apart: it must never start a line of its own.
-	if strings.Contains(stderr.String(), "\nspindrift-driver: FORGED") {
-		t.Errorf("stderr = %q, want the forged body line flattened into the retry note", stderr.String())
+	if strings.Contains(got.stderr, "\nspindrift-driver: FORGED") {
+		t.Errorf("stderr = %q, want the forged body line flattened into the retry note", got.stderr)
 	}
 }
 
@@ -2071,21 +2068,20 @@ func TestRunServerErrorStatus(t *testing.T) {
 	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "model not found", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m", "--base-url", srv.URL, "p"}, nil, &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code == 0 {
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusInternalServerError, nil, "model not found"),
+			reject(http.StatusInternalServerError, nil, "model not found"),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code == 0 {
 		t.Fatal("non-200 response should exit non-zero")
 	}
-	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "500") {
-		t.Errorf("error event text = %q, want the failing status", got)
+	if ev := oneErrorEvent(t, string(got.stdout)); !strings.Contains(ev, "500") {
+		t.Errorf("error event text = %q, want the failing status", ev)
 	}
-	if !strings.Contains(stderr.String(), "500") {
-		t.Errorf("stderr = %q, want the failing status", stderr.String())
+	if !strings.Contains(got.stderr, "500") {
+		t.Errorf("stderr = %q, want the failing status", got.stderr)
 	}
 }
 
@@ -2153,33 +2149,28 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 	chatRetryAttempts, chatRetryBackoff = 4, time.Millisecond
 	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
 
-	var mu sync.Mutex
-	posts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		mu.Lock()
-		posts++
-		mu.Unlock()
-		http.Error(w, "upstream exploded", http.StatusBadGateway)
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code == 0 {
-		t.Fatalf("exit code = 0, want non-zero once the retry budget is spent; stderr = %q", stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusBadGateway, nil, "upstream exploded"),
+			reject(http.StatusBadGateway, nil, "upstream exploded"),
+			reject(http.StatusBadGateway, nil, "upstream exploded"),
+			reject(http.StatusBadGateway, nil, "upstream exploded"),
+		},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code == 0 {
+		t.Fatalf("exit code = 0, want non-zero once the retry budget is spent; stderr = %q", got.stderr)
 	}
-	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "server returned 502") {
-		t.Errorf("error event text = %q, want the last failing status", got)
+	if ev := oneErrorEvent(t, string(got.stdout)); !strings.Contains(ev, "server returned 502") {
+		t.Errorf("error event text = %q, want the last failing status", ev)
 	}
-	if posts != 4 {
-		t.Errorf("POSTs = %d, want exactly 4 (the full injected budget, no more)", posts)
+	if n := len(got.requests); n != 4 {
+		t.Errorf("POSTs = %d, want exactly 4 (the full injected budget, no more)", n)
 	}
-	if !strings.Contains(stderr.String(), "server returned 502") {
-		t.Errorf("stderr = %q, want the last failing status in the existing server-returned wording", stderr.String())
+	if !strings.Contains(got.stderr, "server returned 502") {
+		t.Errorf("stderr = %q, want the last failing status in the existing server-returned wording", got.stderr)
 	}
-	if !strings.Contains(stderr.String(), "retry 4/4") {
-		t.Errorf("stderr = %q, want the final attempt announced as retry 4/4", stderr.String())
+	if !strings.Contains(got.stderr, "retry 4/4") {
+		t.Errorf("stderr = %q, want the final attempt announced as retry 4/4", got.stderr)
 	}
 }
 
@@ -2188,21 +2179,15 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 // escaping is what keeps the multi-line body inside one stdout line.
 func TestRunRejectionBodyStaysVerbatimInOneErrorEvent(t *testing.T) {
 	const body = "context length exceeded\n\tset --max-turns lower\nend of rejection"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, body)
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusBadRequest, nil, body)},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", got.code, got.stderr)
 	}
 	want := "server returned 400 Bad Request: " + body
-	if got := oneErrorEvent(t, stdout.String()); got != want {
-		t.Errorf("error event text = %q, want the rejection verbatim %q", got, want)
+	if ev := oneErrorEvent(t, string(got.stdout)); ev != want {
+		t.Errorf("error event text = %q, want the rejection verbatim %q", ev, want)
 	}
 }
 
