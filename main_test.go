@@ -633,22 +633,19 @@ func (s *scriptedChatServer) serve(t *testing.T) *scriptedChatServer {
 // the Driver assembles the chunks below the sendChat seam and emits nothing per
 // frame, so stdout does not grow with the number of chunks the server used.
 func TestRunStreamedChunksAssembleOneTextAndOneUsageEvent(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"hello "}}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}`,
 			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+		))},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
 	var textEvents, usageEvents []map[string]any
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		switch ev["kind"] {
 		case "text":
 			textEvents = append(textEvents, ev)
@@ -657,20 +654,20 @@ func TestRunStreamedChunksAssembleOneTextAndOneUsageEvent(t *testing.T) {
 		}
 	}
 	if len(textEvents) != 1 {
-		t.Fatalf("stdout carries %d text event(s), want the chunks joined into one: %q", len(textEvents), stdout.String())
+		t.Fatalf("stdout carries %d text event(s), want the chunks joined into one: %q", len(textEvents), got.stdout)
 	}
 	if textEvents[0]["text"] != "hello world" {
 		t.Errorf("text event = %v, want both chunks concatenated in order", textEvents[0]["text"])
 	}
 	if len(usageEvents) != 1 {
-		t.Fatalf("stdout carries %d usage event(s), want one for the call: %q", len(usageEvents), stdout.String())
+		t.Fatalf("stdout carries %d usage event(s), want one for the call: %q", len(usageEvents), got.stdout)
 	}
 	tokens, _ := usageEvents[0]["tokens"].(map[string]any)
 	if tokens["input"] != float64(12) || tokens["output"] != float64(3) {
 		t.Errorf("usage tokens = %v, want the usage chunk's tally input 12 output 3", tokens)
 	}
-	if got := resultText(t, stdout.String()); got != "hello world" {
-		t.Errorf("result text = %q, want the assembled answer", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "hello world" {
+		t.Errorf("result text = %q, want the assembled answer", gotText)
 	}
 }
 
@@ -680,40 +677,37 @@ func TestRunStreamedChunksAssembleOneTextAndOneUsageEvent(t *testing.T) {
 // spliced into the one text event, while a delta naming no index at all still
 // belongs to choice 0.
 func TestRunStreamIgnoresDeltasBeyondTheFirstChoice(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"hello "}}]}`,
 			`{"model":"m-a","choices":[{"index":1,"delta":{"content":"ALTERNATIVE"}}]}`,
 			`{"model":"m-a","choices":[{"delta":{"content":"again "}}]}`,
 			`{"model":"m-a","choices":[{"index":1,"delta":{"content":" ATIVE"},"finish_reason":"stop"}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}`,
 			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+		))},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
 	var textEvents []map[string]any
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] == "text" {
 			textEvents = append(textEvents, ev)
 		}
 	}
 	if len(textEvents) != 1 {
-		t.Fatalf("stdout carries %d text event(s), want choice 0 only: %q", len(textEvents), stdout.String())
+		t.Fatalf("stdout carries %d text event(s), want choice 0 only: %q", len(textEvents), got.stdout)
 	}
 	if textEvents[0]["text"] != "hello again world" {
 		t.Errorf("text event = %v, want choice 0's deltas with the index-less delta folded in", textEvents[0]["text"])
 	}
-	if got := resultText(t, stdout.String()); got != "hello again world" {
-		t.Errorf("result text = %q, want choice 0's answer alone", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "hello again world" {
+		t.Errorf("result text = %q, want choice 0's answer alone", gotText)
 	}
-	if strings.Contains(stdout.String(), "ALTERNATIVE") {
-		t.Errorf("stdout carries an alternative choice's prose: %q", stdout.String())
+	if strings.Contains(string(got.stdout), "ALTERNATIVE") {
+		t.Errorf("stdout carries an alternative choice's prose: %q", got.stdout)
 	}
 }
 
@@ -723,22 +717,19 @@ func TestRunStreamIgnoresDeltasBeyondTheFirstChoice(t *testing.T) {
 // the joined fragments and no text event at all, and the reasoning stays out of
 // the result event's prose.
 func TestRunStreamReasoningOnlyAnswerEmitsOneReasoningEvent(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(
 			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"thinking "}}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"about it"},"finish_reason":"stop"}]}`,
 			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+		))},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
 	var reasoningEvents, textEvents []map[string]any
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		switch ev["kind"] {
 		case "reasoning":
 			reasoningEvents = append(reasoningEvents, ev)
@@ -747,7 +738,7 @@ func TestRunStreamReasoningOnlyAnswerEmitsOneReasoningEvent(t *testing.T) {
 		}
 	}
 	if len(reasoningEvents) != 1 {
-		t.Fatalf("stdout carries %d reasoning event(s), want the fragments joined into one: %q", len(reasoningEvents), stdout.String())
+		t.Fatalf("stdout carries %d reasoning event(s), want the fragments joined into one: %q", len(reasoningEvents), got.stdout)
 	}
 	if reasoningEvents[0]["text"] != "thinking about it" {
 		t.Errorf("reasoning event text = %v, want both fragments concatenated in order", reasoningEvents[0]["text"])
@@ -756,10 +747,10 @@ func TestRunStreamReasoningOnlyAnswerEmitsOneReasoningEvent(t *testing.T) {
 		t.Errorf("reasoning event message_id = %v, want the msg-1 of the call that thought it", reasoningEvents[0]["message_id"])
 	}
 	if len(textEvents) != 0 {
-		t.Errorf("stdout carries %d text event(s), want none when the message only reasoned: %q", len(textEvents), stdout.String())
+		t.Errorf("stdout carries %d text event(s), want none when the message only reasoned: %q", len(textEvents), got.stdout)
 	}
-	if got := resultText(t, stdout.String()); strings.Contains(got, "thinking") {
-		t.Errorf("result text = %q, want none of the reasoning in it", got)
+	if gotText := resultText(t, string(got.stdout)); strings.Contains(gotText, "thinking") {
+		t.Errorf("result text = %q, want none of the reasoning in it", gotText)
 	}
 }
 
@@ -767,23 +758,20 @@ func TestRunStreamReasoningOnlyAnswerEmitsOneReasoningEvent(t *testing.T) {
 // thought goes out first, then the answer alone, and the result event reports
 // the prose only.
 func TestRunStreamReasoningAndProseEmitReasoningThenText(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseStream(
 			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"let me "}}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"reasoning_content":"check"}}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"the "}}]}`,
 			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}`,
 			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":11}}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+		))},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := got.events
 	var kinds []string
 	var reasoningText, proseText string
 	usageEvents := 0
@@ -800,7 +788,7 @@ func TestRunStreamReasoningAndProseEmitReasoningThenText(t *testing.T) {
 		}
 	}
 	if want := []string{"reasoning", "text"}; !reflect.DeepEqual(kinds, want) {
-		t.Fatalf("stdout prose kinds = %v, want %v (one reasoning event then one text event): %q", kinds, want, stdout.String())
+		t.Fatalf("stdout prose kinds = %v, want %v (one reasoning event then one text event): %q", kinds, want, got.stdout)
 	}
 	if reasoningText != "let me check" {
 		t.Errorf("reasoning event text = %q, want only the reasoning fragments joined", reasoningText)
@@ -808,11 +796,11 @@ func TestRunStreamReasoningAndProseEmitReasoningThenText(t *testing.T) {
 	if proseText != "the answer" {
 		t.Errorf("text event text = %q, want only the content fragments joined", proseText)
 	}
-	if got := resultText(t, stdout.String()); got != "the answer" {
-		t.Errorf("result text = %q, want the prose alone, without the reasoning", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "the answer" {
+		t.Errorf("result text = %q, want the prose alone, without the reasoning", gotText)
 	}
 	if usageEvents != 1 {
-		t.Errorf("stdout carries %d usage event(s), want the one this call owes: %q", usageEvents, stdout.String())
+		t.Errorf("stdout carries %d usage event(s), want the one this call owes: %q", usageEvents, got.stdout)
 	}
 }
 
@@ -822,27 +810,24 @@ func TestRunStreamReasoningAndProseEmitReasoningThenText(t *testing.T) {
 // tool_calls entry always had — so exactly one tool_call event goes out with the
 // id, name and complete arguments, paired with its tool_result.
 func TestRunStreamReassemblesToolCallSplitAcrossChunks(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ec"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho hel"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo\"}"}}]},"finish_reason":"tool_calls"}]}`,
-			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9}}`,
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			replyFrames(sseStream(
+				`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ec"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho hel"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo\"}"}}]},"finish_reason":"tool_calls"}]}`,
+				`{"model":"m-a","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9}}`,
+			)),
+			replyFrames(sseStream(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`)),
 		},
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := got.events
 	callEv, resultEv := toolPair(t, events)
 	if callEv["tool_id"] != "call_1" || resultEv["tool_id"] != "call_1" {
 		t.Errorf("pair tool_id = %v / %v, want the first delta's id call_1 on both", callEv["tool_id"], resultEv["tool_id"])
@@ -857,8 +842,8 @@ func TestRunStreamReassemblesToolCallSplitAcrossChunks(t *testing.T) {
 	if callEv["tool_target"] != "echo hello" {
 		t.Errorf("tool_call tool_target = %v, want the reassembled command", callEv["tool_target"])
 	}
-	if got := resultText(t, stdout.String()); got != "all done" {
-		t.Errorf("result text = %q, want the loop to continue past the reassembled call", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "all done" {
+		t.Errorf("result text = %q, want the loop to continue past the reassembled call", gotText)
 	}
 }
 
@@ -867,24 +852,21 @@ func TestRunStreamReassemblesToolCallSplitAcrossChunks(t *testing.T) {
 // two calls stay separate and each still gets one whole pair, in the order the
 // Model listed them.
 func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho a\"}"}},{"index":1,"function":{"arguments":"ho b\"}"}}]},"finish_reason":"tool_calls"}]}`,
-			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":14}}`,
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			replyFrames(sseStream(
+				`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"ec"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho a\"}"}},{"index":1,"function":{"arguments":"ho b\"}"}}]},"finish_reason":"tool_calls"}]}`,
+				`{"model":"m-a","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":14}}`,
+			)),
+			replyFrames(sseStream(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"both ran"},"finish_reason":"stop"}]}`)),
 		},
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"both ran"},"finish_reason":"stop"}]}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
 	type pair struct {
@@ -896,7 +878,7 @@ func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
 	// each call's tool_result has to be the very next event, carrying its id
 	var pending string
 	seen := 0
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		switch ev["kind"] {
 		case "tool_call":
 			if pending != "" {
@@ -906,8 +888,8 @@ func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
 			pending = fmt.Sprint(ev["tool_id"])
 		case "tool_result":
 			seen++
-			if got := fmt.Sprint(ev["tool_id"]); pending == "" || got != pending {
-				t.Errorf("tool_result tool_id = %v, want the pending call %v", got, pending)
+			if id := fmt.Sprint(ev["tool_id"]); pending == "" || id != pending {
+				t.Errorf("tool_result tool_id = %v, want the pending call %v", id, pending)
 			}
 			pending = ""
 		}
@@ -922,8 +904,8 @@ func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
 	if seen != 2 {
 		t.Errorf("stdout carries %d tool_result event(s), want one per reassembled call", seen)
 	}
-	if got := resultText(t, stdout.String()); got != "both ran" {
-		t.Errorf("result text = %q, want the loop to continue past both calls", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "both ran" {
+		t.Errorf("result text = %q, want the loop to continue past both calls", gotText)
 	}
 }
 
@@ -932,21 +914,18 @@ func TestRunStreamReassemblesInterleavedToolCallFragments(t *testing.T) {
 // them into one call whose arguments are two JSON objects spliced together, so
 // the differing ids have to keep them apart.
 func TestRunStreamSplitsIndexlessWholeCallsInSeparateDeltas(t *testing.T) {
-	srv := newScriptedSSEServer(t,
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`,
-			`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]},"finish_reason":"tool_calls"}]}`,
-			`{"model":"m-a","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":12}}`,
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			replyFrames(sseStream(
+				`{"model":"m-a","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]},"finish_reason":"tool_calls"}]}`,
+				`{"model":"m-a","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":12}}`,
+			)),
+			replyFrames(sseStream(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`)),
 		},
-		[]string{
-			`{"model":"m-a","choices":[{"index":0,"delta":{"content":"all done"},"finish_reason":"stop"}]}`,
-		},
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q stdout = %q", got.code, got.stderr, got.stdout)
 	}
 
 	type pair struct {
@@ -958,7 +937,7 @@ func TestRunStreamSplitsIndexlessWholeCallsInSeparateDeltas(t *testing.T) {
 	// each call's tool_result has to be the very next event, carrying its id
 	var pending string
 	seen := 0
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		switch ev["kind"] {
 		case "tool_call":
 			if pending != "" {
@@ -968,8 +947,8 @@ func TestRunStreamSplitsIndexlessWholeCallsInSeparateDeltas(t *testing.T) {
 			pending = fmt.Sprint(ev["tool_id"])
 		case "tool_result":
 			seen++
-			if got := fmt.Sprint(ev["tool_id"]); pending == "" || got != pending {
-				t.Errorf("tool_result tool_id = %v, want the pending call %v", got, pending)
+			if id := fmt.Sprint(ev["tool_id"]); pending == "" || id != pending {
+				t.Errorf("tool_result tool_id = %v, want the pending call %v", id, pending)
 			}
 			pending = ""
 		}
@@ -984,8 +963,8 @@ func TestRunStreamSplitsIndexlessWholeCallsInSeparateDeltas(t *testing.T) {
 	if seen != 2 {
 		t.Errorf("stdout carries %d tool_result event(s), want one per whole call", seen)
 	}
-	if got := resultText(t, stdout.String()); got != "all done" {
-		t.Errorf("result text = %q, want the loop to continue past both calls", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "all done" {
+		t.Errorf("result text = %q, want the loop to continue past both calls", gotText)
 	}
 }
 
