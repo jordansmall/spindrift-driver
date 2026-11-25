@@ -352,13 +352,27 @@ type hookDecision struct {
 	UpdatedToolOutput string `json:"updatedToolOutput"`
 }
 
-// guardCommand runs command through the pre-call Guard Hooks in manifest order
-// and returns the command to run together with the refusal to hand back as the
-// Tool Result, "" for "no objection". The first refusal stops the chain: a
-// command already refused has no reason to be asked of a second hook, and a
-// refused call runs nothing, so the command returned with a refusal is the
-// empty string. A hook that answers with updatedInput replaces the command the
-// rest of the chain sees and the command the caller runs.
+// guardPresentation is one call as the Guard chain is asked about it. Today
+// there are two shapes: a command a hook may rewrite, and a file path shown to
+// hooks as the Read shape.
+type guardPresentation struct {
+	protocolName string // the tool_name the hooks see
+	subject      string // the command, or the file path
+	encode       func(subject string) ([]byte, error)
+	jqMissing    string // precondition refusal wording for this shape
+	// feedsRewrite marks the shape whose subject a hook's answer can replace,
+	// which is the only shape hookRewrite's policy applies to. It also decides how
+	// often encode runs: a subject nothing can replace never changes, so the chain
+	// is built one request instead of one per hook.
+	feedsRewrite bool
+}
+
+// guardThrough runs p through the pre-call Guard Hooks in manifest order and
+// returns the subject to act on together with the first refusal to hand back as
+// the Tool Result, "" for "no objection". The first refusal stops the chain: a
+// call already refused has no reason to be asked of a second hook, and a refused
+// call acts on nothing, so the subject returned with a refusal is the empty
+// string.
 //
 // A hook's silence is a pass and anything else is a block. Silence means an
 // empty or whitespace-only stdout, an absent or null hookSpecificOutput, and
@@ -372,37 +386,46 @@ type hookDecision struct {
 //
 // Every refusal carries the "error: " prefix, which is what turns this string
 // into an error Tool Result downstream, and a refusal raised by a run names the
-// hook's path so the operator can find the script to ask why — except the
-// missing-jq precondition below, which belongs to the run, not to a hook.
-func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
+// hook's path so the operator can find the script to ask why. The missing-jq
+// precondition below is the exception: it belongs to the guarded run rather than
+// to one hook, and each presentation words it for its own subject.
+func guardThrough(hooks []guardHook, p guardPresentation, stderr io.Writer) (string, string) {
 	if len(hooks) == 0 {
 		// An unguarded run pays nothing: no marshalling, no fork, no wait — and no
-		// jq, since nothing here needs reading. The command runs as asked.
-		return command, ""
+		// jq, since nothing here needs reading. The call goes through as asked.
+		return p.subject, ""
 	}
 	if _, err := exec.LookPath("jq"); err != nil {
 		// A guard that cannot read its own request must never be trusted as
 		// approving: the host's baked hook scripts shell out to jq to parse the
-		// stdin this function builds, so without jq a hook exits 0 having inspected
-		// nothing and that silence reads as a pass. Refuse before any hook runs,
-		// which is also before the command can run. The reason names jq rather than
-		// a hook path — jq is a precondition of the guarded run, not of one hook.
-		return "", "error: jq is not available, so the guarded command cannot be run"
+		// stdin the payload below carries, so without jq a hook exits 0 having
+		// inspected nothing and that silence reads as a pass. Refuse before any hook
+		// runs, which is also before the call can act.
+		return "", p.jqMissing
 	}
-	protocolName := hookToolName(driverTool)
-
+	subject := p.subject
+	var payload []byte
+	if !p.feedsRewrite {
+		// Built once for the chain where nothing feeds forward: every hook is asked
+		// about the same subject, so the request cannot differ between them. It is
+		// built before the loop rather than inside it, so a build that fails refuses
+		// the call even when no hook in the chain applies to this shape.
+		var err error
+		if payload, err = p.encode(subject); err != nil {
+			return "", encodeRefusal(err)
+		}
+	}
 	for _, hook := range hooks {
-		if !hook.appliesTo(protocolName) {
+		if !hook.appliesTo(p.protocolName) {
 			continue
 		}
-		// Built per hook rather than once for the chain: a rewrite from an earlier
-		// hook is the command the next hook is asked about.
-		payload, err := encodeHookRequest(protocolName, command)
-		if err != nil {
-			// Fail closed like a hook that never answered: a request the Driver could
-			// not build is a command no hook was ever asked about, so running it would
-			// be running it unguarded.
-			return "", fmt.Sprintf("error: guard hook request could not be built: %v", err)
+		if p.feedsRewrite {
+			// Built per hook where a rewrite feeds forward: an earlier hook's answer is
+			// the subject the next is asked about.
+			var err error
+			if payload, err = p.encode(subject); err != nil {
+				return "", encodeRefusal(err)
+			}
 		}
 		// The run is judged before the verdict: a hook that never answered blocks
 		// the call on its own, with nothing left to parse.
@@ -411,16 +434,38 @@ func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Write
 		if refusal == "" {
 			answer, refusal = hookVerdict(hook, stdout)
 		}
-		if refusal == "" {
+		if refusal == "" && p.feedsRewrite {
 			// Judged only after the verdicts, so a rewriting hook that denies is
 			// refused for denying rather than for the rewrite it withheld.
-			command, refusal = hookRewrite(hook, command, answer)
+			subject, refusal = hookRewrite(hook, subject, answer)
 		}
 		if refusal != "" {
 			return "", refusal
 		}
 	}
-	return command, ""
+	return subject, ""
+}
+
+// encodeRefusal words the fail-closed judgement on a request the Driver could
+// not build: a call no hook was ever asked about must not be acted on.
+func encodeRefusal(err error) string {
+	return fmt.Sprintf("error: guard hook request could not be built: %v", err)
+}
+
+// guardCommand runs command through the Guard chain as a bash-shaped call and
+// returns the command to run together with the refusal. It is the one shape
+// whose subject feeds forward: a hook that answers with updatedInput replaces
+// the command the rest of the chain sees and the command the caller runs. The
+// chain's fail-closed judgement is guardThrough's.
+func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
+	protocolName := hookToolName(driverTool)
+	return guardThrough(hooks, guardPresentation{
+		protocolName: protocolName,
+		subject:      command,
+		encode:       func(subject string) ([]byte, error) { return encodeHookRequest(protocolName, subject) },
+		jqMissing:    "error: jq is not available, so the guarded command cannot be run",
+		feedsRewrite: true,
+	}, stderr)
 }
 
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
@@ -463,7 +508,7 @@ func encodeHookReadRequest(path string) ([]byte, error) {
 	return encodeHookPayload(hookRequest{ToolName: "Read", ToolInput: hookToolInput{FilePath: path}})
 }
 
-// guardRead runs filePath through the pre-call Guard Hooks in manifest order and
+// guardRead runs filePath through the Guard chain as a Read-shaped call and
 // returns the refusal to hand back as the Tool Result, "" for "no objection".
 // The call is presented as the Read tool's own request — tool_name "Read" for
 // both file Tools, not two new protocol names — so one host rule that denies
@@ -471,44 +516,20 @@ func encodeHookReadRequest(path string) ([]byte, error) {
 // rewritten. The hooks asked are the ones guarding reads, which an empty tools
 // list already means.
 //
-// hookRewrite has no place here: a read has no input to rewrite, so the rule
-// that refuses a silent rewriter is command-only policy, and any updatedInput a
-// hook answers a read with is ignored. Everything else about the chain is
-// guardCommand's fail-closed judgement, first refusal winning.
+// With feedsRewrite off the chain stops at the verdicts: a read has no input to
+// rewrite, so the rule that refuses a silent rewriter is command-only policy,
+// and any updatedInput a hook answers a read with is ignored.
 func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
-	if len(hooks) == 0 {
-		// An unguarded run pays nothing: no marshalling, no fork, no jq lookup.
-		return ""
-	}
-	if _, err := exec.LookPath("jq"); err != nil {
-		// The same doubt guardCommand raises — a guard that cannot read its own
-		// request has inspected nothing — worded for a run that has no command in
-		// it, and still named for jq rather than a hook path.
-		return "error: jq is not available, so the guarded read cannot be run"
-	}
-	// Built once for the chain rather than per hook as guardCommand does: with no
-	// rewrite to feed forward, every hook is asked about the same path.
-	payload, err := encodeHookReadRequest(filePath)
-	if err != nil {
-		// Fail closed like a hook that never answered: a request the Driver could
-		// not build is a path no hook was ever asked about.
-		return fmt.Sprintf("error: guard hook request could not be built: %v", err)
-	}
-	for _, hook := range hooks {
-		if !hook.appliesTo("Read") {
-			continue
-		}
-		// The run is judged before the verdict, as in guardCommand: a hook that never
-		// answered blocks the call on its own, with nothing left to parse.
-		stdout, refusal := runHookScript(hook.path, payload, stderr)
-		if refusal == "" {
-			_, refusal = hookVerdict(hook, stdout)
-		}
-		if refusal != "" {
-			return refusal
-		}
-	}
-	return ""
+	_, refusal := guardThrough(hooks, guardPresentation{
+		protocolName: "Read",
+		subject:      filePath,
+		// Takes no subject: a path has nothing to rewrite, so every hook in the
+		// chain is asked about the same one.
+		encode:       func(string) ([]byte, error) { return encodeHookReadRequest(filePath) },
+		jqMissing:    "error: jq is not available, so the guarded read cannot be run",
+		feedsRewrite: false,
+	}, stderr)
+	return refusal
 }
 
 // encodeHookPostRequest builds the stdin the summary hook is handed for a
