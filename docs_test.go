@@ -522,6 +522,48 @@ func TestContextDefinesWriteTool(t *testing.T) {
 	}
 }
 
+// TestContextDefinesToolResult pins the glossary entry for the Tool Result now that
+// the verdict is a value a Tool states rather than a rule the Driver reads off the
+// text. An entry describing only the text hands a host author the wrong question:
+// not "what does the text say" but "what did the Tool state", which is what the
+// host's is_error and the Model's next request are both built from.
+func TestContextDefinesToolResult(t *testing.T) {
+	const file = "CONTEXT.md"
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("%s is missing and must define the Tool Result vocabulary: %v", file, err)
+	}
+	norm := normalizeMarkdown(t, file)
+
+	entry := glossarySection(norm, "tool result")
+	if entry == "" {
+		t.Fatal("CONTEXT.md has no **Tool Result** glossary entry")
+	}
+	// The two halves of the outcome and who reads each: the Model gets the text in the
+	// next request, the host gets the verdict.
+	if !near(entry, "next request", "model", 200) {
+		t.Error("the **Tool Result** entry does not state that the text goes back to the Model in the next request")
+	}
+	if !near(entry, "is_error", "failed", 200) || !near(entry, "is_error", "host", 200) {
+		t.Error("the **Tool Result** entry does not state that whether the call failed is reported to the host as is_error")
+	}
+	// Stated, not inferred — so no prefix rule may stand in for the Tool's decision.
+	if !near(entry, "tool decides", "both", 120) {
+		t.Error("the **Tool Result** entry does not state that the Tool decides the text and the verdict")
+	}
+	if strings.Contains(entry, "error:-prefixed") || near(entry, "`error:`", "prefix", 200) {
+		t.Error("the **Tool Result** entry still derives the verdict from an `error:` prefix in the text")
+	}
+	if !near(entry, "guard hook", "failed", 240) || !near(entry, "repeated-call breaker", "failed", 240) {
+		t.Error("the **Tool Result** entry does not say a Guard Hook or Repeated-Call Breaker refusal is a failed Tool Result like any other")
+	}
+	if !strings.Contains(entry, "_avoid_:") {
+		t.Error("the **Tool Result** entry has no _Avoid_ line")
+	}
+	if n := countAny(entry, "observation", "output"); n < 2 {
+		t.Errorf("the **Tool Result** entry retires %d of the wrong words (observation, output); want at least 2", n)
+	}
+}
+
 // readADRs loads every ADR from disk keyed by file name, mapping to its raw text:
 // which decision supersedes which is a property of the record set, not of a file
 // name somebody chose, so the directory is read rather than its names assumed.

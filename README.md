@@ -55,15 +55,19 @@ exit.
   `write`, the resolved absolute path the call acts on — a relative `path` is read against
   the run's working directory once, at plan time, and `tool_call` and `tool_result` report
   that one value).
-- `tool_result` — that call's output on its way back to the Model, `is_error` set when the
-  command failed or a file operation did. A file Tool answers in a sentence rather than
-  command output — `wrote N bytes to <path>`, `edited <path>: replaced N matches` — and
-  `is_error` is true exactly for the `error:`-prefixed ones: an `edit` whose `old_string`
-  matches nowhere in the file, or matches more than once without `replace_all`, names the
-  count, writes nothing, and the run goes on past it to exit 0. `tool_call` and `tool_result`
-  pair by `tool_id`. A call the Repeated-Call Breaker refused never ran, so its `tool_result`
-  is the Driver's own text asking the Model to take a different action, and it pairs with its
-  `tool_call` like any result does.
+- `tool_result` — that call's output on its way back to the Model, plus the verdict the Tool
+  states alongside it, which is what `is_error` reports: a command's verdict comes from its
+  exit status, a file Tool's from the branch that failed, a Subagent Tool's from whether the
+  child spawned and handed back a result — never from its answer's first word. Nothing reads
+  the text to decide, so a summary hook may replace a command's text and never its verdict.
+  A file Tool answers in a sentence rather than command output — `wrote N bytes to <path>`,
+  `edited <path>: replaced N matches` — and a failed one carries the `error:` prefix: an
+  `edit` whose `old_string` matches nowhere in the file, or matches more than once without
+  `replace_all`, names the count, writes nothing, and the run goes on past it to exit 0. A
+  Guard Hook refusal, an unknown Tool and unparseable arguments are failed results built the
+  same way. `tool_call` and `tool_result` pair by `tool_id`. A call the Repeated-Call Breaker
+  refused never ran, so its `tool_result` is the Driver's own text asking the Model to take a
+  different action, and it pairs with its `tool_call` like any result does.
 - `result` — the final answer, in `text`, plus `num_turns`, `duration_ms`,
   `duration_api_ms`, the session token totals in `tokens` and the `models` that
   answered. The answer is this event's `text`; it is also emitted as a `text` event,

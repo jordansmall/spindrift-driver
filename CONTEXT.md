@@ -25,7 +25,7 @@ A structured tool invocation the Model returns in its response (via the OpenAI `
 _Avoid_: function call, action
 
 **Tool Result**:
-The output the Driver sends back to the Model for one Tool Call, in the next request.
+The outcome of one Tool Call: its text, which the Driver sends back to the Model in the next request, and whether the call failed, which the Driver reports to the host as `is_error`. The Tool decides both, and a refusal by a Guard Hook or the Repeated-Call Breaker is a failed Tool Result like any other.
 _Avoid_: observation, output
 
 **Bash Tool**:
