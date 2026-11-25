@@ -578,7 +578,10 @@ func TestFileToolDispatchesEdit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("before"), 0o644); err != nil {
 		t.Fatalf("pre-write: %v", err)
 	}
-	plan := planToolCall(editCall(`{"path":"a.txt","old_string":"before","new_string":"after"}`), session{})
+	// Dispatch reads the run's resolved set, so the session has to carry one: the
+	// top-level set over no roster is the set that holds edit and write.
+	s := session{cfg: config{tools: resolveTools(agentEntry{}, nil)}}
+	plan := planToolCall(editCall(`{"path":"a.txt","old_string":"before","new_string":"after"}`), s)
 	want := filepath.Join(dir, "a.txt")
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want the resolved path %q", plan.target, want)
@@ -600,7 +603,7 @@ func TestFileToolDispatchesWrite(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	plan := planToolCall(writeCall(`{"path":"dispatched.txt","content":"via planToolCall"}`), session{})
+	plan := planToolCall(writeCall(`{"path":"dispatched.txt","content":"via planToolCall"}`), session{cfg: config{tools: resolveTools(agentEntry{}, nil)}})
 	want := filepath.Join(dir, "dispatched.txt")
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want %q", plan.target, want)

@@ -681,7 +681,9 @@ func TestSubagentChildSpawnsOnlyItsOwn(t *testing.T) {
 
 // TestSubagentSpawnOfAgentWithNoFileIsRefused: spawns is a grant over the Agent
 // Files that exist, so an entry whose spawns names only a missing file may spawn
-// nobody — and the refusal says so rather than naming an empty list.
+// nobody — and the refusal says so rather than naming an empty list. The
+// set-level call refusal is the one that answers here, because a run with nobody
+// it may name is never given the Subagent Tool in the first place.
 func TestSubagentSpawnOfAgentWithNoFileIsRefused(t *testing.T) {
 	got := runDriver(t, map[string][]modelEntry{
 		"m-planner": {
@@ -702,16 +704,25 @@ func TestSubagentSpawnOfAgentWithNoFileIsRefused(t *testing.T) {
 	if len(got.requests) != 2 {
 		t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(got.requests), raw)
 	}
-	_, resultEv := spawnPair(t, raw)
+	callEv, resultEv := spawnPair(t, raw)
 	out, _ := resultEv["tool_output"].(string)
 	if !strings.HasPrefix(out, "error:") || resultEv["is_error"] != true {
 		t.Errorf("tool_output = %q is_error = %v, want an error:-prefixed result flagged as one", out, resultEv["is_error"])
 	}
-	if !strings.Contains(out, "this run may spawn no agents") {
-		t.Errorf("tool_output = %q, want the refusal to say this run may spawn nobody", out)
+	if !strings.Contains(out, `cannot call tool "subagent"`) {
+		t.Errorf("tool_output = %q, want the refusal to name the Tool the call asked for", out)
+	}
+	if !strings.Contains(out, "bash") {
+		t.Errorf("tool_output = %q, want the refusal to name the one Tool this run may call", out)
 	}
 	if strings.Contains(out, "worker") {
 		t.Errorf("tool_output = %q names worker, which planner's spawns does not grant", out)
+	}
+	if callEv["tool_target"] != nil || resultEv["subagent"] != nil {
+		t.Errorf("refusal events carry subagent = %v tool_target = %v, want both unset", resultEv["subagent"], callEv["tool_target"])
+	}
+	if relayed := relayedEvents(t, raw); len(relayed) != 0 {
+		t.Errorf("stdout carries relayed child events for a spawn this run may not make: %v", relayed)
 	}
 	if got := parentResult(t, raw)["text"]; got != "parent answer" {
 		t.Errorf("parent result text = %v, want the run to go on after the refusal", got)
