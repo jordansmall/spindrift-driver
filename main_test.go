@@ -3912,45 +3912,44 @@ func postedToolNames(t *testing.T, raw []byte) []string {
 // TestRunOffersNoSubagentWithoutAgentFiles is the issue's first acceptance
 // criterion: with no Agent Files the run offers no Subagent Tool at all.
 func TestRunOffersNoSubagentWithoutAgentFiles(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// An empty HOME is what keeps "no Agent Files" meaning no Agent Files: the
+	// helper runs on real os.LookupEnv, so without it the run could resolve a home
+	// that holds a roster and grow the offer.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 1 {
-		t.Fatalf("POSTs = %d, want 1", len(sent))
+	if len(got.requests) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(got.requests))
 	}
-	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
-		t.Errorf("offered tools = %v, want [bash edit write] only", got)
+	if offer := postedToolNames(t, got.requests[0].body); !reflect.DeepEqual(offer, []string{"bash", "edit", "write"}) {
+		t.Errorf("offered tools = %v, want [bash edit write] only", offer)
 	}
 }
 
 // TestRunOffersSubagentToolWithAgentFiles: a roster the Driver Config points at
 // is the only thing that puts the Subagent Tool in front of the Model.
 func TestRunOffersSubagentToolWithAgentFiles(t *testing.T) {
-	dir := t.TempDir()
-	writeAgentFile(t, dir, "reviewer.md", "---\nname: reviewer\nmodel: m-r\n---\nreview things\n")
-	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
-	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(name string) (string, bool) {
-		if name == envConfigPath {
-			return cfgPath, true
-		}
-		return "", false
-	})
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// HOME is pinned to an empty directory so the roster the run's Driver Config
+	// names is the only one in play: the helper runs on real os.LookupEnv, and what
+	// this test pins is what agents_dir alone does to the offer.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-r", body: "review things"}),
+		withFlags("--model", "m"),
+		withEnv("HOME", t.TempDir()),
+	)
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 1 {
-		t.Fatalf("POSTs = %d, want 1", len(sent))
+	if len(got.requests) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(got.requests))
 	}
-	if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
-		t.Errorf("offered tools = %v, want [bash edit write subagent]", got)
+	if offer := postedToolNames(t, got.requests[0].body); !reflect.DeepEqual(offer, []string{"bash", "edit", "write", "subagent"}) {
+		t.Errorf("offered tools = %v, want [bash edit write subagent]", offer)
 	}
 }
 
@@ -4076,17 +4075,21 @@ func TestParseArgsUnknownAgent(t *testing.T) {
 // path as every other parseArgs error — exit 2, one error event, and the Model
 // is never contacted.
 func TestRunUnknownAgentExitsTwo(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-r", "review things")
-	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--agent", "ghost", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 2 {
-		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
+	// The queue is scripted even though this run never POSTs: what is under test is
+	// that the startup error spends nothing, and an unspent entry is not a failure.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-r", body: "review things"}),
+		withFlags("--model", "m", "--agent", "ghost"),
+	)
+	if got.code != 2 {
+		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", got.code, got.stderr)
 	}
-	if got := oneErrorEvent(t, stdout.String()); got != `unknown agent "ghost"` {
-		t.Errorf("error event text = %q, want %q", got, `unknown agent "ghost"`)
+	if text := oneErrorEvent(t, string(got.stdout)); text != `unknown agent "ghost"` {
+		t.Errorf("error event text = %q, want %q", text, `unknown agent "ghost"`)
 	}
-	if n := len(srv.requestBodies(t)); n != 0 {
+	if n := len(got.requests); n != 0 {
 		t.Errorf("POSTs = %d, want 0: a startup error never reaches the server", n)
 	}
 }
@@ -4098,32 +4101,27 @@ func TestRunUnknownAgentExitsTwo(t *testing.T) {
 // reply would mask any mangle in the usage event.
 func TestRunAgentModelPostedVerbatim(t *testing.T) {
 	const modelID = "vendor/model-x:2025-01-01-effort-high"
-	cfgPath := agentFixture(t, "thinker", modelID, "think hard")
-	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--agent", "thinker", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		modelID: {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p",
+		withRoster(agentSpec{name: "thinker", model: modelID, body: "think hard"}),
+		withFlags("--agent", "thinker"),
+	)
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 1 {
-		t.Fatalf("POSTs = %d, want 1", len(sent))
+	if len(got.requests) != 1 {
+		t.Fatalf("POSTs = %d, want 1", len(got.requests))
 	}
-	var body struct {
-		Model    string            `json:"model"`
-		Messages []recordedMessage `json:"messages"`
+	if model := requestModel(t, got.requests[0].body); model != modelID {
+		t.Errorf("posted model = %q, want the entry id verbatim %q", model, modelID)
 	}
-	if err := json.Unmarshal(sent[0], &body); err != nil {
-		t.Fatalf("POST body is not valid JSON: %v; body = %q", err, sent[0])
+	msgs := requestMessages(t, got.requests[0].body)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
 	}
-	if body.Model != modelID {
-		t.Errorf("posted model = %q, want the entry id verbatim %q", body.Model, modelID)
-	}
-	if len(body.Messages) != 2 {
-		t.Fatalf("messages = %d, want 2", len(body.Messages))
-	}
-	if body.Messages[0].Role != "system" || body.Messages[0].Content != "think hard" {
-		t.Errorf("system message = %+v, want the Agent File body as the system prompt", body.Messages[0])
+	if msgs[0].Role != "system" || msgs[0].Content != "think hard" {
+		t.Errorf("system message = %+v, want the Agent File body as the system prompt", msgs[0])
 	}
 }
 
@@ -4146,21 +4144,24 @@ func TestRunChildNotOfferedSubagentTool(t *testing.T) {
 		{name: "top level keeps the tool", agent: nil, want: []string{"bash", "edit", "write", "subagent"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfgPath := agentFixtureEntries(t, roster...)
-			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-			args := append([]string{"p"}, tc.agent...)
-			args = append(args, "--model", "m", "--base-url", srv.srv.URL)
-			var stdout, stderr bytes.Buffer
-			code := run(args, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-			if code != 0 {
-				t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+			// HOME is pinned empty so the roster the row wrote is the only one the
+			// offer can be read against: the helper runs on real os.LookupEnv.
+			got := runDriver(t, map[string][]modelEntry{
+				"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+			}, "p",
+				withRoster(roster...),
+				withFlags(tc.agent...),
+				withFlags("--model", "m"),
+				withEnv("HOME", t.TempDir()),
+			)
+			if got.code != 0 {
+				t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 			}
-			sent := srv.requestBodies(t)
-			if len(sent) != 1 {
-				t.Fatalf("POSTs = %d, want 1", len(sent))
+			if len(got.requests) != 1 {
+				t.Fatalf("POSTs = %d, want 1", len(got.requests))
 			}
-			if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("offered tools = %v, want %v", got, tc.want)
+			if offer := postedToolNames(t, got.requests[0].body); !reflect.DeepEqual(offer, tc.want) {
+				t.Errorf("offered tools = %v, want %v", offer, tc.want)
 			}
 		})
 	}
@@ -4224,21 +4225,24 @@ func TestRunOfferIsWhatTheEntryGrants(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfgPath := agentFixtureEntries(t, tc.specs...)
-			srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-			args := append([]string{"p"}, tc.agent...)
-			args = append(args, "--model", "m", "--base-url", srv.srv.URL)
-			var stdout, stderr bytes.Buffer
-			code := run(args, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-			if code != 0 {
-				t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+			// HOME is pinned empty so the roster the row wrote is the only one the
+			// grant is read against: the helper runs on real os.LookupEnv.
+			got := runDriver(t, map[string][]modelEntry{
+				"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+			}, "p",
+				withRoster(tc.specs...),
+				withFlags(tc.agent...),
+				withFlags("--model", "m"),
+				withEnv("HOME", t.TempDir()),
+			)
+			if got.code != 0 {
+				t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 			}
-			sent := srv.requestBodies(t)
-			if len(sent) != 1 {
-				t.Fatalf("POSTs = %d, want 1", len(sent))
+			if len(got.requests) != 1 {
+				t.Fatalf("POSTs = %d, want 1", len(got.requests))
 			}
-			if got := postedToolNames(t, sent[0]); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("offered tools = %v, want %v", got, tc.want)
+			if offer := postedToolNames(t, got.requests[0].body); !reflect.DeepEqual(offer, tc.want) {
+				t.Errorf("offered tools = %v, want %v", offer, tc.want)
 			}
 		})
 	}
@@ -4249,13 +4253,16 @@ func TestRunOfferIsWhatTheEntryGrants(t *testing.T) {
 // those runs have always started from the package prompt. The fallback keeps
 // them byte-identical.
 func TestRunSystemPromptFallsBackToDefault(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	// The empty HOME is what keeps this the roster-free top-level run the fallback
+	// is described for: the helper runs on real os.LookupEnv, so a home holding (or
+	// one that fails to parse) Agent Files would otherwise steer the run itself.
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	}, "p", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 1 || len(msgs[0]) != 2 {
 		t.Fatalf("messages = %+v, want one POST of two messages", msgs)
 	}
