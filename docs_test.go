@@ -179,6 +179,12 @@ func TestContextDefinesAgentFile(t *testing.T) {
 	if !strings.Contains(entry, "verbatim") {
 		t.Error("the **Agent File** entry does not say the model id is used verbatim, with no effort parsed out of it")
 	}
+	// The grant holds at dispatch as well as at offer time, and this entry is where a
+	// roster author learns the shape of the refusal that enforces it: naming the set
+	// is what makes an off-grant call correctable in one step.
+	if !near(entry, "may call", "error tool result naming", 250) || !near(entry, "error tool result naming", "may call", 250) {
+		t.Error("the **Agent File** entry does not state that `tools` bounds what that entry's run may call and that a Tool Call outside the grant comes back as an error Tool Result naming the Tools the run may call")
+	}
 	if !strings.Contains(entry, "_avoid_:") {
 		t.Error("the **Agent File** entry has no _Avoid_ line")
 	}

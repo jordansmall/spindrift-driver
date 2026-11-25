@@ -353,11 +353,13 @@ You are a scout. Read, and report paths; never edit.
 `name` and `model` are required. `model` is the child's Model id, used verbatim — no
 effort suffix is parsed off it — and `--model` still overrides it for a run started with
 `--agent`, as it does for any run. The body below the frontmatter is the child's system
-prompt. `tools` grants the Tools that entry's run is offered, by the Driver's own names —
-`bash`, `edit`, `write` and `subagent`, in that order whatever order the file lists them,
-and an entry naming no tools, or only names the Driver does not know, is offered the Bash
-Tool alone; `spawns` limits which roster entries that run may delegate to, while a run
-started with no `--agent` flag is unrestricted.
+prompt. `tools` grants the Tools that entry's run is offered and may call, by the Driver's
+own names — `bash`, `edit`, `write` and `subagent`, in that order whatever order the file
+lists them, and an entry naming no tools, or only names the Driver does not know, is
+offered the Bash Tool alone; `spawns` limits which roster entries that run may delegate to,
+while a run started with no `--agent` flag is unrestricted. A Tool Call outside the grant is
+refused as an error Tool Result naming the Tools the run may call, so the grant bounds what
+the Driver will run and not only what the Model is shown.
 
 The Subagent Tool is offered only when the roster holds at least one Agent File — with
 none there is nobody for a call to name — and a call takes the `agent` to delegate to and

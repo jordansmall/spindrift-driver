@@ -94,8 +94,10 @@ The API key comes from $` + envAPIKey + ` or that file, never from argv.
 --max-turns caps the number of agent turns (default ` + fmt.Sprint(defaultMaxTurns) + `).
 --agent <name> runs as that Agent File entry: its model id names the model unless --model
 gives one, and the file body replaces the system prompt. The entry's tools list limits which
-Tools that run is offered, the Bash Tool alone when it names none, and its spawns list limits
-which agents it may spawn; a run with no --agent flag is unrestricted.
+Tools that run is offered and may call, the Bash Tool alone when it names none, and its
+spawns list limits which agents it may spawn; a run with no --agent flag is unrestricted.
+A Tool Call outside that grant comes back as an error Tool Result naming the Tools that run
+may call, so the grant bounds what the Driver will run, not only what the Model is shown.
 --timeout is an idle bound on one chat attempt: the dial, the response headers and the
 gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
 arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a

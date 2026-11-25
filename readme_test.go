@@ -948,6 +948,12 @@ func TestReadmeDocumentsSubagents(t *testing.T) {
 	if !regexp.MustCompile(`grants the tools[^.]*bash tool alone`).MatchString(sec) {
 		t.Error("the Subagents section does not say an entry's tools list grants the Tools its run is offered, the Bash Tool alone when it names none")
 	}
+	// The grant is a dispatch bound too, not a display list: an author who reads it
+	// as only the offer believes an off-grant Tool is simply out of reach, and the
+	// page is the only place naming the error a call for it actually returns.
+	if !near(sec, "may call", "error tool result", 320) || !near(sec, "error tool result", "may call", 320) {
+		t.Error("the Subagents section does not say the tools grant bounds what the run may call, a Tool Call outside it coming back as an error Tool Result naming the Tools the run may call")
+	}
 	if !regexp.MustCompile(`spawns[^.]*delegate to[^.]*no .--agent. flag[^.]*unrestricted`).MatchString(sec) {
 		t.Error("the Subagents section does not say spawns limits whom a run may delegate to and that a run started with no --agent flag is unrestricted")
 	}

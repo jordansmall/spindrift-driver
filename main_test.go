@@ -4443,6 +4443,12 @@ func TestUsageDocumentsAgentFlag(t *testing.T) {
 	if !regexp.MustCompile(`(?s)tools list limits[^.]*Bash Tool alone`).MatchString(usage) {
 		t.Errorf("usage does not say an entry's tools list limits the Tools its run is offered, the Bash Tool alone when it names none:\n%s", usage)
 	}
+	// The grant bounds dispatch, not just the offer: an operator reading -h as only
+	// the offer expects an off-grant Tool to be absent rather than refused, and the
+	// refusal text is what they have to match against.
+	if !regexp.MustCompile(`(?s)Tool Call outside[^.]*error Tool Result[^.]*Tools that run\s+may call`).MatchString(usage) {
+		t.Errorf("usage does not say a Tool Call outside the grant is refused as an error Tool Result naming the Tools that run may call:\n%s", usage)
+	}
 	if !regexp.MustCompile(`(?s)spawns list limits[^.]*may spawn`).MatchString(usage) {
 		t.Errorf("usage does not say an entry's spawns list limits the agents its run may spawn:\n%s", usage)
 	}
