@@ -4463,7 +4463,7 @@ func TestParseArgsPositionalPromptNotTrimmed(t *testing.T) {
 }
 
 func TestRunBashToolSuccess(t *testing.T) {
-	result := runBashTool("echo hello")
+	result := runBashTool("echo hello").text
 	want := "hello\nexit code: 0"
 	if result != want {
 		t.Errorf("runBashTool(echo hello) = %q, want %q", result, want)
@@ -4472,15 +4472,26 @@ func TestRunBashToolSuccess(t *testing.T) {
 
 func TestRunBashToolFailureIsResultNotError(t *testing.T) {
 	// A non-zero exit is ordinary tool output for the model, not a Go error.
-	result := runBashTool("echo before; exit 3")
+	result := runBashTool("echo before; exit 3").text
 	want := "before\nexit code: 3"
 	if result != want {
 		t.Errorf("runBashTool(echo before; exit 3) = %q, want %q", result, want)
 	}
 }
 
+func TestRunBashToolStatesFailureFromExitStatus(t *testing.T) {
+	// The verdict is the Tool's own statement rather than something a caller reads
+	// back out of the text: a non-zero exit failed, a clean exit did not.
+	if got := runBashTool("printf x; exit 3"); !got.failed {
+		t.Errorf("runBashTool(printf x; exit 3).failed = %v, want true", got.failed)
+	}
+	if got := runBashTool("printf x"); got.failed {
+		t.Errorf("runBashTool(printf x).failed = %v, want false", got.failed)
+	}
+}
+
 func TestRunBashToolIncludesStderr(t *testing.T) {
-	result := runBashTool("echo out; echo err >&2")
+	result := runBashTool("echo out; echo err >&2").text
 	if !strings.Contains(result, "out") || !strings.Contains(result, "err") {
 		t.Errorf("runBashTool = %q, want both stdout and stderr combined", result)
 	}
@@ -4501,7 +4512,7 @@ func TestRunBashToolRunsInDriverCwd(t *testing.T) {
 	f.Close()
 	defer os.Remove(name)
 
-	result := runBashTool("echo written > " + name)
+	result := runBashTool("echo written > " + name).text
 	if !strings.HasSuffix(result, "exit code: 0") {
 		t.Errorf("runBashTool = %q, want success", result)
 	}
@@ -4517,7 +4528,7 @@ func TestRunBashToolRunsInDriverCwd(t *testing.T) {
 func TestRunBashToolNonexistentCommandExits127(t *testing.T) {
 	// bash itself starts fine and reports 127 for a command it cannot find;
 	// the model still gets an ordinary Tool Result.
-	result := runBashTool("nonexistent-spindrift-cmd-xyz")
+	result := runBashTool("nonexistent-spindrift-cmd-xyz").text
 	if !strings.Contains(result, "not found") || !strings.Contains(result, "exit code: 127") {
 		t.Errorf("runBashTool = %q, want error text plus exit-code line", result)
 	}
@@ -4529,7 +4540,7 @@ func TestRunBashToolUnstartableBashIsWellFormedResult(t *testing.T) {
 	// Setenv before the call: exec.Command resolves bash via LookPath at
 	// command-construction time, inheriting the current env.
 	t.Setenv("PATH", "")
-	result := runBashTool("echo hi")
+	result := runBashTool("echo hi").text
 	if !strings.HasPrefix(result, "error: cannot start command:") {
 		t.Errorf("runBashTool = %q, want a plain 'error: cannot start command: ...' result", result)
 	}
@@ -4538,10 +4549,20 @@ func TestRunBashToolUnstartableBashIsWellFormedResult(t *testing.T) {
 	}
 }
 
+func TestRunBashToolStatesFailureFromACommandThatNeverStarted(t *testing.T) {
+	// Nothing ran, so the text carries no exit-code line at all: only the Tool can
+	// say the call failed, and it does.
+	t.Setenv("PATH", "")
+	got := runBashTool("echo hi")
+	if !got.failed {
+		t.Errorf("runBashTool(echo hi) with no bash to start: failed = %v, want true; text = %q", got.failed, got.text)
+	}
+}
+
 func TestRunBashToolPreservesTrailingBlankLines(t *testing.T) {
 	// Only the final newline is trimmed so the exit-code line sits flush;
 	// intentional blank lines before it must survive.
-	result := runBashTool("printf 'a\\n\\n\\n'")
+	result := runBashTool("printf 'a\\n\\n\\n'").text
 	want := "a\n\n\nexit code: 0"
 	if result != want {
 		t.Errorf("runBashTool = %q, want %q", result, want)
@@ -4551,12 +4572,34 @@ func TestRunBashToolPreservesTrailingBlankLines(t *testing.T) {
 func TestRunBashToolSignalKillReportsSignal(t *testing.T) {
 	// A signal-killed command has no exit code (ExitCode is -1); report the
 	// signal instead of the meaningless -1.
-	result := runBashTool("kill -9 $$")
+	result := runBashTool("kill -9 $$").text
 	if strings.Contains(result, "exit code: -1") {
 		t.Errorf("runBashTool = %q, want the signal reported instead of -1", result)
 	}
 	if !strings.HasSuffix(result, "exit code: signal killed") {
 		t.Errorf("runBashTool = %q, want trailing 'exit code: signal killed' line", result)
+	}
+}
+
+func TestRunBashToolStatesFailureFromTimeout(t *testing.T) {
+	// The timeout verdict belongs to the Tool too: a killed command failed even
+	// though its exit status is a signal the suffix rule would only guess at.
+	old := bashToolTimeout
+	bashToolTimeout = 100 * time.Millisecond
+	defer func() { bashToolTimeout = old }()
+
+	got := runBashTool("sleep 5")
+	if !got.failed {
+		t.Errorf("runBashTool(sleep 5).failed = %v, want true; text = %q", got.failed, got.text)
+	}
+}
+
+func TestRunBashToolStatesFailureFromSignal(t *testing.T) {
+	// A signal death is a failure the Tool states, not one a caller infers from the
+	// absence of a clean exit-code line.
+	got := runBashTool("kill -9 $$")
+	if !got.failed {
+		t.Errorf("runBashTool(kill -9 $$).failed = %v, want true; text = %q", got.failed, got.text)
 	}
 }
 
@@ -4583,7 +4626,7 @@ func TestRunBashToolTimeoutKillsAndReports(t *testing.T) {
 		t.Fatalf("cannot link sleep into %s: %v", dir, err)
 	}
 
-	result := runBashTool("exec " + probe + " 5")
+	result := runBashTool("exec " + probe + " 5").text
 	if !strings.Contains(result, "timed out after 100ms") {
 		t.Errorf("runBashTool(%q) = %q, want a timeout result naming the injected duration", "exec "+probe+" 5", result)
 	}
@@ -4606,7 +4649,7 @@ func TestRunBashToolTimeoutWithOversizedOutput(t *testing.T) {
 		bashToolMaxOutput = oldMax
 	}()
 
-	result := runBashTool("while true; do seq 1 100000; done")
+	result := runBashTool("while true; do seq 1 100000; done").text
 
 	// pins the timeout path
 	if !strings.Contains(result, "timed out after 100ms") {
@@ -4639,7 +4682,7 @@ func TestRunBashToolReturnsWhenEscapedChildHoldsPipes(t *testing.T) {
 	t.Setenv("BASH_TOOL_ESCAPE_HELPER", "1")
 	escaping := os.Args[0] + " & wait"
 	done := make(chan string, 1)
-	go func() { done <- runBashTool(escaping) }()
+	go func() { done <- runBashTool(escaping).text }()
 	select {
 	case result := <-done:
 		if !strings.Contains(result, "timed out after 100ms") {
@@ -4659,7 +4702,7 @@ func TestRunBashToolTruncatesToTail(t *testing.T) {
 	bashToolMaxOutput = 256
 	defer func() { bashToolMaxOutput = old }()
 
-	result := runBashTool("seq 1 100000")
+	result := runBashTool("seq 1 100000").text
 
 	if len(result) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
 		t.Errorf("runBashTool(seq 1 100000) returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), bashToolMaxOutput)
@@ -5411,6 +5454,36 @@ func TestRunSummaryHookReplacesTheToolResultOnTheWireAndInReplay(t *testing.T) {
 	want := recordedMessage{Role: "tool", Content: summary, ToolCallID: "call_s"}
 	if got := msgs[1][len(msgs[1])-1]; !reflect.DeepEqual(got, want) {
 		t.Errorf("replayed tool message = %+v, want %+v — the Model must read the summary, not the raw output", got, want)
+	}
+}
+
+// TestRunSummaryHookKeepsAFailingCommandVerdict pins the other half of where a
+// verdict comes from: the summary replaces the Tool Result text only, so a
+// command that exited non-zero still reports is_error true through the summary —
+// otherwise every summarised failure would reach the log as a success.
+func TestRunSummaryHookKeepsAFailingCommandVerdict(t *testing.T) {
+	summary := "SUMMARY: the command failed"
+	hook := writeGuardHookScript(t, "summarize.sh",
+		`echo '{"hookSpecificOutput":{"updatedToolOutput":"`+summary+`"}}'`)
+	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
+	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
+
+	srv := newScriptedChatServer(t,
+		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo boom; exit 7\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failing command is not a failing run); stderr = %q", code, stderr.String())
+	}
+	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	if got, _ := resultEv["tool_output"].(string); got != summary {
+		t.Errorf("tool_result tool_output = %q, want the summary verbatim", got)
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("tool_result is_error = %v, want the command's own verdict: exit 7 failed whatever the summary says", resultEv["is_error"])
 	}
 }
 
