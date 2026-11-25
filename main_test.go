@@ -1333,19 +1333,17 @@ func TestRunWithNoSubagentNeverStatesSubagent(t *testing.T) {
 // tool_target stays off the wire because the Driver never learned what it acted
 // on. The event's tool_output is the same string the Model is handed.
 func TestRunToolPairForUnknownTool(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"squiggle","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (an unknown tool must not crash the loop); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"name":"squiggle","arguments":"{\"command\":\"ls\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (an unknown tool must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
-	callEv, resultEv := toolPair(t, events)
+	callEv, resultEv := toolPair(t, got.events)
 	if callEv["tool_name"] != "squiggle" || resultEv["tool_name"] != "squiggle" {
 		t.Errorf("pair tool_name = %v / %v, want squiggle on both", callEv["tool_name"], resultEv["tool_name"])
 	}
@@ -1358,7 +1356,7 @@ func TestRunToolPairForUnknownTool(t *testing.T) {
 		t.Errorf("unknown tool tool_result is_error = %v, want true", resultEv["is_error"])
 	}
 	want := fmt.Sprintf("error: unknown tool %q", "squiggle")
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	toolMsg := msgs[1][len(msgs[1])-1]
 	if resultEv["tool_output"] != want || toolMsg.Content != want {
 		t.Errorf("tool_output = %v, tool message = %q, want both exactly %q", resultEv["tool_output"], toolMsg.Content, want)
@@ -1374,20 +1372,18 @@ func TestRunToolPairForUnparseableArguments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal scripted arguments: %v", err)
 	}
-	srv := newScriptedChatServer(t,
-		fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_bad","type":"function","function":{"name":"bash","arguments":%s}}]}}]}`, argsJSON),
-		`{"choices":[{"message":{"role":"assistant","content":"moving on"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (malformed arguments must not crash the loop); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_bad","type":"function","function":{"name":"bash","arguments":%s}}]}}]}`, argsJSON)),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"moving on"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (malformed arguments must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
-	callEv, resultEv := toolPair(t, events)
-	if got, ok := callEv["tool_input"].(string); !ok || got != rawArgs {
+	callEv, resultEv := toolPair(t, got.events)
+	if sent, ok := callEv["tool_input"].(string); !ok || sent != rawArgs {
 		t.Errorf("tool_call tool_input = %#v, want the raw arguments string %q", callEv["tool_input"], rawArgs)
 	}
 	for _, ev := range []map[string]any{callEv, resultEv} {
@@ -1398,7 +1394,7 @@ func TestRunToolPairForUnparseableArguments(t *testing.T) {
 	if resultEv["is_error"] != true {
 		t.Errorf("unparseable arguments tool_result is_error = %v, want true", resultEv["is_error"])
 	}
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	toolMsg := msgs[1][len(msgs[1])-1]
 	if resultEv["tool_output"] != toolMsg.Content {
 		t.Errorf("tool_output = %v, want exactly the tool message content %q", resultEv["tool_output"], toolMsg.Content)
@@ -1412,25 +1408,24 @@ func TestRunToolPairForUnparseableArguments(t *testing.T) {
 // Driver synthesises call-<n> over the whole run; the Model-facing replay keeps
 // the empty id it was given, because the synthesised key belongs to the stream.
 func TestRunSynthesisesToolIDsWhenServerSendsNone(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}},{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"paired"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}},{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"paired"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := got.events
 	var kinds []string
 	for _, ev := range events {
 		kinds = append(kinds, fmt.Sprint(ev["kind"]))
 	}
 	wantKinds := []string{"start", "usage", "tool_call", "tool_result", "tool_call", "tool_result", "start", "text", "usage", "result"}
 	if !reflect.DeepEqual(kinds, wantKinds) {
-		t.Fatalf("stdout kinds = %v, want each tool_call immediately followed by its own tool_result (%v): %q", kinds, wantKinds, stdout.String())
+		t.Fatalf("stdout kinds = %v, want each tool_call immediately followed by its own tool_result (%v): %q", kinds, wantKinds, string(got.stdout))
 	}
 	for i, want := range []struct {
 		toolID string
@@ -1447,7 +1442,7 @@ func TestRunSynthesisesToolIDsWhenServerSendsNone(t *testing.T) {
 			t.Errorf("pair %d tool_target = %v / %v, want %q on both lines", i+1, callEv["tool_target"], resultEv["tool_target"], want.target)
 		}
 	}
-	for _, msg := range srv.messageBodies(t)[1] {
+	for _, msg := range got.messageBodies(t)[1] {
 		if msg.Role == "tool" && msg.ToolCallID != "" {
 			t.Errorf("replayed tool message carries tool_call_id %q, want the server's empty id replayed unchanged", msg.ToolCallID)
 		}
@@ -1458,20 +1453,19 @@ func TestRunSynthesisesToolIDsWhenServerSendsNone(t *testing.T) {
 // dedup key and the reader's message boundary, so a pair stamped with the wrong
 // turn would attribute a tool to a call that never requested it.
 func TestRunToolPairCarriesTheMessageIDOfItsModelCall(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"both done"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo one\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo two\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"both done"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
 	seen := map[string][]string{}
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		id, _ := ev["message_id"].(string)
 		seen[id] = append(seen[id], fmt.Sprint(ev["kind"]))
 	}
@@ -1521,20 +1515,19 @@ func toolPair(t *testing.T, events []map[string]any) (map[string]any, map[string
 }
 
 func TestRunFailingToolCommandIsOrdinaryResult(t *testing.T) {
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 7\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"gave up gracefully"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (failing command must not crash); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"exit 7\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"gave up gracefully"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (failing command must not crash); stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "gave up gracefully" {
-		t.Errorf("result event text = %q, want the final answer", got)
+	if text := resultText(t, string(got.stdout)); text != "gave up gracefully" {
+		t.Errorf("result event text = %q, want the final answer", text)
 	}
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 2 {
 		t.Fatalf("POSTs = %d, want 2", len(msgs))
 	}
@@ -1556,20 +1549,19 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	bashToolMaxOutput = 256
 	defer func() { bashToolMaxOutput = old }()
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_g","type":"function","function":{"name":"bash","arguments":"{\"command\":\"seq 1 100000\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"truncation acknowledged"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"flood", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (truncation must not crash the loop); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_g","type":"function","function":{"name":"bash","arguments":"{\"command\":\"seq 1 100000\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"truncation acknowledged"}}]}`),
+		},
+	}, "flood", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (truncation must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "truncation acknowledged" {
-		t.Errorf("result event text = %q, want the final answer after the flooded turn", got)
+	if text := resultText(t, string(got.stdout)); text != "truncation acknowledged" {
+		t.Errorf("result event text = %q, want the final answer after the flooded turn", text)
 	}
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 2 {
 		t.Fatalf("POSTs = %d, want 2", len(msgs))
 	}
@@ -1591,7 +1583,7 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	}
 	// The event carries the very same bounded string, so a decoder never sees more
 	// of a flood than the Model did.
-	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	_, resultEv := toolPair(t, got.events)
 	if resultEv["tool_output"] != tool.Content {
 		t.Errorf("tool_result tool_output = %d bytes, want the truncated tool message verbatim (%d bytes)", len(fmt.Sprint(resultEv["tool_output"])), len(tool.Content))
 	}
@@ -1606,20 +1598,19 @@ func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
 	bashToolTimeout = 200 * time.Millisecond
 	defer func() { bashToolTimeout = old }()
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_t","type":"function","function":{"name":"bash","arguments":"{\"command\":\"sleep 30\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"recovered from timeout"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"hang up", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (timeout must not crash the loop); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_t","type":"function","function":{"name":"bash","arguments":"{\"command\":\"sleep 30\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered from timeout"}}]}`),
+		},
+	}, "hang up", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (timeout must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "recovered from timeout" {
-		t.Errorf("result event text = %q, want the final answer after the timed-out turn", got)
+	if text := resultText(t, string(got.stdout)); text != "recovered from timeout" {
+		t.Errorf("result event text = %q, want the final answer after the timed-out turn", text)
 	}
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 2 {
 		t.Fatalf("POSTs = %d, want 2 (loop must continue past the timeout)", len(msgs))
 	}
