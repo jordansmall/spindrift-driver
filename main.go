@@ -484,26 +484,6 @@ func toolResultEvent(messageID, toolID, toolName string, plan toolPlan, result t
 	}
 }
 
-// repeatedCallRefuseLimit is how many identical calls in a row the breaker lets
-// run before it starts refusing: the third gets the synthetic Tool Result in
-// place of running. The two 3s of the breaker count different things — calls and
-// refusals — so each gets its own name rather than one shared literal that would
-// tie two independent limits together.
-const repeatedCallRefuseLimit = 3
-
-// repeatedCallEndLimit is how many refusals in a row the breaker hands out
-// before it ends the run: past that many identical calls the refusal is clearly
-// not being heeded, and spending turns on it only repeats itself.
-const repeatedCallEndLimit = 3
-
-// repeatedCallRefusal is the synthetic Tool Result a refused call gets in place
-// of running. It carries the "error: " prefix the Guard Hook refusal established
-// as how a refusal reads, and names the call so the Model can tell which action
-// to change.
-func repeatedCallRefusal(toolName string, repeat int) string {
-	return fmt.Sprintf("error: %s was already called %d times in a row with these exact arguments, so it was not run again; take a different action", toolName, repeat-1)
-}
-
 // unparseableArgs is the answer every Tool gives when its own arguments do not
 // parse: shared because the Model reads this text to correct itself, so one
 // Tool's parse failure must never drift from another's wording.
