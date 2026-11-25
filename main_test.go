@@ -1329,6 +1329,67 @@ func TestRunToolPairForUnknownTool(t *testing.T) {
 	}
 }
 
+// TestPlanToolCallBoundsTheRunSet pins the lookup table of decisions dispatch
+// makes against one run's resolved set: a name the Tool table knows but this set
+// does not is refused with the callable set named and plans nothing, a name no
+// table entry knows keeps the unknown-tool wording, and a name the set holds
+// still plans its own work.
+func TestPlanToolCallBoundsTheRunSet(t *testing.T) {
+	s := session{cfg: config{tools: resolveTools(agentEntry{Name: "solo", Tools: []string{"bash"}}, nil)}}
+
+	for _, name := range []string{"edit", "write", "subagent"} {
+		plan := planToolCall(toolCall{ID: "call_" + name, Type: "function", Function: toolCallFunction{Name: name, Arguments: "{}"}}, s)
+		if plan.target != "" {
+			t.Errorf("%s plan.target = %q, want a refused call to plan nothing", name, plan.target)
+		}
+		want := fmt.Sprintf("error: cannot call tool %q: this run may call bash", name)
+		if res := plan.run(); !res.failed || res.text != want {
+			t.Errorf("%s run() = (%q, failed=%v), want (%q, failed=true)", name, res.text, res.failed, want)
+		}
+	}
+
+	unknown := planToolCall(toolCall{ID: "call_q", Type: "function", Function: toolCallFunction{Name: "squiggle", Arguments: "{}"}}, s)
+	if res := unknown.run(); !res.failed || res.text != `error: unknown tool "squiggle"` {
+		t.Errorf("squiggle run() = (%q, failed=%v), want the unknown-tool wording flagged as a failure", res.text, res.failed)
+	}
+
+	granted := planToolCall(toolCall{ID: "call_b", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: `{"command":"echo hi"}`}}, s)
+	if granted.target != "echo hi" {
+		t.Errorf("bash plan.target = %q, want the command the call named", granted.target)
+	}
+}
+
+// TestCallRefusalEmptySetNamesNoCallableTools pins callRefusal's empty branch on
+// its own: a run whose resolved set holds nothing has no names to offer, so the
+// refusal says it may call no tools rather than trailing an empty list after
+// "may call".
+func TestCallRefusalEmptySetNamesNoCallableTools(t *testing.T) {
+	got := callRefusal("edit", toolSet{})
+	want := `error: cannot call tool "edit": this run may call no tools`
+	if got != want {
+		t.Errorf("callRefusal over an empty toolSet = %q, want %q", got, want)
+	}
+}
+
+// TestNativeToolsAreTheCompiledFour pins the compiled table: the bash floor in
+// resolveTools looks "bash" up by name and discards the lookup's ok, so a row that
+// stopped existing — or offered another name — dereferences a nil spec mid-run.
+func TestNativeToolsAreTheCompiledFour(t *testing.T) {
+	var names []string
+	for _, row := range nativeTools {
+		if row.spec == nil || row.plan == nil {
+			t.Fatalf("nativeTools row %q has a nil spec or plan", row.name)
+		}
+		if got := row.spec(nil).Function.Name; got != row.name {
+			t.Errorf("nativeTools row %q offers spec name %q, want the row's own name", row.name, got)
+		}
+		names = append(names, row.name)
+	}
+	if !reflect.DeepEqual(names, goldenToolNamesAreTheDriversTools) {
+		t.Errorf("nativeTools names = %v, want %v", names, goldenToolNamesAreTheDriversTools)
+	}
+}
+
 // callTurn scripts one turn that asks for exactly one Tool by name, with the
 // arguments nested the way bashCallTurn nests them — a JSON object inside a JSON
 // string — so a run can be shown asking for a Tool its entry never granted. The

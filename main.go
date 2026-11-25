@@ -466,7 +466,9 @@ func failedResult(format string, a ...any) toolResult {
 	return toolResult{text: fmt.Sprintf(format, a...), failed: true}
 }
 
-// planToolCall parses one tool call without executing it. An unknown tool and
+// planToolCall parses one tool call without executing it by looking the name up
+// in the run's resolved Tool set — the same value the Model was offered — so no
+// call can reach a Tool the run was never given. An unknown tool and
 // unparseable arguments are ordinary results rather than crashes, so the plan
 // answers with the very error text the Model has always received.
 //
@@ -475,20 +477,28 @@ func failedResult(format string, a ...any) toolResult {
 // charge its spend to — so the run passes a session rather than a global.
 func planToolCall(call toolCall, s session) toolPlan {
 	input := decodeToolArguments(call.Function.Arguments)
-	if call.Function.Name == "subagent" {
-		return planSubagentCall(call, input, s)
-	}
-	if call.Function.Name == "write" {
-		return planWriteCall(call, input, s)
-	}
-	if call.Function.Name == "edit" {
-		return planEditCall(call, input, s)
-	}
-	if call.Function.Name == "bash" {
-		return planBashCall(call, input, s)
+	if entry, ok := s.cfg.tools.lookup(call.Function.Name); ok {
+		return entry.plan(call, input, s)
 	}
 	name := call.Function.Name
+	// A name the table knows but this run's set does not is a Tool this run was
+	// never granted: the refusal plans nothing at all — no target, no subagent —
+	// so neither half of the event pair claims something it acted on, while
+	// tool_name still reports the name the Model asked for.
+	if _, known := nativeToolByName(name); known {
+		return toolPlan{input: input, run: func() toolResult { return failedResult("%s", callRefusal(name, s.cfg.tools)) }}
+	}
 	return toolPlan{input: input, run: func() toolResult { return failedResult("error: unknown tool %q", name) }}
+}
+
+// callRefusal is the answer to a call for a Tool outside this run's resolved
+// set; naming the Tools it may call is what makes it correctable in one step
+// rather than a guess, the standing spawnRefusal gives a spawn it may not make.
+func callRefusal(name string, set toolSet) string {
+	if len(set) == 0 {
+		return fmt.Sprintf("error: cannot call tool %q: this run may call no tools", name)
+	}
+	return fmt.Sprintf("error: cannot call tool %q: this run may call %s", name, strings.Join(set.names(), ", "))
 }
 
 // planBashCall plans one bash Tool call, lifted out of planToolCall so a table
