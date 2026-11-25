@@ -511,22 +511,31 @@ func TestSubagentAnswerDoesNotBecomeParentResult(t *testing.T) {
 // TestSubagentFailureIsAnErrorToolResult: a child that dies is an ordinary error
 // shaped Tool Result, and the parent still finishes its own run.
 func TestSubagentFailureIsAnErrorToolResult(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newSubagentReplyServer(t, "m-reviewer",
-		parentToolCallResponse,
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		// The child never gets an answer, and a 500 is retried, so its queue holds
+		// one refusal per attempt: chatRetryAttempts (main.go:800) at its default
+		// of 3, the only value a re-exec'd child can see. Should that default
+		// change, the queue runs dry and checkNoUnscriptedRequests fails the test.
+		"m-reviewer": {
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 — a failed child is a Tool Result, not a failed run; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a failed child is a Tool Result, not a failed run; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	if got := parentResult(t, stdout.String())["text"]; got != "parent answer" {
-		t.Errorf("parent result text = %v, want the run to continue past a dead child", got)
+	if text := parentResult(t, string(got.stdout))["text"]; text != "parent answer" {
+		t.Errorf("parent result text = %v, want the run to continue past a dead child", text)
 	}
-	_, resultEv := spawnPair(t, stdout.String())
+	_, resultEv := spawnPair(t, string(got.stdout))
 	out, _ := resultEv["tool_output"].(string)
 	if !strings.HasPrefix(out, "error:") {
 		t.Errorf("tool_output = %q, want an error:-prefixed result", out)
@@ -539,12 +548,12 @@ func TestSubagentFailureIsAnErrorToolResult(t *testing.T) {
 	}
 	// The conversation has to carry the same text the event reported, or the
 	// parent's next turn would be answering something the reader never saw.
-	bodies := srv.requestBodies(t)
 	var replayed string
 	var req struct {
 		Messages []recordedMessage `json:"messages"`
 	}
-	if err := json.Unmarshal(bodies[len(bodies)-1], &req); err != nil {
+	last := got.requests[len(got.requests)-1].body
+	if err := json.Unmarshal(last, &req); err != nil {
 		t.Fatalf("last POST body is not valid JSON: %v", err)
 	}
 	for _, msg := range req.Messages {
@@ -924,36 +933,45 @@ func TestSubagentRollUpAddsNoUsageEventOfTheParents(t *testing.T) {
 }
 
 // childBashTurnResponse is a child turn that keeps the child running: one bash
-// Tool Call, so its next Model call is the one the fake refuses.
+// Tool Call, so its next Model call is the one the script refuses.
 const childBashTurnResponse = `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
 
 // TestSubagentFailingChildStillContributesItsSpend is why the roll-up folds usage
 // events rather than the child's result totals: a child that dies emits no result
 // event at all, and the tokens it already spent are still real.
 func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newSubagentReplyServerPassing(t, "m-reviewer", 1,
-		withUsage(parentToolCallResponse, "m-parent", 100, 20),
-		withUsage(childBashTurnResponse, "m-reviewer", 7, 1),
-		usageCompletion("m-parent", "parent answer", 30, 5),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(withUsage(parentToolCallResponse, "m-parent", 100, 20)),
+			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
+		},
+		// The child's first Model call succeeds and spends its tokens; the call after
+		// its bash turn is refused, retried chatRetryAttempts times (main.go:800, and
+		// a re-exec'd child always runs that default of 3), so the tail holds one
+		// rejection per attempt. A dry queue trips checkNoUnscriptedRequests.
+		"m-reviewer": {
+			replyCompletion(withUsage(childBashTurnResponse, "m-reviewer", 7, 1)),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 — a dead child is still a Tool Result; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a dead child is still a Tool Result; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	result := parentResult(t, stdout.String())
-	got := resultTokenFields(t, result)
-	if got["input"] != 137 || got["output"] != 26 {
-		t.Errorf("parent result tokens = %v, want parent 130/25 plus the dead child's 7/1", got)
+	result := parentResult(t, string(got.stdout))
+	tokens := resultTokenFields(t, result)
+	if tokens["input"] != 137 || tokens["output"] != 26 {
+		t.Errorf("parent result tokens = %v, want parent 130/25 plus the dead child's 7/1", tokens)
 	}
 	// The premise of the assertion above: the child got one usage event relayed,
 	// and died before it could report a result of its own.
 	var relayedResult, relayedUsage int
-	for _, ev := range relayedEvents(t, stdout.String()) {
+	for _, ev := range relayedEvents(t, string(got.stdout)) {
 		switch ev["kind"] {
 		case "result":
 			relayedResult++
@@ -962,9 +980,9 @@ func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
 		}
 	}
 	if relayedUsage != 1 || relayedResult != 0 {
-		t.Errorf("relayed stream has %d usage and %d result events, want the child's one usage and no result: %q", relayedUsage, relayedResult, stdout.String())
+		t.Errorf("relayed stream has %d usage and %d result events, want the child's one usage and no result: %q", relayedUsage, relayedResult, got.stdout)
 	}
-	_, resultEv := spawnPair(t, stdout.String())
+	_, resultEv := spawnPair(t, string(got.stdout))
 	out, _ := resultEv["tool_output"].(string)
 	if !strings.HasPrefix(out, "error:") {
 		t.Errorf("tool_output = %q, want an error:-prefixed result", out)
