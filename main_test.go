@@ -2344,51 +2344,28 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 
 	cases := []struct {
 		name       string
-		status     int
-		body       string
+		entry      modelEntry
 		wantStderr string
 	}{
-		{"4xx", http.StatusBadRequest, "bad request", "server returned 400"},
-		{"unparseable chunk", http.StatusOK, sseFrame("this is not json") + sseDone, "unparseable"},
-		{"empty stream", http.StatusOK, sseDone, "stream"},
+		{"4xx", reject(http.StatusBadRequest, nil, "bad request"), "server returned 400"},
+		{"unparseable chunk", replyFrames(sseFrame("this is not json") + sseDone), "unparseable"},
+		{"empty stream", replyFrames(sseDone), "stream"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var mu sync.Mutex
-			posts := 0
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				io.Copy(io.Discard, r.Body)
-				mu.Lock()
-				posts++
-				mu.Unlock()
-				// only a 200 is the event stream; a rejection body stays plain
-				if tc.status == http.StatusOK {
-					w.Header().Set("Content-Type", "text/event-stream")
-				} else {
-					w.Header().Set("Content-Type", "application/json")
-				}
-				w.WriteHeader(tc.status)
-				io.WriteString(w, tc.body)
-			}))
-			defer srv.Close()
-
-			var stdout, stderr bytes.Buffer
-			code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-			if code == 0 {
-				t.Fatalf("exit code = 0, want non-zero; stderr = %q", stderr.String())
+			got := runDriver(t, map[string][]modelEntry{"m-a": {tc.entry}}, "p", withFlags("--model", "m-a"))
+			if got.code == 0 {
+				t.Fatalf("exit code = 0, want non-zero; stderr = %q", got.stderr)
 			}
-			eventText := oneErrorEvent(t, stdout.String())
+			eventText := oneErrorEvent(t, string(got.stdout))
 			if !strings.Contains(eventText, tc.wantStderr) {
 				t.Errorf("error event text = %q, want it to mention %q", eventText, tc.wantStderr)
 			}
-			mu.Lock()
-			n := posts
-			mu.Unlock()
-			if n != 1 {
-				t.Errorf("POSTs = %d, want exactly 1 (no retry for a permanent failure)", n)
+			if len(got.requests) != 1 {
+				t.Errorf("POSTs = %d, want exactly 1 (no retry for a permanent failure)", len(got.requests))
 			}
-			if !strings.Contains(stderr.String(), tc.wantStderr) {
-				t.Errorf("stderr = %q, want it to mention %q", stderr.String(), tc.wantStderr)
+			if !strings.Contains(got.stderr, tc.wantStderr) {
+				t.Errorf("stderr = %q, want it to mention %q", got.stderr, tc.wantStderr)
 			}
 		})
 	}
@@ -2876,24 +2853,20 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 }
 
 func TestRunEmptyResponse(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// the streaming analogue of the old {"choices":[]}: a stream that closes
-		// without ever carrying a chunk
-		writeSSE(w, sseDone)
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m", "--base-url", srv.URL, "p"}, nil, &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code == 0 {
+	// the streaming analogue of the old {"choices":[]}: a stream that closes
+	// without ever carrying a chunk
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(sseDone)},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code == 0 {
 		t.Fatal("a stream with no chunks should exit non-zero")
 	}
 	const wantErr = "server returned a stream with no chunks"
-	if got := oneErrorEvent(t, stdout.String()); got != wantErr {
-		t.Errorf("error event text = %q, want %q", got, wantErr)
+	if ev := oneErrorEvent(t, string(got.stdout)); ev != wantErr {
+		t.Errorf("error event text = %q, want %q", ev, wantErr)
 	}
-	if !strings.Contains(stderr.String(), "stream") {
-		t.Errorf("stderr = %q, want a message about the empty stream", stderr.String())
+	if !strings.Contains(got.stderr, "stream") {
+		t.Errorf("stderr = %q, want a message about the empty stream", got.stderr)
 	}
 }
 
