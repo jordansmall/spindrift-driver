@@ -37,12 +37,20 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 	if !ok {
 		return toolPlan{input: input, run: func() string { return spawnRefusal(args.Agent, permitted) }}
 	}
+	// The verdict travels as a value rather than as a rule over the text: a child
+	// that answered successfully in prose is clean whatever its first word is, and
+	// only the closure below knows whether the spawn and the handover worked.
+	var failed bool
 	return toolPlan{
 		input:    input,
 		target:   entry.Name,
 		subagent: entry.Name,
-		isError:  subagentResultIsError,
-		run:      func() string { return runSubagentTool(entry, args.Task, s) },
+		isError:  func(string) bool { return failed },
+		run: func() string {
+			res := runSubagentTool(entry, args.Task, s)
+			failed = res.failed
+			return res.text
+		},
 	}
 }
 
@@ -59,23 +67,16 @@ func spawnRefusal(name string, permitted []agentEntry) string {
 	return fmt.Sprintf("error: cannot spawn agent %q: this run may spawn %s", name, strings.Join(names, ", "))
 }
 
-// subagentResultIsError is the is_error rule for a Subagent Tool Result: the
-// child's answer carries no exit-code line for toolResultIsError to read, so the
-// error: prefix a failed spawn returns with is the only failure signal the result
-// can carry. A child's answer that merely begins with the word "error:" is a
-// false positive this accepts — the alternative is reporting every failure as a
-// success.
-func subagentResultIsError(output string) bool {
-	return strings.HasPrefix(output, "error:")
-}
-
 // runSubagentTool starts the child Driver and returns its answer as the Tool
-// Result. A child that dies is an error-shaped result, never a failed run: the
-// Model decides what to do about it, so the parent's exit code stays 0.
-func runSubagentTool(entry agentEntry, task string, s session) string {
+// Result, stating the verdict the way only the spawner can: failed when the child
+// could not be started, when it exited non-zero, or when it handed over no answer,
+// and clean for a real answer however that answer reads. A child that dies is an
+// error-shaped result, never a failed run: the Model decides what to do about it,
+// so the parent's exit code stays 0.
+func runSubagentTool(entry agentEntry, task string, s session) toolResult {
 	exe, err := os.Executable()
 	if err != nil {
-		return fmt.Sprintf("error: cannot locate the Driver binary: %v", err)
+		return toolResult{text: fmt.Sprintf("error: cannot locate the Driver binary: %v", err), failed: true}
 	}
 	// No cmd.Dir and no cmd.Env: inheriting the working directory and the
 	// environment is the whole point of the spawn — it is how the child resolves
@@ -93,27 +94,31 @@ func runSubagentTool(entry agentEntry, task string, s session) string {
 	cmd.Stderr = s.stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Sprintf("error: cannot start subagent %q: %v", entry.Name, err)
+		return toolResult{text: fmt.Sprintf("error: cannot start subagent %q: %v", entry.Name, err), failed: true}
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Sprintf("error: cannot start subagent %q: %v", entry.Name, err)
+		return toolResult{text: fmt.Sprintf("error: cannot start subagent %q: %v", entry.Name, err), failed: true}
 	}
 	// The pipe has to be drained before Wait, which closes it: the child's result
 	// line is the last thing it writes and would be lost otherwise.
-	text, sawResult := relaySubagentOutput(stdout, entry.Name, s)
+	res, sawResult := relaySubagentOutput(stdout, entry.Name, s)
+	// Wait is what makes a child that died failed: Start already succeeded, so the
+	// only thing a non-zero exit can mean is the child itself gave up.
 	if err := cmd.Wait(); err != nil {
-		return fmt.Sprintf("error: subagent %q failed: %v", entry.Name, err)
+		return toolResult{text: fmt.Sprintf("error: subagent %q failed: %v", entry.Name, err), failed: true}
 	}
 	if !sawResult {
-		return fmt.Sprintf("error: subagent %q emitted no result event", entry.Name)
+		return toolResult{text: fmt.Sprintf("error: subagent %q emitted no result event", entry.Name), failed: true}
 	}
-	return text
+	return res
 }
 
 // relaySubagentOutput forwards every event line the child wrote onto the parent's
 // stdout as it arrives, attributed to the agent, and reports the text of the
-// child's own result event — or, when that event carries no text, an error: message,
-// because a child that cannot hand over an answer has not succeeded.
+// child's own result event — or, when that event carries no text, an error: message
+// stating itself failed, because a child that cannot hand over an answer has not
+// succeeded. It owns that one verdict and no other: whether the child ran at all
+// is runSubagentTool's to state.
 //
 // Each line is handed to s.relay, the one function a Subagent Tool holds: it puts
 // the line on the run's stream with the child's own timestamp and charges a usage
@@ -125,10 +130,11 @@ func runSubagentTool(entry agentEntry, task string, s session) string {
 // malformed event on the wire. An over-long line ends the scan — the stream broke
 // the protocol — and the rest of the child's output is drained and lost, which is
 // why such a run reports no result event at all.
-func relaySubagentOutput(r io.Reader, agentName string, s session) (string, bool) {
+func relaySubagentOutput(r io.Reader, agentName string, s session) (toolResult, bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
-	text, sawResult := "", false
+	var res toolResult
+	sawResult := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		// RawMessage rather than any: the child's numbers round-trip byte-exactly
@@ -151,9 +157,9 @@ func relaySubagentOutput(r io.Reader, agentName string, s session) (string, bool
 			sawResult = true
 			var answer string
 			if err := json.Unmarshal(fields["text"], &answer); err != nil {
-				text = fmt.Sprintf("error: subagent %q emitted a result event with no text", agentName)
+				res = toolResult{text: fmt.Sprintf("error: subagent %q emitted a result event with no text", agentName), failed: true}
 			} else {
-				text = answer
+				res = toolResult{text: answer}
 			}
 		}
 	}
@@ -169,5 +175,5 @@ func relaySubagentOutput(r io.Reader, agentName string, s session) (string, bool
 		// the accepted loss: the run ends as "emitted no result event".
 		_, _ = io.Copy(io.Discard, r)
 	}
-	return text, sawResult
+	return res, sawResult
 }
