@@ -1329,6 +1329,129 @@ func TestRunToolPairForUnknownTool(t *testing.T) {
 	}
 }
 
+// callTurn scripts one turn that asks for exactly one Tool by name, with the
+// arguments nested the way bashCallTurn nests them — a JSON object inside a JSON
+// string — so a run can be shown asking for a Tool its entry never granted. The
+// name is a parameter because the grant is what is under test: nothing about the
+// scripted turn may pre-select a permitted Tool.
+func callTurn(t *testing.T, id, name, args string) string {
+	t.Helper()
+	nested, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("nest arguments %q for turn %s: %v", args, id, err)
+	}
+	return `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"` + id +
+		`","type":"function","function":{"name":"` + name + `","arguments":` + string(nested) + `}}]}}]}`
+}
+
+// toolPairForID finds the tool_call/tool_result pair answering one call id and
+// pins that the two lines are adjacent. toolPair picks the only pair a run has;
+// a run asked for three Tools it may not call has three.
+func toolPairForID(t *testing.T, events []map[string]any, id string) (map[string]any, map[string]any) {
+	t.Helper()
+	for i, ev := range events {
+		if ev["kind"] != "tool_call" || ev["tool_id"] != id {
+			continue
+		}
+		if i+1 >= len(events) || events[i+1]["kind"] != "tool_result" {
+			t.Fatalf("tool_call %s is not immediately followed by its tool_result: %v", id, events)
+		}
+		return ev, events[i+1]
+	}
+	t.Fatalf("stdout carries no tool_call for %s: %v", id, events)
+	return nil, nil
+}
+
+// TestRunRefusesToolCallOutsideGrant: an entry's tools grant bounds what its run
+// may call at the moment of the call, not merely what the offer lists — so a Tool
+// the entry does not grant comes back as an ordinary Tool Result naming the Tools
+// this run may call, nothing is written to disk, and no child starts.
+func TestRunRefusesToolCallOutsideGrant(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(callTurn(t, "call_e", "edit", `{"path":"note.txt","old_string":"one","new_string":"two"}`)),
+			replyCompletion(callTurn(t, "call_w", "write", `{"path":"created.txt","content":"written anyway"}`)),
+			replyCompletion(spawnAgentCall("worker")),
+			replyCompletion(completion("done")),
+		},
+		// Scripted so that a spawn this run may not make shows up as a child's POST
+		// rather than as the endpoint having nothing to answer with.
+		"m-worker": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(
+			agentSpec{name: "solo", model: "m", tools: "bash"},
+			agentSpec{name: "worker", model: "m-worker", body: "work on it"},
+		),
+		withFlags("--agent", "solo"),
+	)
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a refusal is a Tool Result, not a failed run; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
+	}
+	raw := string(got.stdout)
+	if len(got.requests) != 4 {
+		t.Fatalf("POSTs = %d, want solo's four turns only — no child may be attempted: stdout = %q", len(got.requests), raw)
+	}
+	for i, req := range got.requests {
+		if model := postedSpawn(t, req.body).Model; model != "m" {
+			t.Errorf("POST %d sent model %q, want only solo's model", i, model)
+		}
+	}
+	if relayed := relayedEvents(t, raw); len(relayed) != 0 {
+		t.Errorf("stdout carries relayed child events for a spawn this run may not make: %v", relayed)
+	}
+
+	msgs := got.messageBodies(t)
+	for _, tc := range []struct {
+		id   string
+		name string
+		// post is the POST whose last message replays this call's Tool Result.
+		post int
+	}{
+		{"call_e", "edit", 1},
+		{"call_w", "write", 2},
+		{"call_s", "subagent", 3},
+	} {
+		want := fmt.Sprintf("error: cannot call tool %q: this run may call bash", tc.name)
+		callEv, resultEv := toolPairForID(t, got.events, tc.id)
+		for _, ev := range []map[string]any{callEv, resultEv} {
+			if ev["tool_name"] != tc.name {
+				t.Errorf("%s tool_name = %v, want %s, the name the Model asked for: %v", ev["kind"], ev["tool_name"], tc.name, ev)
+			}
+			// A refusal runs nothing, so neither half may claim what it acted on or
+			// whose stream it relayed.
+			if _, ok := ev["tool_target"]; ok {
+				t.Errorf("%v carries tool_target for a call that never ran, want it omitted: %v", ev["kind"], ev)
+			}
+			if _, ok := ev["subagent"]; ok {
+				t.Errorf("%v carries subagent for a call that never ran, want it omitted: %v", ev["kind"], ev)
+			}
+		}
+		if resultEv["is_error"] != true {
+			t.Errorf("%s tool_result is_error = %v, want true: %v", tc.name, resultEv["is_error"], resultEv)
+		}
+		if out, _ := resultEv["tool_output"].(string); out != want {
+			t.Errorf("%s tool_output = %q, want the refusal naming the Tools this run may call: %q", tc.name, out, want)
+		}
+		if last := msgs[tc.post][len(msgs[tc.post])-1]; last.Role != "tool" || last.Content != want {
+			t.Errorf("POST %d replays %+v, want a tool message holding exactly %q", tc.post, last, want)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the run's working dir %s: %v", dir, err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the run's working dir holds %v, want nothing written", entries)
+	}
+	if text := resultText(t, raw); text != "done" {
+		t.Errorf("result text = %q, want the run to have gone on past the refusals", text)
+	}
+}
+
 // Arguments that are not valid JSON cannot be decoded, so tool_input falls back
 // to the raw arguments string — the malformed text is the fact worth reporting —
 // and no target can be named. The parse error is the Tool Result.
