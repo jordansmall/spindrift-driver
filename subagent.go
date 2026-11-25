@@ -27,7 +27,7 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 		Task  string `json:"task"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return toolPlan{input: input, run: func() string { return fmt.Sprintf("error: cannot parse tool arguments: %v", err) }}
+		return toolPlan{input: input, run: func() toolResult { return failedResult(unparseableArgs, err) }}
 	}
 	// Looking up against the caller's permitted set covers both refusals the issue
 	// unifies: a name with no Agent File, and one its spawns does not permit. The
@@ -35,22 +35,13 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 	permitted := spawnable(s.cfg.agent, s.cfg.agents)
 	entry, ok := findAgent(permitted, args.Agent)
 	if !ok {
-		return toolPlan{input: input, run: func() string { return spawnRefusal(args.Agent, permitted) }}
+		return toolPlan{input: input, run: func() toolResult { return failedResult("%s", spawnRefusal(args.Agent, permitted)) }}
 	}
-	// The verdict travels as a value rather than as a rule over the text: a child
-	// that answered successfully in prose is clean whatever its first word is, and
-	// only the closure below knows whether the spawn and the handover worked.
-	var failed bool
 	return toolPlan{
 		input:    input,
 		target:   entry.Name,
 		subagent: entry.Name,
-		isError:  func(string) bool { return failed },
-		run: func() string {
-			res := runSubagentTool(entry, args.Task, s)
-			failed = res.failed
-			return res.text
-		},
+		run:      func() toolResult { return runSubagentTool(entry, args.Task, s) },
 	}
 }
 

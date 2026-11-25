@@ -1290,7 +1290,7 @@ func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
 		input:    map[string]any{"agent": "reviewer", "task": "read main.go"},
 		target:   "reviewer",
 		subagent: "reviewer",
-		run:      func() string { return "the child's answer" },
+		run:      func() toolResult { return toolResult{text: "the child's answer"} },
 	}
 
 	var buf bytes.Buffer
@@ -1324,27 +1324,24 @@ func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
 	}
 }
 
-// The bash exit-code suffix rule is the default, not the only rule: a Subagent
-// Tool Result is the child's answer text and never ends in the literal a command
-// appends, so a plan carrying its own rule must have that rule consulted — the
-// default alone reports every successful delegation as a failure.
-func TestToolResultIsErrorUsesThePlanRuleWhenOneIsSet(t *testing.T) {
+// The event carries the verdict the Tool stated and reads nothing back out of the
+// text: prose — a child's answer, a summary — keeps the verdict its Tool gave it,
+// and a result stated clean keeps is_error off the wire entirely.
+func TestToolResultEventCarriesTheStatedVerdict(t *testing.T) {
 	pinClock(t, 1700000000000)
 
-	agentRule := func(output string) bool { return strings.HasPrefix(output, "error:") }
 	for _, tc := range []struct {
 		name   string
-		plan   toolPlan
-		output string
+		result toolResult
 		want   bool
 	}{
-		{"default rule, clean exit", toolPlan{}, "ran\nexit code: 0", false},
-		{"default rule, non-zero exit", toolPlan{}, "blew up\nexit code: 4", true},
-		{"default rule, error prefix", toolPlan{}, "error: unknown tool \"squiggle\"", true},
-		{"plan rule accepts child prose", toolPlan{isError: agentRule}, "the child's answer", false},
-		{"plan rule rejects child failure", toolPlan{isError: agentRule}, "error: agent \"reviewer\" failed", true},
+		{"stated clean, clean exit", toolResult{text: "ran\nexit code: 0"}, false},
+		{"stated failed, non-zero exit", toolResult{text: "blew up\nexit code: 4", failed: true}, true},
+		{"stated failed, never ran", toolResult{text: "error: unknown tool \"squiggle\"", failed: true}, true},
+		{"stated clean, child prose", toolResult{text: "the child's answer"}, false},
+		{"stated failed, child failure", toolResult{text: "error: agent \"reviewer\" failed", failed: true}, true},
 	} {
-		ev := toolResultEvent("msg-1", "call_1", "bash", tc.plan, tc.output)
+		ev := toolResultEvent("msg-1", "call_1", "bash", toolPlan{}, tc.result)
 		if ev.IsError != tc.want {
 			t.Errorf("%s: is_error = %v, want %v", tc.name, ev.IsError, tc.want)
 		}
@@ -5551,8 +5548,12 @@ echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
 	}
 	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
-	if got, _ := resultEv["tool_output"].(string); !strings.HasPrefix(got, "error: ") {
-		t.Errorf("tool_result tool_output = %q, want the refusal verbatim", got)
+	want := "error: guard hook " + deny + " denied this command: credential path"
+	if got, _ := resultEv["tool_output"].(string); got != want {
+		t.Errorf("tool_result tool_output = %q, want the refusal verbatim %q", got, want)
+	}
+	if resultEv["is_error"] != true {
+		t.Errorf("denied call tool_result is_error = %v, want true: %v", resultEv["is_error"], resultEv)
 	}
 	if hookMarkerExists(t, marker) {
 		t.Errorf("summary hook %s ran for a call that never ran", summary)

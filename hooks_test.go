@@ -453,8 +453,9 @@ func TestGuardCommandDenies(t *testing.T) {
 
 	_, got := chainOf(guardHook{path: script}).guardCommand("cat ~/.ssh/id_ed25519", "bash", nil)
 
-	// The "error: " prefix is what makes the Tool Result an error downstream,
-	// and the script path is what the operator has to go read.
+	// The refusal states its own failure where it is built; the "error: " prefix is
+	// for the Model reading it, and the script path is what the operator has to go
+	// read.
 	want := "error: guard hook " + script + " denied this command: credential path"
 	if got != want {
 		t.Errorf("guardCommand = %q, want %q", got, want)
@@ -1150,9 +1151,9 @@ func TestGuardReadDenies(t *testing.T) {
 
 	got := chainOf(guardHook{path: script}).guardRead("/home/model/.ssh/id_ed25519", nil)
 
-	// The same refusal text guardCommand returns for a deny: the file Tool's
-	// is_error rule reads only the "error: " prefix, so the shape is what makes
-	// this a failed Tool Result.
+	// The same refusal text guardCommand returns for a deny, and the same stated
+	// failure: the file Tools hand this back as a failed Tool Result rather than
+	// trusting the "error: " prefix to be read as one.
 	want := "error: guard hook " + script + " denied this command: credential path"
 	if got != want {
 		t.Errorf("guardRead = %q, want %q", got, want)
