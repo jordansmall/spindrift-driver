@@ -39,7 +39,7 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 		target:  resolved,
 		isError: fileToolResultIsError,
 		run: func() string {
-			if refusal := guardRead(resolved, s.cfg.hooks, s.stderr); refusal != "" {
+			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
 				return refusal
 			}
 			return writeFileTool(resolved, args.Content)
@@ -93,7 +93,7 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 		target:  resolved,
 		isError: fileToolResultIsError,
 		run: func() string {
-			if refusal := guardRead(resolved, s.cfg.hooks, s.stderr); refusal != "" {
+			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
 				return refusal
 			}
 			return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)

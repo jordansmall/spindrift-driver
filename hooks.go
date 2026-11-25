@@ -331,7 +331,7 @@ type hookPostRequest struct {
 
 // hookResponse is the part of a hook's stdout this step reads. The pre-call
 // chain reads permissionDecision and updatedInput out of it and ignores
-// updatedToolOutput, which only summarizeToolOutput acts on; the summary side
+// updatedToolOutput, which only the chain's summarize acts on; the summary side
 // reads updatedToolOutput and ignores the rest. One struct for both because one
 // script can legitimately answer both questions.
 //
@@ -479,12 +479,6 @@ func (c *guardChain) guardCommand(command, driverTool string, stderr io.Writer) 
 	}, stderr)
 }
 
-// guardCommand is the pre-chain entry point Slice D removes once the run carries
-// the chain: it wraps hooks in a one-link chain and asks that.
-func guardCommand(command, driverTool string, hooks []guardHook, stderr io.Writer) (string, string) {
-	return (&guardChain{pre: hooks}).guardCommand(command, driverTool, stderr)
-}
-
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
 // the non-empty updatedInput.command the hook handed back, or command itself.
 // A hook the manifest declares a rewriter owes that answer for any command worth
@@ -553,12 +547,6 @@ func (c *guardChain) guardRead(filePath string, stderr io.Writer) string {
 		feedsRewrite: false,
 	}, stderr)
 	return refusal
-}
-
-// guardRead is the pre-chain entry point Slice D removes once the run carries
-// the chain: it wraps hooks in a one-link chain and asks that.
-func guardRead(filePath string, hooks []guardHook, stderr io.Writer) string {
-	return (&guardChain{pre: hooks}).guardRead(filePath, stderr)
 }
 
 // encodeHookPostRequest builds the stdin the summary hook is handed for a
@@ -748,13 +736,6 @@ func (c *guardChain) summarize(driverTool, command, output string, stderr io.Wri
 		return output
 	}
 	return truncateToolOutput(summary)
-}
-
-// summarizeToolOutput is the pre-chain entry point Slice D removes once the run
-// carries the chain: it wraps hook in a chain with no pre-call links and asks
-// that.
-func summarizeToolOutput(driverTool, command, output string, hook *summaryHook, stderr io.Writer) string {
-	return (&guardChain{summary: hook}).summarize(driverTool, command, output, stderr)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

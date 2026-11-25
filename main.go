@@ -60,15 +60,13 @@ type config struct {
 	// offeredTools so the offer and the roster cannot disagree later.
 	agents []agentEntry
 	tools  []toolSpec
-	// hooks is the Guard Hook list read from the Driver Config's hook_manifest
-	// once at startup. An empty list means no Hook Manifest is configured, so
-	// nothing is guarded: unlike agentsDir the manifest has no home-relative
-	// default, so an absent key has nothing to fall back to.
-	hooks []guardHook
-	// summary is the Hook Manifest's one post-call entry, nil when no Hook
-	// Manifest is configured or the configured one names no post call. Nothing
-	// reads it yet: the slice that rewrites a Tool Result with it is the next one.
-	summary *summaryHook
+	// hooks is the run's Guard chain, read from the Driver Config's hook_manifest
+	// once at startup. Unlike agentsDir the manifest has no home-relative
+	// default, so an absent key has nothing to fall back to, and a nil chain is
+	// the whole of that state: nothing is guarded, and no guard pays a jq lookup
+	// or a fork. Held by pointer the way runTally is, because a session copies
+	// its config into Tool plan closures.
+	hooks *guardChain
 	// agent is the roster entry this run was started as by --agent, "" for a
 	// top-level run. It is the fact that makes a run a child, and the tool offer
 	// is read with it: a child never gets the Subagent Tool.
@@ -555,7 +553,7 @@ func planToolCall(call toolCall, s session) toolPlan {
 		target:  args.Command,
 		isError: func(string) bool { return failed },
 		run: func() string {
-			command, refusal := guardCommand(args.Command, call.Function.Name, s.cfg.hooks, s.stderr)
+			command, refusal := s.cfg.hooks.guardCommand(args.Command, call.Function.Name, s.stderr)
 			if refusal != "" {
 				// Judged by the same rule so a blocked call keeps reporting is_error true
 				// off its "error: " prefix. A refused call never ran, so there is no Tool
@@ -565,7 +563,7 @@ func planToolCall(call toolCall, s session) toolPlan {
 			}
 			result := runBashTool(command)
 			failed = toolResultIsError(result)
-			return summarizeToolOutput(call.Function.Name, command, result, s.cfg.summary, s.stderr)
+			return s.cfg.hooks.summarize(call.Function.Name, command, result, s.stderr)
 		},
 	}
 }
@@ -697,12 +695,11 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	// run unguarded because a file went missing. loadHookManifest already names
 	// the manifest path in every message it returns, so nothing is wrapped here.
 	if file.hookManifest != "" {
-		manifest, err := loadHookManifest(file.hookManifest)
+		chain, err := loadHookManifest(file.hookManifest)
 		if err != nil {
 			return config{}, err
 		}
-		cfg.hooks = manifest.pre
-		cfg.summary = manifest.summary
+		cfg.hooks = &chain
 	}
 	// Resolved against the loaded roster, never opened from a path in argv: the
 	// configured directory is the only place an Agent File comes from. The entry
