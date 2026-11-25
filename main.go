@@ -425,6 +425,15 @@ func retryAfterMS(h http.Header, now int64) (int64, bool) {
 	return 0, false
 }
 
+// toolResult is the value a Tool hands back for one call: the text the Driver
+// sends to the Model, plus whether the call failed. The Tool that ran states the
+// verdict, because it is the only thing that knows — a caller reading the verdict
+// back out of the text has to re-guess it from wording.
+type toolResult struct {
+	text   string
+	failed bool
+}
+
 // toolPlan is one assistant tool call read before it runs. The tool_call event
 // has to carry the decoded arguments and the target while the command has yet to
 // start, so the read cannot live on the far side of execution.
@@ -536,17 +545,16 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// The Guard chain runs when the call runs, not when it is planned: a hook is a
 	// script bounded by guardHookTimeout, and planning must stay parsing so the
 	// tool_call event is already on the wire before any hook fires. The refusal is
-	// what the Model is told, and its "error: " prefix is what toolResultIsError
-	// already reads as a failed Tool Result — so the refusal needs no new event
-	// grammar, only that runBashTool is never reached. A rewrite is host policy on
-	// what executes, so it replaces the command runBashTool is handed while
-	// tool_target keeps reporting the command the Model asked for.
-	// is_error stays the command's own verdict: a summary replaces the Tool Result
-	// text and has no exit-code line of its own, so letting toolResultIsError read
-	// the summary would flip every summarised success to an error. The rule closes
-	// over failed, which run writes from the pre-summary result — an ordering that
-	// is load bearing, because the run loop calls plan.run() before it hands the
-	// output to toolResultEvent.
+	// what the Model is told, and it states its own failure rather than leaning on
+	// how its prefix reads — so the refusal needs no new event grammar, only that
+	// runBashTool is never reached. A rewrite is host policy on what executes, so
+	// it replaces the command runBashTool is handed while tool_target keeps
+	// reporting the command the Model asked for.
+	// is_error stays the command's own verdict: a summary replaces only the Tool
+	// Result text, and prose cannot say whether the command exited cleanly. The
+	// rule closes over failed, which run writes from the pre-summary value — an
+	// ordering that is load bearing, because the run loop calls plan.run() before
+	// it hands the output to toolResultEvent.
 	var failed bool
 	return toolPlan{
 		input:   input,
@@ -555,15 +563,15 @@ func planToolCall(call toolCall, s session) toolPlan {
 		run: func() string {
 			command, refusal := s.cfg.hooks.guardCommand(args.Command, call.Function.Name, s.stderr)
 			if refusal != "" {
-				// Judged by the same rule so a blocked call keeps reporting is_error true
-				// off its "error: " prefix. A refused call never ran, so there is no Tool
-				// Result to summarise and the summary hook is not asked.
-				failed = toolResultIsError(refusal)
+				// A refused call never ran, so there is no exit status to read a verdict
+				// from: the denial is itself the failure. With nothing to summarise, the
+				// summary hook is not asked.
+				failed = true
 				return refusal
 			}
-			result := runBashTool(command)
-			failed = toolResultIsError(result)
-			return s.cfg.hooks.summarize(call.Function.Name, command, result, s.stderr)
+			res := runBashTool(command)
+			failed = res.failed
+			return s.cfg.hooks.summarize(call.Function.Name, command, res.text, s.stderr)
 		},
 	}
 }
@@ -847,11 +855,12 @@ func truncatedOutputMarker(kept int) string {
 }
 
 // runBashTool executes one tool call's shell command and returns the Tool
-// Result: combined stdout+stderr plus a trailing exit-code line. It runs
-// under bash -c in the Driver's own cwd (no persistence between calls). A
-// failing command — non-zero exit, or one that cannot even start — is an
-// ordinary Tool Result for the model, never a Go error.
-func runBashTool(command string) string {
+// Result: combined stdout+stderr plus a trailing exit-code line, and the
+// verdict that exit produced — a failing command is still an ordinary Tool
+// Result for the model, never a Go error, so nothing but this value can say the
+// call failed. It runs under bash -c in the Driver's own cwd (no persistence
+// between calls).
+func runBashTool(command string) toolResult {
 	ctx, cancel := context.WithTimeout(context.Background(), bashToolTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
@@ -870,7 +879,7 @@ func runBashTool(command string) string {
 	cmd.Stderr = &output
 	err := cmd.Start()
 	if err != nil {
-		return fmt.Sprintf("error: cannot start command: %v", err)
+		return toolResult{text: fmt.Sprintf("error: cannot start command: %v", err), failed: true}
 	}
 	err = cmd.Wait()
 	// trim exactly one trailing newline so the exit-code line sits directly
@@ -885,21 +894,21 @@ func runBashTool(command string) string {
 		// it would need a second Wait.
 		// must be distinct from a plain signal kill so the model can tell a
 		// timeout apart from a command that died on a signal
-		return result + fmt.Sprintf("\nexit code: timed out after %s", bashToolTimeout)
+		return toolResult{text: result + fmt.Sprintf("\nexit code: timed out after %s", bashToolTimeout), failed: true}
 	}
 	if err == nil {
-		return result + "\nexit code: 0"
+		return toolResult{text: result + "\nexit code: 0"}
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		if exitErr.ExitCode() < 0 {
 			// no exit code: the process was killed by a signal
-			return result + fmt.Sprintf("\nexit code: signal %s", exitErr.Sys().(syscall.WaitStatus).Signal())
+			return toolResult{text: result + fmt.Sprintf("\nexit code: signal %s", exitErr.Sys().(syscall.WaitStatus).Signal()), failed: true}
 		}
-		return result + fmt.Sprintf("\nexit code: %d", exitErr.ExitCode())
+		return toolResult{text: result + fmt.Sprintf("\nexit code: %d", exitErr.ExitCode()), failed: true}
 	}
 	// command could not be started at all (e.g. bash missing)
-	return fmt.Sprintf("error: cannot start command: %v", err)
+	return toolResult{text: fmt.Sprintf("error: cannot start command: %v", err), failed: true}
 }
 
 type chatMessage struct {
