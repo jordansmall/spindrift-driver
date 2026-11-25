@@ -20,8 +20,8 @@ import (
 //
 // The Guard Hook chain is asked inside run rather than at plan time, so the
 // call is judged when it runs: the tool_call event is already on the wire by
-// then, exactly as it is for bash. A refusal needs no new grammar because
-// fileToolResultIsError already reads the "error:" prefix as a failed result.
+// then, exactly as it is for bash. A refusal states its own failure — it never
+// reached the disk, so there is no write verdict to read.
 func planWriteCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Path    string `json:"path"`
@@ -34,15 +34,22 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 	if err != nil {
 		return fileErrorPlan(input, "error: %v", err)
 	}
+	// The verdict travels as a value the closure reads back, the way bash and the
+	// Subagent Tool carry theirs: only run knows whether the Guard refused and
+	// what the write itself answered.
+	var failed bool
 	return toolPlan{
 		input:   input,
 		target:  resolved,
-		isError: fileToolResultIsError,
+		isError: func(string) bool { return failed },
 		run: func() string {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
+				failed = true
 				return refusal
 			}
-			return writeFileTool(resolved, args.Content)
+			res := writeFileTool(resolved, args.Content)
+			failed = res.failed
+			return res.text
 		},
 	}
 }
@@ -88,24 +95,31 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 	if err != nil {
 		return fileErrorPlan(input, "error: %v", err)
 	}
+	// The verdict travels as a value the closure reads back, the way bash and the
+	// Subagent Tool carry theirs: only run knows whether the Guard refused and
+	// what the edit itself answered.
+	var failed bool
 	return toolPlan{
 		input:   input,
 		target:  resolved,
-		isError: fileToolResultIsError,
+		isError: func(string) bool { return failed },
 		run: func() string {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
+				failed = true
 				return refusal
 			}
-			return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
+			res := editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
+			failed = res.failed
+			return res.text
 		},
 	}
 }
 
 // editFileTool rewrites path with the exact text oldString swapped for newString.
-func editFileTool(path, oldString, newString string, replaceAll bool) string {
+func editFileTool(path, oldString, newString string, replaceAll bool) toolResult {
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Sprintf("error: cannot read %s: %v", path, err)
+		return toolResult{text: fmt.Sprintf("error: cannot read %s: %v", path, err), failed: true}
 	}
 	// Counted before anything is written: an edit that guessed which occurrence was
 	// meant changes the file in a way the Model cannot spot, so an ambiguous call
@@ -113,50 +127,41 @@ func editFileTool(path, oldString, newString string, replaceAll bool) string {
 	count := strings.Count(string(body), oldString)
 	switch {
 	case count == 0:
-		return fmt.Sprintf("error: old_string not found in %s", path)
+		return toolResult{text: fmt.Sprintf("error: old_string not found in %s", path), failed: true}
 	case count > 1 && !replaceAll:
-		return fmt.Sprintf("error: %d matches of old_string in %s; set replace_all to replace every match", count, path)
+		return toolResult{text: fmt.Sprintf("error: %d matches of old_string in %s; set replace_all to replace every match", count, path), failed: true}
 	}
 	// A unique match and an accepted replace_all differ only in count by now.
 	out := strings.Replace(string(body), oldString, newString, count)
 	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
-		return fmt.Sprintf("error: cannot write %s: %v", path, err)
+		return toolResult{text: fmt.Sprintf("error: cannot write %s: %v", path, err), failed: true}
 	}
 	noun := "match"
 	if count != 1 {
 		noun = "matches"
 	}
-	return fmt.Sprintf("edited %s: replaced %d %s", path, count, noun)
+	return toolResult{text: fmt.Sprintf("edited %s: replaced %d %s", path, count, noun)}
 }
 
-// fileErrorPlan is a file Tool plan that never touches the filesystem. It
-// carries fileToolResultIsError rather than leaving isError nil: an inherited
-// toolResultIsError happens to answer true for these messages, but only because
-// they lack an exit-code line, and a rule that works by accident is one a reword
-// can silently turn into a reported success.
+// fileErrorPlan is a file Tool plan that never touches the filesystem, so it
+// states its own verdict outright rather than leaving isError nil: the inherited
+// toolResultIsError answers true for these messages only because they lack an
+// exit-code line, and a rule that works by accident is one a reword can silently
+// turn into a reported success.
 func fileErrorPlan(input any, format string, a ...any) toolPlan {
 	msg := fmt.Sprintf(format, a...)
-	return toolPlan{input: input, isError: fileToolResultIsError, run: func() string { return msg }}
-}
-
-// fileToolResultIsError is the is_error rule for the file Tools' results. A
-// write reports a sentence rather than a command's output, so it has no trailing
-// exit-code line for toolResultIsError's suffix test to find — inheriting that
-// rule would report every successful write as a failure. The "error:" prefix a
-// failed write returns with is the only failure signal such a result can carry.
-func fileToolResultIsError(output string) bool {
-	return strings.HasPrefix(output, "error:")
+	return toolPlan{input: input, isError: func(string) bool { return true }, run: func() string { return msg }}
 }
 
 // writeFileTool writes content over path, creating the parents the Model did not
 // mention: making it spend a turn pre-creating a directory before it can name
 // the file it wants is a turn wasted for a fact the host can supply.
-func writeFileTool(path, content string) string {
+func writeFileTool(path, content string) toolResult {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Sprintf("error: cannot write %s: %v", path, err)
+		return toolResult{text: fmt.Sprintf("error: cannot write %s: %v", path, err), failed: true}
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fmt.Sprintf("error: cannot write %s: %v", path, err)
+		return toolResult{text: fmt.Sprintf("error: cannot write %s: %v", path, err), failed: true}
 	}
-	return fmt.Sprintf("wrote %d bytes to %s", len(content), path)
+	return toolResult{text: fmt.Sprintf("wrote %d bytes to %s", len(content), path)}
 }

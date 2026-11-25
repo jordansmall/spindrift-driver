@@ -41,6 +41,33 @@ func TestPlanWriteCallCreatesFile(t *testing.T) {
 	}
 }
 
+// TestWriteFileToolStatesFailureFromAFailedWrite pins the verdict at the leaf that
+// can actually know it: a write that never landed states its own failure as a
+// value, so nothing downstream has to read its wording to decide.
+func TestWriteFileToolStatesFailureFromAFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("pre-write blocker: %v", err)
+	}
+
+	blocked := writeFileTool(filepath.Join(blocker, "child.txt"), "nope")
+	if !strings.HasPrefix(blocked.text, "error:") {
+		t.Errorf("result = %q, want the error: wording the Model already sees", blocked.text)
+	}
+	if !blocked.failed {
+		t.Errorf("failed = false for %q, want the failed write to say so", blocked.text)
+	}
+
+	written := writeFileTool(filepath.Join(dir, "ok.txt"), "written")
+	if written.failed {
+		t.Errorf("failed = true for a successful write: %q", written.text)
+	}
+	if want := "wrote 7 bytes to " + filepath.Join(dir, "ok.txt"); written.text != want {
+		t.Errorf("result = %q, want %q", written.text, want)
+	}
+}
+
 func TestPlanWriteCallMissingPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -257,6 +284,25 @@ func TestPlanEditCallOldStringNotFound(t *testing.T) {
 	}
 }
 
+// TestEditFileToolStatesFailureWhenOldStringNotFound pins the miss as a stated
+// verdict: the edit read the file and wrote nothing, and only that branch can say
+// so without reading its own sentence for a prefix.
+func TestEditFileToolStatesFailureWhenOldStringNotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatalf("pre-write: %v", err)
+	}
+
+	res := editFileTool(path, "gamma", "GAMMA", false)
+	if want := "error: old_string not found in " + path; res.text != want {
+		t.Errorf("result = %q, want %q", res.text, want)
+	}
+	if !res.failed {
+		t.Errorf("failed = false for %q, want the miss to say so", res.text)
+	}
+}
+
 func TestPlanEditCallAmbiguousWithoutReplaceAll(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -284,6 +330,25 @@ func TestPlanEditCallAmbiguousWithoutReplaceAll(t *testing.T) {
 	}
 }
 
+// TestEditFileToolStatesFailureOnAmbiguousMatchesWithoutReplaceAll is the
+// judgement branch: the file was read, the replacement was declined, and the text
+// naming the count is only as trustworthy as the verdict stated beside it.
+func TestEditFileToolStatesFailureOnAmbiguousMatchesWithoutReplaceAll(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("tick\ntock\ntick\n"), 0o644); err != nil {
+		t.Fatalf("pre-write: %v", err)
+	}
+
+	res := editFileTool(path, "tick", "tock", false)
+	if want := "error: 2 matches of old_string in " + path + "; set replace_all to replace every match"; res.text != want {
+		t.Errorf("result = %q, want %q", res.text, want)
+	}
+	if !res.failed {
+		t.Errorf("failed = false for %q, want the declined edit to say so", res.text)
+	}
+}
+
 func TestPlanEditCallReplaceAll(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -305,6 +370,68 @@ func TestPlanEditCallReplaceAll(t *testing.T) {
 	if got := string(b); got != "tock\ntock\ntock\n" {
 		t.Errorf("file content = %q, want every occurrence replaced", got)
 	}
+}
+
+// TestEditFileToolStatesFailureFromAnUnreadableFile covers the branch that fails
+// before it has anything to count: the path is a directory, so there is no body to
+// inspect and the read refusal is the whole verdict.
+func TestEditFileToolStatesFailureFromAnUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+
+	res := editFileTool(dir, "x", "y", false)
+	if !strings.HasPrefix(res.text, "error: cannot read "+dir) {
+		t.Errorf("result = %q, want the cannot-read wording the Model already sees", res.text)
+	}
+	if !res.failed {
+		t.Errorf("failed = false for %q, want the unreadable file to say so", res.text)
+	}
+}
+
+// TestEditFileToolStaysCleanOnACompletedEdit is the other half of the stated
+// verdict: the two success wordings carry no "error:" prefix today, and a clean
+// result must stay clean for reasons that have nothing to do with how they read.
+func TestEditFileToolStaysCleanOnACompletedEdit(t *testing.T) {
+	t.Run("unique match", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "a.txt")
+		if err := os.WriteFile(path, []byte("alpha\n"), 0o644); err != nil {
+			t.Fatalf("pre-write: %v", err)
+		}
+		res := editFileTool(path, "alpha", "BETA", false)
+		if res.failed {
+			t.Errorf("failed = true for a completed edit: %q", res.text)
+		}
+		if want := "edited " + path + ": replaced 1 match"; res.text != want {
+			t.Errorf("result = %q, want %q", res.text, want)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read edited file: %v", err)
+		}
+		if string(body) != "BETA\n" {
+			t.Errorf("file content = %q, want %q", body, "BETA\n")
+		}
+	})
+
+	t.Run("replace_all", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "a.txt")
+		if err := os.WriteFile(path, []byte("tick\ntock\ntick\n"), 0o644); err != nil {
+			t.Fatalf("pre-write: %v", err)
+		}
+		res := editFileTool(path, "tick", "tock", true)
+		if res.failed {
+			t.Errorf("failed = true for a completed replace_all: %q", res.text)
+		}
+		if want := "edited " + path + ": replaced 2 matches"; res.text != want {
+			t.Errorf("result = %q, want %q", res.text, want)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read edited file: %v", err)
+		}
+		if string(body) != "tock\ntock\ntock\n" {
+			t.Errorf("file content = %q, want every occurrence replaced", body)
+		}
+	})
 }
 
 func TestPlanEditCallReplaceAllOnUniqueMatch(t *testing.T) {
@@ -430,6 +557,20 @@ func TestPlanEditCallUnparseableArguments(t *testing.T) {
 	}
 }
 
+// TestFileErrorPlanStatesItsOwnVerdict is why no file verdict may be read off text
+// any more: a plan that never touches the filesystem already knows it failed, so
+// its isError answers true whatever the sentence it will return happens to start
+// with.
+func TestFileErrorPlanStatesItsOwnVerdict(t *testing.T) {
+	plan := fileErrorPlan(nil, "error: %s", "path is required")
+	if out := plan.run(); !plan.isError(out) {
+		t.Errorf("is_error = false for %q, want a plan that never ran to state failure", out)
+	}
+	if !plan.isError("a result the prefix rule would have read as clean") {
+		t.Error("is_error = false for unrelated output, want the plan's own stated failure")
+	}
+}
+
 func TestFileToolDispatchesEdit(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -515,6 +656,9 @@ func TestPlanEditCallGuardHookDenies(t *testing.T) {
 
 	if want := "error: guard hook " + script + " denied this command: credential path"; out != want {
 		t.Errorf("plan.run() = %q, want %q", out, want)
+	}
+	if !plan.isError(out) {
+		t.Errorf("is_error = false for %q, want a refusal that never touched the file to state failure", out)
 	}
 	body, err := os.ReadFile(target)
 	if err != nil {
