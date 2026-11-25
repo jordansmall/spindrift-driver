@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -19,8 +17,9 @@ import (
 // child without building a second binary.
 const subagentHelperEnv = "SPINDRIFT_SUBAGENT_HELPER"
 
-// subagentEnv points a run and every child it spawns at one roster and one fake
-// endpoint. A child inherits the environment rather than a config struct, so
+// subagentEnv points a run and every child it spawns at one roster and one
+// scripted Model endpoint. A child inherits the environment rather than a
+// config struct, so
 // these variables are the only channel to it — and they only reach the parent's
 // own parseArgs if the test passes os.LookupEnv, which is also what lets parent
 // and child resolve the same roster.
@@ -127,69 +126,6 @@ func spawnPair(t *testing.T, raw string) (callEv, resultEv map[string]any) {
 		t.Fatalf("stdout carries no subagent tool_call/tool_result pair (call %d, result %d) in %q", callIdx, resultIdx, raw)
 	}
 	return events[callIdx], events[resultIdx]
-}
-
-// subagentReplyServer answers one model id with a 500 and every other POST with
-// the next scripted completion. The POST-counting scriptedChatServer cannot fail
-// only the child: the child retries, and both runs share one endpoint, so the
-// routing key has to be the model in the body.
-type subagentReplyServer struct {
-	mu        sync.Mutex
-	failModel string
-	// passes counts how many of failModel's POSTs are still answered from the
-	// script before the refusals start, so a test can hand a child one Model call
-	// that succeeds — and one that fails afterwards.
-	passes   int
-	replies  []string
-	answered int
-	bodies   [][]byte
-	srv      *httptest.Server
-}
-
-func newSubagentReplyServer(t *testing.T, failModel string, replies ...string) *subagentReplyServer {
-	return newSubagentReplyServerPassing(t, failModel, 0, replies...)
-}
-
-// newSubagentReplyServerPassing refuses failModel only after answering its first
-// passes POSTs from the script.
-func newSubagentReplyServerPassing(t *testing.T, failModel string, passes int, replies ...string) *subagentReplyServer {
-	s := &subagentReplyServer{failModel: failModel, passes: passes, replies: replies}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		s.mu.Lock()
-		s.bodies = append(s.bodies, body)
-		var req struct {
-			Model string `json:"model"`
-		}
-		_ = json.Unmarshal(body, &req)
-		fail := req.Model == failModel && s.passes <= 0
-		if !fail {
-			if s.answered < len(s.replies) {
-				if req.Model == failModel {
-					s.passes--
-				}
-				reply := s.replies[s.answered]
-				s.answered++
-				s.mu.Unlock()
-				writeSSE(w, sseChatCompletion(reply))
-				return
-			}
-			fail = true
-		}
-		s.mu.Unlock()
-		http.Error(w, "scripted failure", http.StatusInternalServerError)
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
-}
-
-func (s *subagentReplyServer) requestBodies(t *testing.T) [][]byte {
-	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([][]byte, len(s.bodies))
-	copy(out, s.bodies)
-	return out
 }
 
 // TestSubagentSpawnRunsTheAgentFileEntry is the issue's core criterion: the child
