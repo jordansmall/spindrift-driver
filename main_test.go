@@ -1801,6 +1801,31 @@ func TestRunThreeConsecutiveRefusalsEndTheRun(t *testing.T) {
 	if len(got.requests) != 5 {
 		t.Errorf("POSTs = %d, want 5: the run stopped on the third refusal, not at the turn cap", len(got.requests))
 	}
+	// The refusal that ended the run is the one Tool Result the Model never got to
+	// read, and the loop returns before the replay precisely so it stays out of the
+	// conversation. The refusal just ahead of it IS replayed, into the POST of the
+	// turn that followed it, which is what makes the absence below a verdict instead
+	// of an empty scan. Each refusal names its own repeat count, so the two texts are
+	// distinguishable and neither contains the other.
+	msgs := got.messageBodies(t)
+	second, _ := results[3]["tool_output"].(string)
+	var carryingEnding, carryingSecond []int
+	for i, body := range msgs {
+		for _, m := range body {
+			if strings.Contains(m.Content, output) {
+				carryingEnding = append(carryingEnding, i+1)
+			}
+			if strings.Contains(m.Content, second) {
+				carryingSecond = append(carryingSecond, i+1)
+			}
+		}
+	}
+	if len(carryingEnding) != 0 {
+		t.Errorf("POSTs %v replay the ending refusal %q: the refusal the Model never got to read must not be replayed into a conversation the run is ending over: %q", carryingEnding, output, raw)
+	}
+	if !reflect.DeepEqual(carryingSecond, []int{5}) {
+		t.Errorf("POSTs %v carry the second refusal %q, want exactly the 5th POST: that refusal is what the run handed the Model to heed, and no POST after the run ended should be asking again: %q", carryingSecond, second, raw)
+	}
 }
 
 func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
@@ -5252,6 +5277,144 @@ esac`)
 	}
 	if gotText := resultText(t, string(got.stdout)); gotText != "one refused, one ran" {
 		t.Errorf("result event text = %q, want the run's own final answer", gotText)
+	}
+}
+
+// TestRunGuardBlockedCallDoesNotFeedTheRefusalStreak pins the seam between the
+// Guard Hook and the repeated-call breaker that only the turn loop can show: the
+// denial is authored inside plan.run(), so the call it answers is a call the loop
+// dispatched, and a dispatched call starts the refusal streak over. A Guard-Hook
+// block is also a Tool Result the Model reads and can act on, which is exactly
+// what a breaker refusal is not — so counting it as a refusal, or letting the two
+// refusals ahead of it stand, would end a run that is answering the Model turn
+// after turn and being answered back.
+//
+// The run sends the identical Bash Call four times — two run, two are refused —
+// then one call the Hook blocks, then the identical call four more times: two run,
+// two are refused again, and the eighth call is the run's third refusal but only
+// the first of the streak behind the blocked call. So the run reaches the final
+// answer the script closes on.
+func TestRunGuardBlockedCallDoesNotFeedTheRefusalStreak(t *testing.T) {
+	// A real Hook judging the payload on its stdin: only the call carrying the
+	// forbidden word is denied, so every other refusal in the run is the breaker's
+	// own and the blocked call is the only thing that can reset the streak.
+	hook := writeGuardHookScript(t, "streak-word.sh", `input=$(cat)
+case "$input" in
+  *forbidden*) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"forbidden word"}}' ;;
+esac`)
+
+	argsJSON := func(command string) string {
+		t.Helper()
+		raw, err := json.Marshal(map[string]string{"command": command})
+		if err != nil {
+			t.Fatalf("marshal scripted arguments: %v", err)
+		}
+		// arguments is a JSON string on the wire, so the encoded object is encoded
+		// a second time rather than embedded as a value.
+		quoted, err := json.Marshal(string(raw))
+		if err != nil {
+			t.Fatalf("marshal scripted arguments string: %v", err)
+		}
+		return string(quoted)
+	}
+	// One call per turn, so the POST index names the position in the sequence.
+	callTurn := func(id, command string) modelEntry {
+		t.Helper()
+		return replyCompletion(fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":%q,"type":"function","function":{"name":"bash","arguments":%s}}]}}]}`, id, argsJSON(command)))
+	}
+	const (
+		keptCommand   = "echo kept"
+		deniedCommand = "echo forbidden"
+	)
+	const finalAnswer = "the streak never reached three in a row"
+
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			callTurn("call_a", keptCommand),   // 1: dispatched
+			callTurn("call_a", keptCommand),   // 2: dispatched, second in a row
+			callTurn("call_a", keptCommand),   // 3: refused, first of the streak
+			callTurn("call_a", keptCommand),   // 4: refused, second of the streak
+			callTurn("call_b", deniedCommand), // 5: Guard-Hook blocked, so the streak starts over
+			callTurn("call_a", keptCommand),   // 6: dispatched
+			callTurn("call_a", keptCommand),   // 7: dispatched, second in a row
+			callTurn("call_a", keptCommand),   // 8: refused, the run's third but the streak's first
+			callTurn("call_a", keptCommand),   // 9: refused, second of the new streak
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"` + finalAnswer + `"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"pre":[{"path":"`+hook+`"}]}`))
+
+	// The whole point of the sequence: a blocked call that fed the streak would make
+	// POST 8 the third refusal in a row, and the run would exit 1 with the breaker's
+	// error event instead of reaching its final answer.
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0: the Guard-Hook block must reset the refusal streak, because if it fed the streak the eighth call would be the third refusal in a row and the run would end on the breaker instead of its final answer; stderr = %q stdout = %q", got.code, got.stderr, string(got.stdout))
+	}
+	raw := string(got.stdout)
+	for i, ev := range got.events {
+		if ev["kind"] == "error" {
+			t.Fatalf("event %d is an error event (%v), want none: a run that ends on the breaker carries the breaker sentence rather than its final answer: %q", i, ev["text"], raw)
+		}
+	}
+
+	// What the loop owed each of the nine scripted calls, in arrival order.
+	const (
+		dispatched = iota
+		refused
+		blocked
+	)
+	wantKinds := []int{dispatched, dispatched, refused, refused, blocked, dispatched, dispatched, refused, refused}
+	var results []map[string]any
+	for i, ev := range got.events {
+		if ev["kind"] != "tool_result" {
+			continue
+		}
+		if i == 0 || got.events[i-1]["kind"] != "tool_call" {
+			t.Errorf("tool_result at %d has no tool_call immediately before it: %q", i, raw)
+		}
+		results = append(results, ev)
+	}
+	if len(results) != len(wantKinds) {
+		t.Fatalf("tool_result events = %d, want one per scripted call: %q", len(results), raw)
+	}
+	for i, ev := range results {
+		output, _ := ev["tool_output"].(string)
+		switch wantKinds[i] {
+		case dispatched:
+			// The exit-code line is the witness the command really ran, so the call the
+			// breaker let through is not quietly skipped.
+			if !strings.Contains(output, "kept") || !strings.HasSuffix(output, "exit code: 0") {
+				t.Errorf("tool_result %d tool_output = %q, want the dispatched command's own output ending in its exit-code line", i+1, output)
+			}
+			if _, onWire := ev["is_error"]; onWire {
+				t.Errorf("tool_result %d states is_error = %v, want the key absent on a call that ran: %v", i+1, ev["is_error"], ev)
+			}
+		case refused:
+			if !strings.Contains(output, "was already called") || !strings.Contains(output, "not run again") {
+				t.Errorf("tool_result %d tool_output = %q, want the breaker's refusal of a repeated call", i+1, output)
+			}
+			// No exit-code line: a refused call never started a command.
+			if strings.Contains(output, "exit code:") {
+				t.Errorf("tool_result %d tool_output = %q, want the refusal with no exit-code line", i+1, output)
+			}
+			if ev["is_error"] != true {
+				t.Errorf("tool_result %d is_error = %v, want true on a breaker refusal: %v", i+1, ev["is_error"], ev)
+			}
+		case blocked:
+			if !strings.Contains(output, "denied this command: forbidden word") {
+				t.Errorf("tool_result %d tool_output = %q, want the Guard Hook's own denial reason", i+1, output)
+			}
+			if ev["is_error"] != true {
+				t.Errorf("tool_result %d is_error = %v, want true on a Guard-Hook denial: %v", i+1, ev["is_error"], ev)
+			}
+		}
+	}
+	if gotText := resultText(t, raw); gotText != finalAnswer {
+		t.Errorf("result event text = %q, want the run's own final answer", gotText)
+	}
+	// One POST per scripted reply, the closing answer included: the run stopped
+	// because the Model finished, not because the breaker stopped it.
+	if len(got.requests) != 10 {
+		t.Errorf("POSTs = %d, want 10, one per scripted reply including the final answer: %q", len(got.requests), raw)
 	}
 }
 
