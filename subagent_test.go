@@ -445,6 +445,34 @@ func TestSubagentToolResultNamesTheAgent(t *testing.T) {
 	}
 }
 
+// TestSubagentAnswerStartingLikeAFailureIsNotOne: the child's answer is the
+// verdict's whole evidence, so prose that merely opens with the word "error:" is
+// still a child that answered, and no is_error may ride on it.
+func TestSubagentAnswerStartingLikeAFailureIsNotOne(t *testing.T) {
+	answer := "error: the build is broken in the second file"
+	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
+	srv := newScriptedChatServer(t,
+		parentToolCallResponse,
+		completion(answer),
+		completion("parent answer"),
+	)
+	subagentEnv(t, cfgPath, srv.srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	_, resultEv := spawnPair(t, stdout.String())
+	if got := resultEv["tool_output"]; got != answer {
+		t.Errorf("tool_result tool_output = %v, want the child's answer verbatim", got)
+	}
+	if v, ok := resultEv["is_error"]; ok {
+		t.Errorf("tool_result carries is_error = %v for a child that answered; only the spawn's own failure may state one", v)
+	}
+}
+
 // TestSubagentAnswerDoesNotBecomeParentResult keeps the two answers apart: the
 // child's answer is a Tool Result, the parent's is the run's result.
 func TestSubagentAnswerDoesNotBecomeParentResult(t *testing.T) {
@@ -802,9 +830,12 @@ func TestSubagentRelayDropsNonObjectLines(t *testing.T) {
 	stream := "not an event at all\nnull\n" +
 		`{"kind":"result","timestamp":1234567890123,"text":"child answer","num_turns":1}` + "\n"
 
-	text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
-	if !sawResult || text != "child answer" {
-		t.Errorf("relay returned text %q sawResult %v, want the result event's text", text, sawResult)
+	res, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
+	if !sawResult || res.text != "child answer" {
+		t.Errorf("relay returned text %q sawResult %v, want the result event's text", res.text, sawResult)
+	}
+	if res.failed {
+		t.Errorf("relay returned failed = true for a child's real answer: %q", res.text)
 	}
 	events := stdoutEvents(t, out.String())
 	if len(events) != 1 {
@@ -938,6 +969,9 @@ func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
 	if !strings.HasPrefix(out, "error:") {
 		t.Errorf("tool_output = %q, want an error:-prefixed result", out)
 	}
+	if resultEv["is_error"] != true {
+		t.Errorf("is_error = %v, want a child that emitted no result event reported as failed", resultEv["is_error"])
+	}
 	if got, _ := result["num_turns"].(float64); int(got) != 2 {
 		t.Errorf("parent result num_turns = %v, want the parent's own two Model calls", got)
 	}
@@ -994,20 +1028,24 @@ func TestSubagentRelayChargesNothingForAKindThatIsNotAString(t *testing.T) {
 
 // TestSubagentRelayResultWithoutText: a result event is how the child hands over
 // its answer, so one carrying no usable text is a failure rather than an empty
-// success — the error: prefix is the only failure signal the Tool Result can
-// carry, and it still gets relayed because relaying and answering are separate.
+// success — the relay states that verdict on the value it returns, because it is
+// the only reader of the child's result event, and the answer still gets relayed
+// because relaying and answering are separate.
 func TestSubagentRelayResultWithoutText(t *testing.T) {
 	for _, stream := range []string{
 		`{"kind":"result","timestamp":1,"num_turns":1}` + "\n",
 		`{"kind":"result","timestamp":2,"text":42,"num_turns":1}` + "\n",
 	} {
 		var out, errOut bytes.Buffer
-		text, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
+		res, sawResult := relaySubagentOutput(strings.NewReader(stream), "reviewer", relaySession(&out, &errOut, newRunTally()))
 		if !sawResult {
 			t.Errorf("sawResult = false, want true: the child did finish with a result event (%s)", stream)
 		}
-		if !strings.HasPrefix(text, "error:") {
-			t.Errorf("relay returned text %q, want an error:-prefixed message (%s)", text, stream)
+		if !strings.HasPrefix(res.text, "error:") {
+			t.Errorf("relay returned text %q, want an error:-prefixed message (%s)", res.text, stream)
+		}
+		if !res.failed {
+			t.Errorf("relay returned failed = false, want the no-answer case stating itself failed (%s)", stream)
 		}
 		if events := stdoutEvents(t, out.String()); len(events) != 1 || events[0]["kind"] != "result" {
 			t.Errorf("parent stdout = %q, want the child's result event relayed", out.String())
@@ -1031,9 +1069,9 @@ func TestSubagentRelayDrainsAfterOverLongLine(t *testing.T) {
 	stream := io.MultiReader(append(parts, strings.NewReader("\n"+`{"kind":"result","timestamp":1,"text":"late answer"}`+"\n"))...)
 
 	var out, errOut bytes.Buffer
-	text, sawResult := relaySubagentOutput(stream, "reviewer", relaySession(&out, &errOut, newRunTally()))
-	if sawResult || text != "" {
-		t.Errorf("relay returned text %q sawResult %v, want the result after the broken line to be lost", text, sawResult)
+	res, sawResult := relaySubagentOutput(stream, "reviewer", relaySession(&out, &errOut, newRunTally()))
+	if sawResult || res.text != "" {
+		t.Errorf("relay returned text %q sawResult %v, want the result after the broken line to be lost", res.text, sawResult)
 	}
 	if !strings.Contains(errOut.String(), fmt.Sprint(sseMaxLineBytes)) {
 		t.Errorf("stderr does not name the byte bound: %q", errOut.String())
