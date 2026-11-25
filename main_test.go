@@ -180,24 +180,20 @@ func TestRunChatRoundTrip(t *testing.T) {
 func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
 	pinSteppingClock(t, 1700000000000, 1000)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w, sseChatCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`))
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"fix the flaky test", "--model", "gpt-4o-mini", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"gpt-4o-mini": {replyCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)},
+	}, "fix the flaky test", withFlags("--model", "gpt-4o-mini"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := got.events
 	if len(events) != 4 {
-		t.Fatalf("stdout carries %d event(s), want exactly 4: %q", len(events), stdout.String())
+		t.Fatalf("stdout carries %d event(s), want exactly 4: %q", len(events), got.stdout)
 	}
 	for i, want := range []string{"start", "text", "usage", "result"} {
-		if got := events[i]["kind"]; got != want {
-			t.Fatalf("event %d kind = %v, want %q: %q", i+1, got, want, stdout.String())
+		if kind := events[i]["kind"]; kind != want {
+			t.Fatalf("event %d kind = %v, want %q: %q", i+1, kind, want, got.stdout)
 		}
 	}
 	// start names the call before the first byte is read, so the Driver assigns
@@ -245,18 +241,14 @@ func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
 func TestRunSubMillisecondAnswerStillStatesDurationFields(t *testing.T) {
 	pinClock(t, 1700000000000)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w, sseChatCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "gpt-4o-mini", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"gpt-4o-mini": {replyCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`)},
+	}, "p", withFlags("--model", "gpt-4o-mini"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
-	result := resultEvent(t, stdout.String())
+	result := resultEvent(t, string(got.stdout))
 	for _, name := range []string{"duration_ms", "duration_api_ms"} {
 		v, ok := result[name]
 		if !ok {
@@ -358,28 +350,24 @@ func TestRunEmitsExactlyOneUsageEventPerModelCall(t *testing.T) {
 // fields as zero — a reader counts Model calls from usage events, so skipping
 // the quiet ones would understate every run.
 func TestRunUsageEventCarriesZeroTokensWhenServerReportsNone(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"no usage here"}}]}`))
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"no usage here"}}]}`)},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 
 	var usage map[string]any
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] == "usage" {
 			if usage != nil {
-				t.Fatalf("stdout carries more than one usage event: %q", stdout.String())
+				t.Fatalf("stdout carries more than one usage event: %q", got.stdout)
 			}
 			usage = ev
 		}
 	}
 	if usage == nil {
-		t.Fatalf("a call whose response has no usage object emitted no usage event: %q", stdout.String())
+		t.Fatalf("a call whose response has no usage object emitted no usage event: %q", got.stdout)
 	}
 	if usage["model"] != "m" {
 		t.Errorf("usage model = %v, want the configured --model as fallback", usage["model"])
@@ -572,22 +560,21 @@ func sseStall(frames string) string { return sseStallPrefix + frames }
 // line names the frame that follows, and the done marker closes the stream. None
 // of them is a delta, so the answer stays exactly what the data frames said.
 func TestRunStreamIgnoresHeartbeatsEventLinesAndDoneMarker(t *testing.T) {
-	srv := newScriptedSSERawServer(t, ": keep-alive\n\n"+
-		"event: message\n\n"+
-		sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"only this"}}]}`)+
-		sseDone+
-		sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":" after the marker"}}]}`))
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {replyFrames(": keep-alive\n\n" +
+			"event: message\n\n" +
+			sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"only this"}}]}`) +
+			sseDone +
+			sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":" after the marker"}}]}`))},
+	}, "p", withFlags("--model", "m-a"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "only this" {
-		t.Errorf("result text = %q, want only the chunk before the done marker", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "only this" {
+		t.Errorf("result text = %q, want only the chunk before the done marker", gotText)
 	}
-	if n := strings.Count(stderr.String(), "POST "); n != 1 {
-		t.Errorf("stderr carries %d POST line(s), want the one progress line: %q", n, stderr.String())
+	if n := strings.Count(got.stderr, "POST "); n != 1 {
+		t.Errorf("stderr carries %d POST line(s), want the one progress line: %q", n, got.stderr)
 	}
 }
 
@@ -4314,24 +4301,20 @@ func (failingReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
 // content that already ends in one keeps exactly one and gains nothing, and the
 // only newline stdout still guarantees belongs to each event line.
 func TestRunResponseEndingInNewline(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"ends with newline\n"}}]}`))
-	}))
-	defer srv.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m", "--base-url", srv.URL, "p"}, nil, &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ends with newline\n"}}]}`)},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	if got := resultText(t, stdout.String()); got != "ends with newline\n" {
-		t.Errorf("result event text = %q, want the server content verbatim: one trailing newline, never doubled or appended", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "ends with newline\n" {
+		t.Errorf("result event text = %q, want the server content verbatim: one trailing newline, never doubled or appended", gotText)
 	}
 	// stdout itself still ends in exactly one newline per event line, so the
 	// answer's own newline cannot leak a blank line into the stream.
-	raw := stdout.String()
-	if n := strings.Count(raw, "\n"); n != len(stdoutEvents(t, raw)) {
-		t.Errorf("stdout has %d newline(s) for %d event line(s), want one per line: %q", n, len(stdoutEvents(t, raw)), raw)
+	raw := string(got.stdout)
+	if n := strings.Count(raw, "\n"); n != len(got.events) {
+		t.Errorf("stdout has %d newline(s) for %d event line(s), want one per line: %q", n, len(got.events), raw)
 	}
 }
 
