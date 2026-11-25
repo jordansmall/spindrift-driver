@@ -231,14 +231,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	toolSeq := 0
 	runStart := nowMS()
 	sess := session{cfg: cfg, stderr: stderr, relay: relayChildEvent(events, tally)}
-	// Repeated-call breaker state: the last call seen and how many times in a row.
-	// These are run() locals rather than package counters because a package counter
-	// would carry across every run() in one process, and the state is per run.
-	var lastKey string
-	repeat := 0
-	// refusals counts how many calls in a row the breaker refused: a call that
-	// actually ran means the Model changed course, so the count starts over.
-	refusals := 0
+	var breaker callBreaker
 	for turn := 0; turn < cfg.maxTurns; turn++ {
 		tally.recordCall()
 		messageID := fmt.Sprintf("msg-%d", tally.calls)
@@ -307,42 +300,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				ToolInput:  plan.input,
 				ToolTarget: plan.target,
 			})
-			// The key is the call exactly as the Model sent it: the tool name and the
-			// raw arguments wire string, joined by a NUL neither can contain. Keying on
-			// the decoded arguments would follow Go map order instead of what was sent.
-			key := tc.Function.Name + "\x00" + tc.Function.Arguments
-			if key == lastKey {
-				repeat++
-			} else {
-				lastKey, repeat = key, 1
-			}
-			var result toolResult
-			refused := repeat >= repeatedCallRefuseLimit
-			if refused {
-				refusals++
-				result = toolResult{text: repeatedCallRefusal(tc.Function.Name, repeat)}
-			} else {
-				// Only the breaker's own refusals chain. A call a Guard Hook blocked comes
-				// back through plan.run() like any other result, and the Model does get to
-				// react to it, so it breaks the streak rather than feeding the counter.
-				refusals = 0
+			verdict := breaker.decide(tc.Function.Name, tc.Function.Arguments)
+			result := verdict.result
+			if verdict.runs() {
 				result = plan.run()
 			}
-			ev := toolResultEvent(messageID, toolID, tc.Function.Name, plan, result)
-			if refused {
-				// The breaker's refusal is the one Tool Result the loop authors instead of
-				// receiving from a Tool, so it is the one verdict no Tool stated and the loop
-				// has to. Moving the breaker behind a plan of its own is its own change.
-				ev.IsError = true
-			}
-			_ = events.emit(ev)
-			if refusals >= repeatedCallEndLimit {
-				// Returning before the replay leaves the refusal out of the conversation
-				// the run is ending over, and any later call of this batch never got a
-				// tool_call, so no pair is left open by the early exit.
-				breaker := fmt.Errorf("repeated the same %s call so often it was refused %d times in a row, so the run ended", tc.Function.Name, refusals)
-				fmt.Fprintf(stderr, "spindrift-driver: %v\n", breaker)
-				return errorExit(events, 1, breaker)
+			_ = events.emit(toolResultEvent(messageID, toolID, tc.Function.Name, plan, result))
+			if verdict.endsRun() {
+				// Stopping after the emit and before the replay keeps the ending refusal
+				// out of the conversation the run is ending over, and any later call of
+				// this batch never got a tool_call, so no pair is left open by the exit.
+				fmt.Fprintf(stderr, "spindrift-driver: %v\n", verdict.reason)
+				return errorExit(events, 1, verdict.reason)
 			}
 			// The replayed Tool Result message is unchanged, idless calls included:
 			// the synthesised tool id belongs to the event stream, not to the Model.
