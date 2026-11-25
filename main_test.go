@@ -5205,8 +5205,6 @@ func TestRunGuardHookDenialDoesNotStopTheTurn(t *testing.T) {
 case "$input" in
   *forbidden*) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"forbidden word"}}' ;;
 esac`)
-	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
 
 	argsJSON := func(command string) string {
 		t.Helper()
@@ -5226,16 +5224,18 @@ esac`)
 		argsJSON("echo forbidden > "+blocked),
 		argsJSON("echo kept > "+kept+"; echo done"),
 	)
-	srv := newScriptedChatServer(t, turn, `{"choices":[{"message":{"role":"assistant","content":"one refused, one ran"}}]}`)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(turn),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"one refused, one ran"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"pre":[{"path":"`+hook+`"}]}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
 	results := map[string]map[string]any{}
 	var order []string
-	for _, ev := range stdoutEvents(t, stdout.String()) {
+	for _, ev := range got.events {
 		if ev["kind"] != "tool_result" {
 			continue
 		}
@@ -5244,9 +5244,9 @@ esac`)
 		order = append(order, id)
 	}
 	if !reflect.DeepEqual(order, []string{"call_1", "call_2"}) {
-		t.Fatalf("tool_result order = %v, want both calls of the turn: %q", order, stdout.String())
+		t.Fatalf("tool_result order = %v, want both calls of the turn: %q", order, got.stdout)
 	}
-	if got, _ := results["call_1"]["tool_output"].(string); !strings.Contains(got, "forbidden word") || results["call_1"]["is_error"] != true {
+	if denied, _ := results["call_1"]["tool_output"].(string); !strings.Contains(denied, "forbidden word") || results["call_1"]["is_error"] != true {
 		t.Errorf("first tool_result = %v, want the refusal marked as an error", results["call_1"])
 	}
 	output, _ := results["call_2"]["tool_output"].(string)
@@ -5262,8 +5262,8 @@ esac`)
 	if !hookMarkerExists(t, kept) {
 		t.Errorf("marker %s was not written: the second call never ran", kept)
 	}
-	if got := resultText(t, stdout.String()); got != "one refused, one ran" {
-		t.Errorf("result event text = %q, want the run's own final answer", got)
+	if gotText := resultText(t, string(got.stdout)); gotText != "one refused, one ran" {
+		t.Errorf("result event text = %q, want the run's own final answer", gotText)
 	}
 }
 
@@ -5277,23 +5277,18 @@ func TestRunSummaryHookReplacesTheToolResultOnTheWireAndInReplay(t *testing.T) {
 	summary := "SUMMARY: one line listed"
 	hook := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"`+summary+`"}}'`)
-	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
-
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a summary is not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"post":{"path":"`+hook+`"}}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a summary is not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
-	if got, _ := resultEv["tool_output"].(string); got != summary {
-		t.Errorf("tool_result tool_output = %q, want the summary verbatim", got)
+	callEv, resultEv := toolPair(t, got.events)
+	if output, _ := resultEv["tool_output"].(string); output != summary {
+		t.Errorf("tool_result tool_output = %q, want the summary verbatim", output)
 	}
 	if resultEv["is_error"] == true {
 		t.Errorf("tool_result is_error = %v, want the command's own verdict: a summary with no exit-code line is not a failed command", resultEv["is_error"])
@@ -5305,19 +5300,19 @@ func TestRunSummaryHookReplacesTheToolResultOnTheWireAndInReplay(t *testing.T) {
 	if callEv["tool_target"] != "echo listed" {
 		t.Errorf("tool_call tool_target = %v, want the command the Model asked for", callEv["tool_target"])
 	}
-	for _, ev := range stdoutEvents(t, raw) {
+	for _, ev := range got.events {
 		if ev["kind"] == "error" {
-			t.Errorf("stdout carries an error event for a summarised call: %q", raw)
+			t.Errorf("stdout carries an error event for a summarised call: %q", got.stdout)
 		}
 	}
 
-	msgs := srv.messageBodies(t)
+	msgs := got.messageBodies(t)
 	if len(msgs) != 2 {
 		t.Fatalf("POSTs = %d, want 2", len(msgs))
 	}
 	want := recordedMessage{Role: "tool", Content: summary, ToolCallID: "call_s"}
-	if got := msgs[1][len(msgs[1])-1]; !reflect.DeepEqual(got, want) {
-		t.Errorf("replayed tool message = %+v, want %+v — the Model must read the summary, not the raw output", got, want)
+	if sent := msgs[1][len(msgs[1])-1]; !reflect.DeepEqual(sent, want) {
+		t.Errorf("replayed tool message = %+v, want %+v — the Model must read the summary, not the raw output", sent, want)
 	}
 }
 
@@ -5329,22 +5324,18 @@ func TestRunSummaryHookKeepsAFailingCommandVerdict(t *testing.T) {
 	summary := "SUMMARY: the command failed"
 	hook := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"`+summary+`"}}'`)
-	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
-
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo boom; exit 7\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a failing command is not a failing run); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo boom; exit 7\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"post":{"path":"`+hook+`"}}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failing command is not a failing run); stderr = %q", got.code, got.stderr)
 	}
-	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
-	if got, _ := resultEv["tool_output"].(string); got != summary {
-		t.Errorf("tool_result tool_output = %q, want the summary verbatim", got)
+	_, resultEv := toolPair(t, got.events)
+	if output, _ := resultEv["tool_output"].(string); output != summary {
+		t.Errorf("tool_result tool_output = %q, want the summary verbatim", output)
 	}
 	if resultEv["is_error"] != true {
 		t.Errorf("tool_result is_error = %v, want the command's own verdict: exit 7 failed whatever the summary says", resultEv["is_error"])
@@ -5359,35 +5350,30 @@ func TestRunFailingSummaryHookLeavesTheToolResultAlone(t *testing.T) {
 	hook := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY THAT NEVER LANDS"}}'
 exit 1`)
-	manifest := writeHookManifest(t, `{"post":{"path":"`+hook+`"}}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
-
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_f","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a broken summary hook is not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_f","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo listed\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"noted"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"post":{"path":"`+hook+`"}}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a broken summary hook is not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	_, resultEv := toolPair(t, stdoutEvents(t, raw))
-	if got, _ := resultEv["tool_output"].(string); got != "listed\nexit code: 0" {
-		t.Errorf("tool_result tool_output = %q, want the command's own output with its exit-code line", got)
+	_, resultEv := toolPair(t, got.events)
+	if output, _ := resultEv["tool_output"].(string); output != "listed\nexit code: 0" {
+		t.Errorf("tool_result tool_output = %q, want the command's own output with its exit-code line", output)
 	}
 	if resultEv["is_error"] == true {
 		t.Errorf("tool_result is_error = %v, want the command's own verdict of success", resultEv["is_error"])
 	}
-	for _, ev := range stdoutEvents(t, raw) {
+	for _, ev := range got.events {
 		if ev["kind"] == "error" {
-			t.Errorf("stdout carries an error event for a hook that merely failed to summarise: %q", raw)
+			t.Errorf("stdout carries an error event for a hook that merely failed to summarise: %q", got.stdout)
 		}
 	}
-	msgs := srv.messageBodies(t)
-	if got := msgs[1][len(msgs[1])-1].Content; got != "listed\nexit code: 0" {
-		t.Errorf("replayed tool message = %q, want the command's own output", got)
+	msgs := got.messageBodies(t)
+	if sent := msgs[1][len(msgs[1])-1].Content; sent != "listed\nexit code: 0" {
+		t.Errorf("replayed tool message = %q, want the command's own output", sent)
 	}
 }
 
@@ -5402,22 +5388,19 @@ func TestRunSummaryHookNeverSeesADeniedCall(t *testing.T) {
 	summary := writeGuardHookScript(t, "summarize.sh",
 		`cat > `+marker+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
-	manifest := writeHookManifest(t, `{"pre":[{"path":"`+deny+`"}],"post":{"path":"`+summary+`"}}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
-
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_n","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat ~/.ssh/id_ed25519\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	if code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath)); code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_n","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat ~/.ssh/id_ed25519\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"understood"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"pre":[{"path":"`+deny+`"}],"post":{"path":"`+summary+`"}}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	_, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	_, resultEv := toolPair(t, got.events)
 	want := "error: guard hook " + deny + " denied this command: credential path"
-	if got, _ := resultEv["tool_output"].(string); got != want {
-		t.Errorf("tool_result tool_output = %q, want the refusal verbatim %q", got, want)
+	if output, _ := resultEv["tool_output"].(string); output != want {
+		t.Errorf("tool_result tool_output = %q, want the refusal verbatim %q", output, want)
 	}
 	if resultEv["is_error"] != true {
 		t.Errorf("denied call tool_result is_error = %v, want true: %v", resultEv["is_error"], resultEv)
