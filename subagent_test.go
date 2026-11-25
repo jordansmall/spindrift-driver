@@ -241,50 +241,51 @@ func TestSubagentSpawnRunsTheAgentFileEntry(t *testing.T) {
 // the recorded sequence; and the first child is scripted to take two Model calls,
 // so a pair that ran side by side could not hide behind one request each.
 func TestSubagentSpawnServesTwoCallsInOneTurnSequentially(t *testing.T) {
-	agentsDir := t.TempDir()
-	writeAgentFile(t, agentsDir, "a-planner.md", "---\nname: planner\nmodel: m-planner\n---\nplan things\n")
-	writeAgentFile(t, agentsDir, "z-reviewer.md", "---\nname: reviewer\nmodel: m-reviewer\n---\nreview things\n")
-	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+agentsDir+`"}`)
+	// The specs are written planner-first so the index-prefixed Agent File names
+	// still sort opposite to the order the two calls ask for them in.
+	specs := []agentSpec{
+		{name: "planner", model: "m-planner", body: "plan things"},
+		{name: "reviewer", model: "m-reviewer", body: "review things"},
+	}
 
 	spawnCall := func(id, agent, task string) string {
 		return `{"id":"` + id + `","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"` + agent + `\",\"task\":\"` + task + `\"}"}}`
 	}
 	childShellTurn := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_shell","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf reviewer-step\"}"}}]}}]}`
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[`+
-			spawnCall("call_first", "reviewer", "review the diff")+","+
-			spawnCall("call_second", "planner", "plan the release")+`]}}]}`,
-		childShellTurn,
-		completion("first child answer"),
-		completion("second child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[` +
+				spawnCall("call_first", "reviewer", "review the diff") + "," +
+				spawnCall("call_second", "planner", "plan the release") + `]}}]}`),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(childShellTurn), replyCompletion(completion("first child answer"))},
+		"m-planner":  {replyCompletion(completion("second child answer"))},
+	}, "p",
+		withRoster(specs...),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
+	raw := string(got.stdout)
 
-	bodies := srv.requestBodies(t)
 	var order []string
-	for _, body := range bodies {
-		order = append(order, postedSpawn(t, body).Model)
+	for _, req := range got.requests {
+		order = append(order, postedSpawn(t, req.body).Model)
 	}
 	if want := []string{"m-parent", "m-reviewer", "m-reviewer", "m-planner", "m-parent"}; !reflect.DeepEqual(order, want) {
 		t.Fatalf("POST order = %v, want the parent, then every request of the first child, then every request of the second, then the parent's final turn; stdout = %q", order, raw)
 	}
-	for i, body := range bodies {
-		req := postedSpawn(t, body)
-		entry, named := map[string]string{"m-reviewer": "review things", "m-planner": "plan things"}[req.Model]
+	for i, req := range got.requests {
+		posted := postedSpawn(t, req.body)
+		entry, named := map[string]string{"m-reviewer": "review things", "m-planner": "plan things"}[posted.Model]
 		if !named {
 			continue
 		}
-		if got := req.Messages[0]; got.Role != "system" || got.Content != entry {
-			t.Errorf("POST %d sent model %q opens with %+v, want that entry's Agent File body", i, req.Model, got)
+		if msg := posted.Messages[0]; msg.Role != "system" || msg.Content != entry {
+			t.Errorf("POST %d sent model %q opens with %+v, want that entry's Agent File body", i, posted.Model, msg)
 		}
 	}
 
