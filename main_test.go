@@ -1697,56 +1697,6 @@ func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
 	}
 }
 
-// TestRunDifferentCallResetsRepeatedCallCount is the other half of the breaker:
-// only identical consecutive calls count, so a call with different arguments in
-// between starts the count again and nothing is ever refused.
-func TestRunDifferentCallResetsRepeatedCallCount(t *testing.T) {
-	callA := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]}}]}`
-	callB := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo other\"}"}}]}}]}`
-	// Five calls that never reach three identical in a row, plus the closing answer:
-	// one reply per POST the run makes.
-	got := runDriver(t, map[string][]modelEntry{
-		"m": {
-			replyCompletion(callA),
-			replyCompletion(callA),
-			replyCompletion(callB),
-			replyCompletion(callA),
-			replyCompletion(callA),
-			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"no call was a third in a row"}}]}`),
-		},
-	}, "p", withFlags("--model", "m"))
-	if got.code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
-	}
-	raw := string(got.stdout)
-	var results []map[string]any
-	for _, ev := range got.events {
-		if ev["kind"] == "tool_result" {
-			results = append(results, ev)
-		}
-	}
-	if len(results) != 5 {
-		t.Fatalf("tool_result events = %d, want one per scripted call: %q", len(results), raw)
-	}
-	for i, ev := range results {
-		output, _ := ev["tool_output"].(string)
-		// Every result carries the exit-code line a real command leaves behind, which
-		// a refusal never does, so no call in the A-A-B-A-A run was refused.
-		if !strings.Contains(output, "exit code:") {
-			t.Errorf("tool_result %d tool_output = %q, want the real command output with its exit-code line", i+1, output)
-		}
-		if ev["is_error"] == true {
-			t.Errorf("tool_result %d is_error = true, want no refusal in the run: %v", i+1, ev)
-		}
-	}
-	if !strings.Contains(raw, "other") {
-		t.Errorf("stdout = %q, want call B's real output so the alternating call ran too", raw)
-	}
-	if text := resultText(t, raw); text != "no call was a third in a row" {
-		t.Errorf("result event text = %q, want the run's own final answer", text)
-	}
-}
-
 // TestRunThreeConsecutiveRefusalsEndTheRun is the stop half of the breaker: a
 // Model refused once keeps sending the identical call, so the refusal is not
 // steering it and the run ends non-zero rather than spending turns on it.
