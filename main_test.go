@@ -5425,18 +5425,17 @@ func TestRunEditToolReplacesTextInFile(t *testing.T) {
 		t.Fatalf("write note: %v", err)
 	}
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"pkg/note.txt\",\"old_string\":\"target\",\"new_string\":\"replacement\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"edited the note"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"pkg/note.txt\",\"old_string\":\"target\",\"new_string\":\"replacement\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"edited the note"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	raw := string(got.stdout)
+	callEv, resultEv := toolPair(t, got.events)
 	want := filepath.Join(dir, "pkg", "note.txt")
 	for _, ev := range []map[string]any{callEv, resultEv} {
 		if ev["tool_name"] != "edit" {
@@ -5456,8 +5455,8 @@ func TestRunEditToolReplacesTextInFile(t *testing.T) {
 	if !strings.Contains(string(body), "replacement") || strings.Contains(string(body), "target") {
 		t.Errorf("file on disk = %q, want the new string in and the old string gone", body)
 	}
-	if got := resultText(t, raw); got != "edited the note" {
-		t.Errorf("result event text = %q, want the run's own final answer", got)
+	if text := resultText(t, raw); text != "edited the note" {
+		t.Errorf("result event text = %q, want the run's own final answer", text)
 	}
 }
 
@@ -5470,17 +5469,16 @@ func TestRunWriteToolCreatesFileWithParentsAndReportsThePath(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"created by the write tool\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"wrote the file"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"created by the write tool\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"wrote the file"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
-	callEv, resultEv := toolPair(t, stdoutEvents(t, stdout.String()))
+	callEv, resultEv := toolPair(t, got.events)
 	want := filepath.Join(dir, "out", "deep", "file.txt")
 	for _, ev := range []map[string]any{callEv, resultEv} {
 		if ev["tool_name"] != "write" {
@@ -5514,21 +5512,20 @@ func TestRunFileToolValidationFailureIsSyntheticErrorAndRunContinues(t *testing.
 		t.Fatalf("write note: %v", err)
 	}
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"a phrase that is absent\",\"new_string\":\"x\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"missed, so I will stop"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a failed edit is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"a phrase that is absent\",\"new_string\":\"x\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"missed, so I will stop"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a failed edit is a Tool Result, not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	if got := resultText(t, raw); got != "missed, so I will stop" {
-		t.Errorf("result event text = %q, want the run to have gone on and answered", got)
+	raw := string(got.stdout)
+	if text := resultText(t, raw); text != "missed, so I will stop" {
+		t.Errorf("result event text = %q, want the run to have gone on and answered", text)
 	}
-	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	_, resultEv := toolPair(t, got.events)
 	if resultEv["is_error"] != true {
 		t.Errorf("tool_result is_error = %v, want true for a failed edit: %v", resultEv["is_error"], resultEv)
 	}
@@ -5558,21 +5555,17 @@ func TestRunGuardHookDeniesEditToolCall(t *testing.T) {
 	}
 	hook := writeGuardHookScript(t, "deny.sh",
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
-	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
-
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"credential\",\"new_string\":\"public\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_e","type":"function","function":{"name":"edit","arguments":"{\"path\":\"note.txt\",\"old_string\":\"credential\",\"new_string\":\"public\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"pre":[{"path":"`+hook+`"}]}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	callEv, resultEv := toolPair(t, stdoutEvents(t, raw))
+	raw := string(got.stdout)
+	callEv, resultEv := toolPair(t, got.events)
 	// A refusal still reports the call the Model made: tool_target is resolved at
 	// plan time, before any hook was asked, so a denial cannot blank it.
 	if want := filepath.Join(dir, "note.txt"); callEv["tool_target"] != want {
@@ -5594,8 +5587,8 @@ func TestRunGuardHookDeniesEditToolCall(t *testing.T) {
 	if string(body) != original {
 		t.Errorf("file on disk = %q, want the original bytes: the refused edit ran anyway", body)
 	}
-	if got := resultText(t, raw); got != "told it was refused" {
-		t.Errorf("result event text = %q, want the run's own final answer", got)
+	if text := resultText(t, raw); text != "told it was refused" {
+		t.Errorf("result event text = %q, want the run's own final answer", text)
 	}
 }
 
@@ -5607,22 +5600,18 @@ func TestRunGuardHookDeniesWriteToolCall(t *testing.T) {
 	t.Chdir(dir)
 	hook := writeGuardHookScript(t, "deny.sh",
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
-	manifest := writeHookManifest(t, `{"pre":[{"path":"`+hook+`"}]}`)
-	cfgPath := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
 	want := filepath.Join(dir, "out", "deep", "file.txt")
 
-	srv := newScriptedChatServer(t,
-		`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"credential material\"}"}}]}}]}`,
-		`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`,
-	)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(cfgPath))
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", code, stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m": {
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_w","type":"function","function":{"name":"write","arguments":"{\"path\":\"out/deep/file.txt\",\"content\":\"credential material\"}"}}]}}]}`),
+			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"told it was refused"}}]}`),
+		},
+	}, "p", withFlags("--model", "m"), withHookManifest(`{"pre":[{"path":"`+hook+`"}]}`))
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 (a refusal is a Tool Result, not a run failure); stderr = %q", got.code, got.stderr)
 	}
-	raw := stdout.String()
-	_, resultEv := toolPair(t, stdoutEvents(t, raw))
+	_, resultEv := toolPair(t, got.events)
 	output, _ := resultEv["tool_output"].(string)
 	for _, want := range []string{"error: ", hook, "credential path"} {
 		if !strings.Contains(output, want) {
