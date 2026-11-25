@@ -388,11 +388,11 @@ type guardPresentation struct {
 // broken hook from an approving one. So is a rewriting hook's answer that rewrote
 // nothing — the same doubt about a hook that may have stopped answering halfway.
 //
-// Every refusal carries the "error: " prefix, which is what turns this string
-// into an error Tool Result downstream, and a refusal raised by a run names the
-// hook's path so the operator can find the script to ask why. The missing-jq
-// precondition below is the exception: it belongs to the guarded run rather than
-// to one hook, and each presentation words it for its own subject.
+// Every refusal carries the "error: " prefix, which is how a refusal reads to the
+// Model; the plan states the failure, not the prefix. A refusal raised by a run
+// names the hook's path so the operator can find the script to ask why. The
+// missing-jq precondition below is the exception: it belongs to the guarded run
+// rather than to one hook, and each presentation words it for its own subject.
 func guardThrough(hooks []guardHook, p guardPresentation, stderr io.Writer) (string, string) {
 	if len(hooks) == 0 {
 		// An unguarded run pays nothing: no marshalling, no fork, no wait — and no

@@ -1031,6 +1031,37 @@ func TestReadmeDocumentsFileTools(t *testing.T) {
 	if !strings.Contains(out, "error:") || !near(out, "wrote", "bytes", 240) {
 		t.Error("the tool_result bullet does not show a file Tool's sentence-shaped result (`wrote N bytes to <path>`, `edited <path>: replaced N matches`) and its error:-prefixed failures")
 	}
+	// The verdict is stated by the Tool, not read off the text — and the case that
+	// proves the difference is the Subagent Tool, whose text is a child's prose answer.
+	// A page still deriving is_error from wording tells a host that a child saying
+	// "error:" fails, which is the opposite of what the Driver now reports.
+	bullet := ""
+	if i := strings.Index(norm, "`tool_result` —"); i >= 0 {
+		bullet = norm[i:]
+		if j := strings.Index(bullet, "- `result`"); j > 0 {
+			bullet = bullet[:j]
+		}
+	}
+	if bullet == "" {
+		t.Fatal("the event-stream section has no `tool_result` bullet to pin")
+	}
+	if !near(bullet, "tool", "states", 160) || !near(bullet, "states", "verdict", 240) {
+		t.Error("the tool_result bullet does not say each Tool states the verdict that becomes is_error")
+	}
+	if !near(bullet, "subagent", "first word", 400) {
+		t.Error("the tool_result bullet does not say a Subagent Tool's verdict comes from the spawn and the handover rather than the child's answer")
+	}
+	// Scoped to the sentence that names the first word, so the breaker's "refused never
+	// ran" elsewhere in the bullet cannot stand in for the negation.
+	var unstated []string
+	for _, s := range sentencesContaining(bullet, "first word") {
+		if strings.Contains(s, "never") || strings.Contains(s, "not ") {
+			unstated = append(unstated, s)
+		}
+	}
+	if len(unstated) == 0 {
+		t.Error("the tool_result bullet does not say the first word of a child's answer is never what decides is_error")
+	}
 
 	sec := markdownSectionBody(string(raw), "guard hooks")
 	if sec == "" {
