@@ -182,15 +182,43 @@ func loadAgentDir(dir string) ([]agentEntry, error) {
 	return entries, nil
 }
 
-// offeredTools is the run's tool list, derived from the roster and nothing
-// else: an empty roster means the Model has no subagent it could name, so
-// offering the tool would only invite a call that cannot be honoured. bash and
-// the file Tools are always there, roster or not.
-func offeredTools(agents []agentEntry) []toolSpec {
-	if len(agents) == 0 {
-		return []toolSpec{bashTool, editTool, writeTool}
+// resolveTools is the one place a run's Tool set is decided, read off the
+// compiled table in nativeTools: an empty entry name is the top-level process,
+// which no Agent File limits, so it gets every Tool; any other entry gets only
+// what its frontmatter grants — a grant only restricts, it can never add to the
+// table (docs/adr/0006). Iterating the table rather than the grant list is what
+// puts the result in canonical order whatever order the file typed its grants in.
+func resolveTools(entry agentEntry, roster []agentEntry) toolSet {
+	unrestricted := entry.Name == ""
+	granted := make(map[string]bool, len(entry.Tools))
+	for _, name := range entry.Tools {
+		granted[name] = true
 	}
-	return []toolSpec{bashTool, editTool, writeTool, subagentToolFor(agents)}
+	// Asked once: the Subagent Tool's presence and the callers its listing names are
+	// one answer.
+	may := spawnable(entry.Name, roster)
+	var set toolSet
+	for _, native := range nativeTools {
+		// Offering the Subagent Tool with nobody to name invites a call that cannot be
+		// honoured — which is why a top-level run over an empty roster loses it too.
+		if native.name == "subagent" && len(may) == 0 {
+			continue
+		}
+		if !unrestricted && !granted[native.name] {
+			continue
+		}
+		set = append(set, resolvedTool{name: native.name, spec: native.spec(may), plan: native.plan})
+	}
+	// The floor: a run whose set holds nothing could do nothing at all, so a grant
+	// set that names no recognisable Tool still gets bash. A grant that does name
+	// one is taken literally, bash included or not.
+	if len(set) == 0 {
+		// Safe only while nativeTools holds a "bash" row — a missing row dereferences
+		// a nil spec mid-run, which TestNativeToolsAreTheCompiledFour pins.
+		bash, _ := nativeToolByName("bash")
+		set = append(set, resolvedTool{name: bash.name, spec: bash.spec(nil), plan: bash.plan})
+	}
+	return set
 }
 
 // spawnable is the roster subset one caller may hand work to. The empty name is
@@ -217,41 +245,6 @@ func spawnable(agent string, roster []agentEntry) []agentEntry {
 		}
 	}
 	return out
-}
-
-// toolsForEntry is the offer for a run selected by --agent: grants restrict the
-// canonical list and never add to it (docs/adr/0006): an unknown grant name
-// names no Tool, because no fifth Tool exists. The output follows the
-// canonical bash, edit, write, subagent order whatever order the file typed its
-// grants in, so what a server sees does not depend on how the frontmatter was
-// written.
-func toolsForEntry(entry agentEntry, roster []agentEntry) []toolSpec {
-	granted := make(map[string]bool, len(entry.Tools))
-	for _, name := range entry.Tools {
-		granted[name] = true
-	}
-	var tools []toolSpec
-	if granted["bash"] {
-		tools = append(tools, bashTool)
-	}
-	if granted["edit"] {
-		tools = append(tools, editTool)
-	}
-	if granted["write"] {
-		tools = append(tools, writeTool)
-	}
-	// Same reasoning offeredTools records: with nobody the caller may name,
-	// offering the Tool only invites a call that cannot be honoured.
-	if may := spawnable(entry.Name, roster); granted["subagent"] && len(may) > 0 {
-		tools = append(tools, subagentToolFor(may))
-	}
-	// The floor: a run with nothing recognisable in its offer could do nothing
-	// at all, so a grant set that names no Tool still gets bash. A grant that
-	// does name a Tool is taken literally, bash included or not.
-	if len(tools) == 0 {
-		tools = append(tools, bashTool)
-	}
-	return tools
 }
 
 // findAgent resolves a --agent name against the roster. The match is exact:

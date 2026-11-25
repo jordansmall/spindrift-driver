@@ -3451,7 +3451,7 @@ func TestParseArgsAbsentDefaultAgentsDir(t *testing.T) {
 	if len(cfg.agents) != 0 {
 		t.Errorf("agents = %+v, want none", cfg.agents)
 	}
-	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
+	if got := offeredNames(cfg.tools.specs()); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
 		t.Errorf("tools = %v, want [bash edit write]", got)
 	}
 }
@@ -3519,7 +3519,7 @@ func TestParseArgsLoadsRosterAndOffer(t *testing.T) {
 	if len(cfg.agents) != 2 || cfg.agents[0].Name != "alpha" || cfg.agents[1].Name != "beta" {
 		t.Errorf("agents = %+v, want [alpha beta] in file-name order", cfg.agents)
 	}
-	if got := offeredNames(cfg.tools); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
+	if got := offeredNames(cfg.tools.specs()); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
 		t.Errorf("tools = %v, want [bash edit write subagent]", got)
 	}
 }
