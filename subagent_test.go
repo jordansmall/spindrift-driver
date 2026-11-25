@@ -197,28 +197,27 @@ func (s *subagentReplyServer) requestBodies(t *testing.T) [][]byte {
 // is a whole Driver run started from the roster entry, so the model id goes out
 // verbatim and the Agent File body is what its conversation opens with.
 func TestSubagentSpawnRunsTheAgentFileEntry(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "top-level prompt",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"top-level prompt", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	sent := srv.requestBodies(t)
-	if len(sent) != 3 {
-		t.Fatalf("POSTs = %d, want parent, child, parent: %q", len(sent), stdout.String())
+	if len(got.requests) != 3 {
+		t.Fatalf("POSTs = %d, want parent, child, parent: %q", len(got.requests), got.stdout)
 	}
-	if got := postedSpawn(t, sent[0]).Model; got != "m-parent" {
-		t.Errorf("parent sent model %q, want the --model value", got)
+	if model := postedSpawn(t, got.requests[0].body).Model; model != "m-parent" {
+		t.Errorf("parent sent model %q, want the --model value", model)
 	}
-	child := postedSpawn(t, sent[1])
+	child := postedSpawn(t, got.requests[1].body)
 	if child.Model != "m-reviewer" {
 		t.Errorf("child sent model %q, want the Agent File model id verbatim", child.Model)
 	}
@@ -350,21 +349,21 @@ func TestSubagentSpawnServesTwoCallsInOneTurnSequentially(t *testing.T) {
 // inside the parent's tool_call/tool_result pair, attributed by role, and never
 // stamped as the parent's own.
 func TestSubagentRelaysChildEventsIntoParentStream(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	events := stdoutEvents(t, stdout.String())
+	events := stdoutEvents(t, string(got.stdout))
 	callIdx, resultIdx := -1, -1
 	for i, ev := range events {
 		if ev["tool_name"] == "subagent" && ev["in_subagent"] != true {
@@ -377,12 +376,12 @@ func TestSubagentRelaysChildEventsIntoParentStream(t *testing.T) {
 		}
 	}
 	if callIdx < 0 || resultIdx < 0 {
-		t.Fatalf("no subagent tool_call/tool_result pair in %q", stdout.String())
+		t.Fatalf("no subagent tool_call/tool_result pair in %q", got.stdout)
 	}
 
-	relayed := relayedEvents(t, stdout.String())
+	relayed := relayedEvents(t, string(got.stdout))
 	if len(relayed) == 0 {
-		t.Fatalf("no relayed child events in %q", stdout.String())
+		t.Fatalf("no relayed child events in %q", got.stdout)
 	}
 	// The whole child stream has to come across, closing result included: it is
 	// where a reader sums the child's usage from, and in_subagent is what keeps it
@@ -411,21 +410,21 @@ func TestSubagentRelaysChildEventsIntoParentStream(t *testing.T) {
 // TestSubagentToolResultNamesTheAgent: subagent and tool_target are what let a
 // reader see which roster entry produced a Tool Result.
 func TestSubagentToolResultNamesTheAgent(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	callEv, resultEv := spawnPair(t, stdout.String())
+	callEv, resultEv := spawnPair(t, string(got.stdout))
 	if got := callEv["tool_name"]; got != "subagent" {
 		t.Errorf("tool_call tool_name = %v, want subagent", got)
 	}
@@ -450,21 +449,21 @@ func TestSubagentToolResultNamesTheAgent(t *testing.T) {
 // still a child that answered, and no is_error may ride on it.
 func TestSubagentAnswerStartingLikeAFailureIsNotOne(t *testing.T) {
 	answer := "error: the build is broken in the second file"
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion(answer),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion(answer))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
 
-	_, resultEv := spawnPair(t, stdout.String())
+	_, resultEv := spawnPair(t, string(got.stdout))
 	if got := resultEv["tool_output"]; got != answer {
 		t.Errorf("tool_result tool_output = %v, want the child's answer verbatim", got)
 	}
@@ -476,24 +475,24 @@ func TestSubagentAnswerStartingLikeAFailureIsNotOne(t *testing.T) {
 // TestSubagentAnswerDoesNotBecomeParentResult keeps the two answers apart: the
 // child's answer is a Tool Result, the parent's is the run's result.
 func TestSubagentAnswerDoesNotBecomeParentResult(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
-	srv := newScriptedChatServer(t,
-		parentToolCallResponse,
-		completion("child answer"),
-		completion("parent answer"),
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
 	)
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	if got := parentResult(t, stdout.String())["text"]; got != "parent answer" {
-		t.Errorf("parent result text = %v, want the parent's own final answer", got)
+	if text := parentResult(t, string(got.stdout))["text"]; text != "parent answer" {
+		t.Errorf("parent result text = %v, want the parent's own final answer", text)
 	}
 	var childResultText any
-	for _, ev := range relayedEvents(t, stdout.String()) {
+	for _, ev := range relayedEvents(t, string(got.stdout)) {
 		if ev["kind"] == "result" {
 			childResultText = ev["text"]
 		}
@@ -503,7 +502,7 @@ func TestSubagentAnswerDoesNotBecomeParentResult(t *testing.T) {
 	}
 	// The child's answer reached the parent twice over: as the relayed prose and
 	// as the Tool Result the next turn reads.
-	if _, resultEv := spawnPair(t, stdout.String()); resultEv["tool_output"] != "child answer" {
+	if _, resultEv := spawnPair(t, string(got.stdout)); resultEv["tool_output"] != "child answer" {
 		t.Errorf("tool_output = %v, want the child's answer", resultEv["tool_output"])
 	}
 }
@@ -810,21 +809,24 @@ func TestSubagentTopLevelIsUnrestricted(t *testing.T) {
 // argv: without it reorderFlagsFirst would hand a dash-leading task to the last
 // flag as its value and the child would run the wrong prompt.
 func TestSubagentTaskStartingWithADashStaysPositional(t *testing.T) {
-	cfgPath := agentFixture(t, "reviewer", "m-reviewer", "review things")
 	call := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_s","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"reviewer\",\"task\":\"-not a flag- just a task\"}"}}]}}]}`
-	srv := newScriptedChatServer(t, call, completion("child answer"), completion("parent answer"))
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(call),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		withFlags("--model", "m-parent"),
+	)
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	sent := srv.requestBodies(t)
-	if len(sent) != 3 {
-		t.Fatalf("POSTs = %d, want parent, child, parent: stdout = %q stderr = %q", len(sent), stdout.String(), stderr.String())
+	if len(got.requests) != 3 {
+		t.Fatalf("POSTs = %d, want parent, child, parent: stdout = %q stderr = %q", len(got.requests), got.stdout, got.stderr)
 	}
-	child := postedSpawn(t, sent[1])
+	child := postedSpawn(t, got.requests[1].body)
 	if len(child.Messages) != 2 || child.Messages[1].Content != "-not a flag- just a task" {
 		t.Errorf("child messages = %+v, want the dash-leading task as the user prompt verbatim", child.Messages)
 	}
