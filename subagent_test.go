@@ -646,29 +646,30 @@ func spawnAgentCall(agent string) string {
 // name the entry does not name is refused as an ordinary Tool Result and starts
 // no process.
 func TestSubagentChildSpawnsOnlyItsOwn(t *testing.T) {
-	cfgPath := agentFixtureEntries(t,
-		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
-		agentSpec{name: "scout", model: "m-scout"},
-		agentSpec{name: "reviewer", model: "m-reviewer"},
-		agentSpec{name: "worker", model: "m-worker"},
-	)
-	callerArgs := func() []string {
-		return []string{"p", "--agent", "planner"}
+	specs := []agentSpec{
+		{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
+		{name: "scout", model: "m-scout"},
+		{name: "reviewer", model: "m-reviewer"},
+		{name: "worker", model: "m-worker"},
 	}
 
 	t.Run("spawns names the child it may run", func(t *testing.T) {
-		srv := newScriptedChatServer(t, spawnAgentCall("worker"), completion("child answer"), completion("parent answer"))
-		subagentEnv(t, cfgPath, srv.srv.URL)
-
-		var stdout, stderr bytes.Buffer
-		args := append(callerArgs(), "--base-url", srv.srv.URL)
-		code := run(args, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+		got := runDriver(t, map[string][]modelEntry{
+			"m-planner": {
+				replyCompletion(spawnAgentCall("worker")),
+				replyCompletion(completion("parent answer")),
+			},
+			"m-worker": {replyCompletion(completion("child answer"))},
+		}, "p",
+			withRoster(specs...),
+			withFlags("--agent", "planner"),
+		)
+		if got.code != 0 {
+			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 		}
-		raw := stdout.String()
-		if sent := srv.requestBodies(t); len(sent) != 3 {
-			t.Fatalf("POSTs = %d, want the caller's turn, the child's turn, the caller's final turn: stdout = %q", len(sent), raw)
+		raw := string(got.stdout)
+		if len(got.requests) != 3 {
+			t.Fatalf("POSTs = %d, want the caller's turn, the child's turn, the caller's final turn: stdout = %q", len(got.requests), raw)
 		}
 		relayed := relayedEvents(t, raw)
 		if len(relayed) == 0 {
@@ -692,23 +693,25 @@ func TestSubagentChildSpawnsOnlyItsOwn(t *testing.T) {
 	})
 
 	t.Run("a name spawns does not name is refused without spawning", func(t *testing.T) {
-		srv := newScriptedChatServer(t, spawnAgentCall("scout"), completion("parent answer"))
-		subagentEnv(t, cfgPath, srv.srv.URL)
-
-		var stdout, stderr bytes.Buffer
-		args := append(callerArgs(), "--base-url", srv.srv.URL)
-		code := run(args, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+		got := runDriver(t, map[string][]modelEntry{
+			"m-planner": {
+				replyCompletion(spawnAgentCall("scout")),
+				replyCompletion(completion("parent answer")),
+			},
+		}, "p",
+			withRoster(specs...),
+			withFlags("--agent", "planner"),
+		)
+		if got.code != 0 {
+			t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 		}
-		raw := stdout.String()
-		sent := srv.requestBodies(t)
-		if len(sent) != 2 {
-			t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(sent), raw)
+		raw := string(got.stdout)
+		if len(got.requests) != 2 {
+			t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(got.requests), raw)
 		}
-		for i, body := range sent {
-			if got := postedSpawn(t, body).Model; got != "m-planner" {
-				t.Errorf("POST %d sent model %q, want only the caller's model", i, got)
+		for i, req := range got.requests {
+			if model := postedSpawn(t, req.body).Model; model != "m-planner" {
+				t.Errorf("POST %d sent model %q, want only the caller's model", i, model)
 			}
 		}
 		if relayed := relayedEvents(t, raw); len(relayed) != 0 {
@@ -744,21 +747,24 @@ func TestSubagentChildSpawnsOnlyItsOwn(t *testing.T) {
 // Files that exist, so an entry whose spawns names only a missing file may spawn
 // nobody — and the refusal says so rather than naming an empty list.
 func TestSubagentSpawnOfAgentWithNoFileIsRefused(t *testing.T) {
-	cfgPath := agentFixtureEntries(t,
-		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "helper"},
-		agentSpec{name: "worker", model: "m-worker"},
+	got := runDriver(t, map[string][]modelEntry{
+		"m-planner": {
+			replyCompletion(spawnAgentCall("helper")),
+			replyCompletion(completion("parent answer")),
+		},
+	}, "p",
+		withRoster(
+			agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "helper"},
+			agentSpec{name: "worker", model: "m-worker"},
+		),
+		withFlags("--agent", "planner"),
 	)
-	srv := newScriptedChatServer(t, spawnAgentCall("helper"), completion("parent answer"))
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--agent", "planner", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
-	if sent := srv.requestBodies(t); len(sent) != 2 {
-		t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(sent), raw)
+	raw := string(got.stdout)
+	if len(got.requests) != 2 {
+		t.Fatalf("POSTs = %d, want the caller's two turns only — no spawn may be attempted: stdout = %q", len(got.requests), raw)
 	}
 	_, resultEv := spawnPair(t, raw)
 	out, _ := resultEv["tool_output"].(string)
@@ -780,21 +786,25 @@ func TestSubagentSpawnOfAgentWithNoFileIsRefused(t *testing.T) {
 // process, so no spawns field bounds it — it may name an entry another entry
 // cannot.
 func TestSubagentTopLevelIsUnrestricted(t *testing.T) {
-	cfgPath := agentFixtureEntries(t,
-		agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
-		agentSpec{name: "worker", model: "m-worker"},
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(spawnAgentCall("worker")),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-worker": {replyCompletion(completion("child answer"))},
+	}, "p",
+		withRoster(
+			agentSpec{name: "planner", model: "m-planner", tools: "bash, subagent", spawns: "worker"},
+			agentSpec{name: "worker", model: "m-worker"},
+		),
+		withFlags("--model", "m-parent"),
 	)
-	srv := newScriptedChatServer(t, spawnAgentCall("worker"), completion("child answer"), completion("parent answer"))
-	subagentEnv(t, cfgPath, srv.srv.URL)
-
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-parent", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, os.LookupEnv)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
 	}
-	raw := stdout.String()
-	if sent := srv.requestBodies(t); len(sent) != 3 {
-		t.Fatalf("POSTs = %d, want parent, child, parent: stdout = %q", len(sent), raw)
+	raw := string(got.stdout)
+	if len(got.requests) != 3 {
+		t.Fatalf("POSTs = %d, want parent, child, parent: stdout = %q", len(got.requests), raw)
 	}
 	callEv, resultEv := spawnPair(t, raw)
 	if resultEv["subagent"] != "worker" || callEv["tool_target"] != "worker" {
