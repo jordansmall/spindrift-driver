@@ -3547,8 +3547,8 @@ func TestParseArgsLoadsRosterAndOffer(t *testing.T) {
 }
 
 // TestParseArgsLoadsHookManifest: the Hook Manifest the Driver Config names is
-// read once at startup, so cfg.hooks carries exactly what the file said and in
-// manifest order, which is the order a later slice runs the hooks in.
+// read once at startup, so cfg.hooks.pre carries exactly what the file said and
+// in manifest order, which is the order the chain runs the hooks in.
 func TestParseArgsLoadsHookManifest(t *testing.T) {
 	manifest := writeHookManifest(t, `{
 	  "pre": [
@@ -3565,33 +3565,36 @@ func TestParseArgsLoadsHookManifest(t *testing.T) {
 		{path: "/lib/hooks/deny.sh", tools: []string{"Bash", "Write"}},
 		{path: "/lib/hooks/sanitize.sh", tools: []string{"Bash"}, rewrites: true},
 	}
-	if len(cfg.hooks) != len(want) {
-		t.Fatalf("hooks = %+v, want %d entries: %+v", cfg.hooks, len(want), want)
+	if cfg.hooks == nil {
+		t.Fatalf("hooks = nil, want the chain a configured manifest always builds")
+	}
+	if len(cfg.hooks.pre) != len(want) {
+		t.Fatalf("hooks.pre = %+v, want %d entries: %+v", cfg.hooks.pre, len(want), want)
 	}
 	// Run order is file order, so the comparison is positional on purpose.
 	for i, w := range want {
-		got := cfg.hooks[i]
+		got := cfg.hooks.pre[i]
 		if got.path != w.path || got.rewrites != w.rewrites || !reflect.DeepEqual(got.tools, w.tools) {
-			t.Errorf("hooks[%d] = %+v, want %+v", i, got, w)
+			t.Errorf("hooks.pre[%d] = %+v, want %+v", i, got, w)
 		}
 	}
 }
 
 // TestParseArgsLoadsHookManifestSummary: the one post-call entry is carried on
-// the config beside the pre-call list, so the slice that rewrites a Tool Result
-// has the script to run without reading the file twice. A manifest naming no
-// post entry leaves it nil, which is "nothing to summarise", not an error.
+// the run's chain beside its pre-call links, so the summary path has the script
+// to run without reading the file twice. A manifest naming no post entry leaves
+// it nil, which is "nothing to summarise", not an error.
 func TestParseArgsLoadsHookManifestSummary(t *testing.T) {
 	withSummary := writeHookManifest(t, `{"post":{"path":"/lib/hooks/summarize.sh","tools":["Bash"]}}`)
 	cfg, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(writeDriverConfig(t, `{"hook_manifest":"`+withSummary+`"}`)))
 	if err != nil {
 		t.Fatalf("parseArgs error = %v, want none for a well-formed manifest", err)
 	}
-	if cfg.summary == nil {
-		t.Fatalf("summary = nil, want the post-call entry")
+	if cfg.hooks.summary == nil {
+		t.Fatalf("hooks.summary = nil, want the post-call entry")
 	}
-	if cfg.summary.path != "/lib/hooks/summarize.sh" || !reflect.DeepEqual(cfg.summary.tools, []string{"Bash"}) {
-		t.Errorf("summary = %+v, want /lib/hooks/summarize.sh tools [Bash]", *cfg.summary)
+	if cfg.hooks.summary.path != "/lib/hooks/summarize.sh" || !reflect.DeepEqual(cfg.hooks.summary.tools, []string{"Bash"}) {
+		t.Errorf("hooks.summary = %+v, want /lib/hooks/summarize.sh tools [Bash]", *cfg.hooks.summary)
 	}
 
 	preOnly := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}]}`)
@@ -3599,22 +3602,27 @@ func TestParseArgsLoadsHookManifestSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs error = %v, want none for a manifest with no post entry", err)
 	}
-	if cfg.summary != nil {
-		t.Errorf("summary = %+v, want nil when the manifest names no post-call hook", *cfg.summary)
+	// A manifest naming only pre-call entries still builds the one chain value:
+	// it is the chain that answers "no summary", not the absence of one.
+	if cfg.hooks == nil {
+		t.Fatalf("hooks = nil, want a chain for a manifest that names pre-call hooks")
+	}
+	if cfg.hooks.summary != nil {
+		t.Errorf("hooks.summary = %+v, want nil when the manifest names no post-call hook", *cfg.hooks.summary)
 	}
 }
 
 // TestParseArgsNoHookManifestKeyGuardsNothing: the manifest is opt-in. With no
 // hook_manifest key the run is not pointed at a default file — cfg.hooks stays
-// empty, which is the state "nothing is guarded", never an error.
+// nil, which is the state "no Hook Manifest, nothing is guarded", never an error.
 func TestParseArgsNoHookManifestKeyGuardsNothing(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url":"http://named:9/v1"}`)
 	cfg, err := parseArgs([]string{"p", "--model", "m"}, nil, driverConfigEnv(path))
 	if err != nil {
 		t.Fatalf("parseArgs error = %v, want none when no manifest is configured", err)
 	}
-	if len(cfg.hooks) != 0 {
-		t.Errorf("hooks = %+v, want none", cfg.hooks)
+	if cfg.hooks != nil {
+		t.Errorf("hooks = %+v, want no chain when no manifest is configured", cfg.hooks)
 	}
 }
 

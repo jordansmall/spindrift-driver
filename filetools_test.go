@@ -484,7 +484,7 @@ func TestPlanWriteCallGuardHookDenies(t *testing.T) {
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
 	plan := planWriteCall(writeCall(`{"path":"secret.txt","content":"hunter2"}`), nil,
-		session{cfg: config{hooks: []guardHook{{path: script}}}})
+		session{cfg: config{hooks: chainOf(guardHook{path: script})}})
 	out := plan.run()
 
 	want := "error: guard hook " + script + " denied this command: credential path"
@@ -510,7 +510,7 @@ func TestPlanEditCallGuardHookDenies(t *testing.T) {
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
 	plan := planEditCall(editCall(`{"path":"notes.txt","old_string":"hunter2","new_string":"redacted"}`), nil,
-		session{cfg: config{hooks: []guardHook{{path: script}}}})
+		session{cfg: config{hooks: chainOf(guardHook{path: script})}})
 	out := plan.run()
 
 	if want := "error: guard hook " + script + " denied this command: credential path"; out != want {
