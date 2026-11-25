@@ -31,9 +31,9 @@ const envBaseURL = "SPINDRIFT_BASE_URL"
 const envAPIKey = "SPINDRIFT_API_KEY"
 
 // systemPrompt is hardcoded rather than assembled per run, so it names every Tool
-// the Driver can execute. offeredTools (agents.go) stays the authority on which of
-// them a given run may actually call: the subagent Tool is in the offer only when a
-// roster exists, and this prompt does not track that.
+// the Driver can execute. resolveTools (agents.go) stays the authority on which of
+// them a given run may actually call: the subagent Tool is in the set only when a
+// roster names somebody, and this prompt does not track that.
 const systemPrompt = "You are a coding agent working in this repository. " +
 	"The tools you have: bash runs a shell command in the working directory; " +
 	"edit replaces exact text in one file, and without replace_all that text must match exactly once; " +
@@ -56,10 +56,11 @@ type config struct {
 	// Agent Files", never an error.
 	agentsDir string
 	// agents is the roster loaded from agentsDir at startup, empty when there is
-	// none. tools is what this run offers the Model, derived from that roster by
-	// offeredTools so the offer and the roster cannot disagree later.
+	// none. tools is this run's resolved Tool set, decided once by resolveTools from
+	// the selected entry and that roster: it is what the Model is offered, and the
+	// same value bounds what the run may call.
 	agents []agentEntry
-	tools  []toolSpec
+	tools  toolSet
 	// hooks is the run's Guard chain, read from the Driver Config's hook_manifest
 	// once at startup. Unlike agentsDir the manifest has no home-relative
 	// default, so an absent key has nothing to fall back to, and a nil chain is
@@ -669,14 +670,10 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	if cfg.model == "" {
 		return config{}, errors.New("--model is required")
 	}
-	// The offer follows the caller: a run named by --agent gets exactly the Tools
-	// its entry grants, and the top-level process — which no Agent File limits —
-	// gets the whole set.
-	if self.Name != "" {
-		cfg.tools = toolsForEntry(self, cfg.agents)
-	} else {
-		cfg.tools = offeredTools(cfg.agents)
-	}
+	// Resolved once, and this is the only resolution: the set the run is offered is
+	// the set it may call, so a listing can never advertise a Tool the dispatcher
+	// would not find.
+	cfg.tools = resolveTools(self, cfg.agents)
 
 	prompt, err := promptFrom(positional, stdin)
 	if err != nil {
@@ -961,6 +958,84 @@ func subagentToolFor(entries []agentEntry) toolSpec {
 	spec := subagentTool
 	spec.Function.Description = subagentDescription(entries)
 	return spec
+}
+
+// nativeTool is one row of the compiled table of Tools this binary knows. The
+// table is the whole set: no Driver Config, Agent File or server response adds a
+// Tool, so a name absent from it names nothing any run can ever call. spec is a
+// function rather than a toolSpec because only the Subagent Tool's listing
+// depends on whom a run may spawn — every other row returns its package-level
+// var unchanged.
+type nativeTool struct {
+	name string
+	spec func(may []agentEntry) toolSpec
+	plan func(call toolCall, input any, s session) toolPlan
+}
+
+// nativeTools is every Tool the Driver can execute. The order is the canonical
+// one a resolved set comes out in, whatever order an Agent File typed its
+// grants, so what a server sees does not depend on how the frontmatter was
+// written.
+var nativeTools = []nativeTool{
+	{name: "bash", spec: func([]agentEntry) toolSpec { return bashTool }, plan: planBashCall},
+	{name: "edit", spec: func([]agentEntry) toolSpec { return editTool }, plan: planEditCall},
+	{name: "write", spec: func([]agentEntry) toolSpec { return writeTool }, plan: planWriteCall},
+	{name: "subagent", spec: subagentToolFor, plan: planSubagentCall},
+}
+
+// nativeToolByName resolves a name against the table. The answer separates "not
+// in this run's set" — a grant the run was never given — from "no such Tool at
+// all", which is the Model inventing a name, and the two need saying differently.
+func nativeToolByName(name string) (nativeTool, bool) {
+	for _, tool := range nativeTools {
+		if tool.name == name {
+			return tool, true
+		}
+	}
+	return nativeTool{}, false
+}
+
+// resolvedTool is one native Tool as one run holds it: the spec already carries
+// whom that run may name, and the planner sits beside it so the offer and the
+// dispatch lookup read one entry rather than two lists that can drift.
+type resolvedTool struct {
+	name string
+	spec toolSpec
+	plan func(call toolCall, input any, s session) toolPlan
+}
+
+// toolSet is one run's Tool set, resolved once at startup: the value the Model is
+// offered is the same value the run is bounded by, so no listing can advertise a
+// Tool the dispatcher would not find.
+type toolSet []resolvedTool
+
+// specs is the offer body — the tools field of the chat request.
+func (set toolSet) specs() []toolSpec {
+	specs := make([]toolSpec, 0, len(set))
+	for _, tool := range set {
+		specs = append(specs, tool.spec)
+	}
+	return specs
+}
+
+// lookup finds the Tool by the name the Model called it by.
+func (set toolSet) lookup(name string) (resolvedTool, bool) {
+	for _, tool := range set {
+		if tool.name == name {
+			return tool, true
+		}
+	}
+	return resolvedTool{}, false
+}
+
+// names lists the set's Tool names in set order, for a diagnostic that must show
+// the set without dumping four structs.
+func (set toolSet) names() []string {
+	names := make([]string, 0, len(set))
+	for _, tool := range set {
+		names = append(names, tool.name)
+	}
+	return names
 }
 
 // subagentDescription renders the entries one caller may spawn into the Tool
@@ -1333,16 +1408,13 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
-	// A config assembled anywhere but parseArgs has no offer of its own, and the
-	// bash-only offer is what predates the tool list, so it stays the default.
-	tools := cfg.tools
-	if len(tools) == 0 {
-		tools = []toolSpec{bashTool}
-	}
+	// The offer is the run's own set and nothing else: a config built anywhere but
+	// parseArgs resolved nothing, so it offers nothing rather than a list invented
+	// here — one offer per run, read from one place.
 	reqBody, err := json.Marshal(chatRequest{
 		Model:         cfg.model,
 		Messages:      messages,
-		Tools:         tools,
+		Tools:         cfg.tools.specs(),
 		Stream:        true,
 		StreamOptions: streamOptions{IncludeUsage: true},
 	})

@@ -431,26 +431,63 @@ func offeredNames(tools []toolSpec) []string {
 	return names
 }
 
-// TestOfferedTools: the Subagent Tool exists in the offer only when there is a
-// roster to delegate to — an empty roster must never offer a call that has no
-// subagent to answer it.
-func TestOfferedTools(t *testing.T) {
-	if got := offeredNames(offeredTools(nil)); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
-		t.Errorf("offeredTools(nil) = %v, want [bash edit write]", got)
+// TestResolveTools: one resolution produces the run's Tool set. The Subagent
+// Tool is in it only when there is somebody to name — an offer with no subagent
+// behind it would only invite a call that cannot be honoured — and grants
+// restrict the compiled table without ever adding to it.
+func TestResolveTools(t *testing.T) {
+	roster := []agentEntry{
+		{Name: "planner", Model: "m", Spawns: []string{"worker"}},
+		{Name: "quiet", Model: "m"},
+		{Name: "wide", Model: "m", Spawns: []string{"ghost"}},
+		{Name: "worker", Model: "m"},
 	}
-	if got := offeredNames(offeredTools([]agentEntry{})); !reflect.DeepEqual(got, []string{"bash", "edit", "write"}) {
-		t.Errorf("offeredTools(empty slice) = %v, want [bash edit write]", got)
+	tests := []struct {
+		name   string
+		entry  agentEntry
+		roster []agentEntry
+		want   []string
+	}{
+		{"top level with no roster", agentEntry{}, nil, []string{"bash", "edit", "write"}},
+		{"top level with a roster", agentEntry{}, roster, []string{"bash", "edit", "write", "subagent"}},
+		{"grants keep canonical order", agentEntry{Name: "editor", Model: "m", Tools: []string{"write", "bash", "edit"}}, roster, []string{"bash", "edit", "write"}},
+		{"bash alone stays bash", agentEntry{Name: "shell", Model: "m", Tools: []string{"bash"}}, roster, []string{"bash"}},
+		{"no tools granted is the bash floor", agentEntry{Name: "quiet", Model: "m"}, roster, []string{"bash"}},
+		{"unknown grant names no Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "read"}}, roster, []string{"bash"}},
+		{"unknown grant names cannot reach a fifth Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"read", "web"}}, roster, []string{"bash"}},
+		{"subagent granted with someone to name", agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "bash"}}, roster, []string{"bash", "subagent"}},
+		{"subagent grant whose spawns name only unknown agents", agentEntry{Name: "wide", Model: "m", Tools: []string{"bash", "subagent"}}, roster, []string{"bash"}},
+		{"subagent grant with no spawns field names nobody", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "subagent"}}, roster, []string{"bash"}},
 	}
-	roster := []agentEntry{{Name: "reviewer", Model: "m-r"}}
-	if got := offeredNames(offeredTools(roster)); !reflect.DeepEqual(got, []string{"bash", "edit", "write", "subagent"}) {
-		t.Errorf("offeredTools(roster) = %v, want [bash edit write subagent]", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveTools(tc.entry, tc.roster).names(); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("resolveTools(%+v) = %v, want %v", tc.entry, got, tc.want)
+			}
+		})
 	}
-	// bash, edit, and write are the package-level specs themselves, not copies
-	// that can drift from the shape the Model is taught; only the subagent spec
-	// is rebuilt, to carry this roster in its description. toolSpec carries a
-	// map, so DeepEqual is the only comparison available.
-	if got, want := offeredTools(roster), []toolSpec{bashTool, editTool, writeTool, subagentToolFor(roster)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("offeredTools(roster) = %+v, want %+v", got, want)
+
+	// The set holds the table's own specs, not copies that can drift from the
+	// shape the Model is taught; only the Subagent Tool differs, because its
+	// listing is per-caller. toolSpec carries a map, so DeepEqual is the only
+	// comparison available.
+	if got, want := resolveTools(agentEntry{}, nil).specs(), []toolSpec{bashTool, editTool, writeTool}; !reflect.DeepEqual(got, want) {
+		t.Errorf("top-level specs() = %+v, want %+v", got, want)
+	}
+	topRoster := []agentEntry{{Name: "reviewer", Model: "m-r"}}
+	if got, want := resolveTools(agentEntry{}, topRoster).specs(), []toolSpec{bashTool, editTool, writeTool, subagentToolFor(topRoster)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("top-level specs() with roster = %+v, want %+v", got, want)
+	}
+	full := resolveTools(agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "write", "edit", "bash"}}, roster)
+	if want := []toolSpec{bashTool, editTool, writeTool, subagentToolFor(spawnable("planner", roster))}; !reflect.DeepEqual(full.specs(), want) {
+		t.Errorf("full grant specs() = %+v, want %+v", full.specs(), want)
+	}
+
+	// The Subagent Tool in the set tells this caller whom it may name, which is
+	// why its spec is built per run rather than shared.
+	child := resolveTools(agentEntry{Name: "planner", Model: "m", Tools: []string{"bash", "subagent"}}, roster)
+	if got, want := subagentSpecIn(t, child.specs()).Function.Description, subagentToolFor(spawnable("planner", roster)).Function.Description; got != want {
+		t.Errorf("child subagent description = %q, want the spawnable listing %q", got, want)
 	}
 }
 
@@ -502,49 +539,6 @@ func TestSpawnable(t *testing.T) {
 	}
 }
 
-// TestToolsForEntry: a grant restricts the offer and never adds to it, the offer
-// comes out in the canonical order whatever order the file typed the grants in,
-// and an unknown grant name names no Tool at all.
-func TestToolsForEntry(t *testing.T) {
-	// The subagent leg asks the roster who the caller may name, so the fixture
-	// varies that answer by name rather than by the entry handed in.
-	roster := []agentEntry{
-		{Name: "planner", Model: "m", Spawns: []string{"worker"}},
-		{Name: "quiet", Model: "m"},
-		{Name: "wide", Model: "m", Spawns: []string{"ghost"}},
-		{Name: "worker", Model: "m"},
-	}
-	tests := []struct {
-		name  string
-		entry agentEntry
-		want  []string
-	}{
-		{"no tools granted is the bash floor", agentEntry{Name: "quiet", Model: "m"}, []string{"bash"}},
-		{"grants keep canonical order", agentEntry{Name: "editor", Model: "m", Tools: []string{"write", "bash", "edit"}}, []string{"bash", "edit", "write"}},
-		{"bash alone stays bash", agentEntry{Name: "shell", Model: "m", Tools: []string{"bash"}}, []string{"bash"}},
-		{"subagent with someone to name", agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "bash"}}, []string{"bash", "subagent"}},
-		{"subagent grant whose spawns name only unknown agents", agentEntry{Name: "wide", Model: "m", Tools: []string{"bash", "subagent"}}, []string{"bash"}},
-		{"subagent grant with no spawns field names nobody", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "subagent"}}, []string{"bash"}},
-		{"unknown grant names no Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"bash", "read"}}, []string{"bash"}},
-		{"unknown grant names cannot reach a fifth Tool", agentEntry{Name: "quiet", Model: "m", Tools: []string{"read", "web"}}, []string{"bash"}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := offeredNames(toolsForEntry(tc.entry, roster))
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("toolsForEntry(%+v) = %v, want %v", tc.entry, got, tc.want)
-			}
-		})
-	}
-
-	// The offer is the package-level specs themselves — the Subagent Tool's spec
-	// except for the roster-derived description, which is per-caller.
-	full := toolsForEntry(agentEntry{Name: "planner", Model: "m", Tools: []string{"subagent", "write", "edit", "bash"}}, roster)
-	if want := []toolSpec{bashTool, editTool, writeTool, subagentToolFor(spawnable("planner", roster))}; !reflect.DeepEqual(full, want) {
-		t.Errorf("toolsForEntry(full grant) = %+v, want %+v", full, want)
-	}
-}
-
 // subagentSpecIn picks the Subagent Tool out of an offer so a test can read the
 // description a caller is actually shown.
 func subagentSpecIn(t *testing.T, tools []toolSpec) toolSpec {
@@ -583,7 +577,7 @@ func TestSubagentToolDescription(t *testing.T) {
 		{Name: "planner", Model: "m", Description: "plan the work", Tools: []string{"bash", "subagent"}, Spawns: []string{"worker"}},
 		{Name: "worker", Model: "m", Description: "carry out one step"},
 	}
-	if got, want := subagentSpecIn(t, toolsForEntry(childRoster[0], childRoster)).Function.Description, base+" Agents this run may spawn: worker (carry out one step)."; got != want {
+	if got, want := subagentSpecIn(t, resolveTools(childRoster[0], childRoster).specs()).Function.Description, base+" Agents this run may spawn: worker (carry out one step)."; got != want {
 		t.Errorf("child subagent description = %q, want %q", got, want)
 	}
 
