@@ -56,6 +56,8 @@ type runSettings struct {
 	// stdoutFile, when set, is where the run's event stream goes instead of the
 	// helper's buffer, because something running during the run reads it there.
 	stdoutFile string
+	// now is the clock the run stamps and measures with; nil means the wall clock.
+	now func() int64
 }
 
 // withFlags appends extra Driver flags after the prompt in argv — --model,
@@ -94,6 +96,14 @@ func withHookManifest(contents string) runOption {
 // are that file read back once the run returns.
 func withStdoutFile(path string) runOption {
 	return func(s *runSettings) { s.stdoutFile = path }
+}
+
+// withClock runs the Driver on a clock the caller built rather than the wall
+// clock, so the stamps and the durations one run reports land on a grid the test
+// names — the in-process counterpart of the $SPINDRIFT_TEST_NOW_MS pin a spawned
+// child Driver gets.
+func withClock(now func() int64) runOption {
+	return func(s *runSettings) { s.now = now }
 }
 
 // completeConfigTimeout is the helper's own idle bound, deliberately not the
@@ -153,7 +163,11 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 		defer f.Close()
 		outFile, out = f, f
 	}
-	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv)
+	now := st.now
+	if now == nil {
+		now = realNowMS
+	}
+	code := runWithClock(now, append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv)
 	srv.checkNoUnscriptedRequests(t)
 
 	raw := stdout.String()

@@ -1069,7 +1069,7 @@ func TestSubagentRelayDrainsAfterOverLongLine(t *testing.T) {
 // every field the child wrote survives (an event struct drops what it lacks).
 func TestSubagentRelayFunctionKeepsTheChildTimestamp(t *testing.T) {
 	var out bytes.Buffer
-	relayChildEvent(eventWriter{w: &out}, newRunTally())("reviewer", "text", relayedEventFields(map[string]string{
+	relayChildEvent(eventWriter{w: &out, now: realNowMS}, newRunTally())("reviewer", "text", relayedEventFields(map[string]string{
 		"kind":       `"text"`,
 		"timestamp":  `1234567890123`,
 		"message_id": `"msg-1"`,
@@ -1098,7 +1098,7 @@ func TestSubagentRelayFunctionFoldsUsageIntoTheTally(t *testing.T) {
 	var out bytes.Buffer
 	tally := newRunTally()
 
-	relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "usage", relayedUsageFields(`{"input":7,"output":1,"cost_usd":0.25}`, `"m-reviewer"`))
+	relayChildEvent(eventWriter{w: &out, now: realNowMS}, tally)("reviewer", "usage", relayedUsageFields(`{"input":7,"output":1,"cost_usd":0.25}`, `"m-reviewer"`))
 
 	if got, want := tally.totals(), (tokenTotals{Input: 7, Output: 1, CostUSD: 0.25}); got != want {
 		t.Errorf("totals() = %+v, want the relayed usage projected as %+v", got, want)
@@ -1118,7 +1118,7 @@ func TestSubagentRelayFunctionFoldsNothingFromANonUsageLine(t *testing.T) {
 	var out bytes.Buffer
 	tally := newRunTally()
 
-	relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "result", relayedEventFields(map[string]string{
+	relayChildEvent(eventWriter{w: &out, now: realNowMS}, tally)("reviewer", "result", relayedEventFields(map[string]string{
 		"kind":      `"result"`,
 		"timestamp": `1`,
 		"tokens":    `{"input":9000,"output":9}`,
@@ -1144,7 +1144,7 @@ func TestSubagentRelayFunctionFoldsNothingFromUnusableUsageTokens(t *testing.T) 
 		var out bytes.Buffer
 		tally := newRunTally()
 
-		relayChildEvent(eventWriter{w: &out}, tally)("reviewer", "usage", relayedUsageFields(tokens, `"m-reviewer"`))
+		relayChildEvent(eventWriter{w: &out, now: realNowMS}, tally)("reviewer", "usage", relayedUsageFields(tokens, `"m-reviewer"`))
 
 		if got := tally.totals(); got != (tokenTotals{}) {
 			t.Errorf("tokens %q: totals() = %+v, want nothing folded", tokens, got)
@@ -1163,7 +1163,7 @@ func TestSubagentRelayFunctionFoldsNothingFromUnusableUsageTokens(t *testing.T) 
 // order and the child's values, one object per line.
 func TestSubagentRelayFunctionWritesOneLineInItsOwnKeyOrder(t *testing.T) {
 	var out bytes.Buffer
-	relay := relayChildEvent(eventWriter{w: &out}, newRunTally())
+	relay := relayChildEvent(eventWriter{w: &out, now: realNowMS}, newRunTally())
 
 	relay("reviewer", "usage", relayedUsageFields(`{"input":7,"output":1}`, `"m-reviewer"`))
 	relay("planner", "text", relayedEventFields(map[string]string{"kind": `"text"`, "timestamp": `2`}))
@@ -1179,7 +1179,7 @@ func TestSubagentRelayFunctionWritesOneLineInItsOwnKeyOrder(t *testing.T) {
 // rather than through a whole run: the tally it hands the relay is how such a test
 // reads back what a child's lines were charged.
 func relaySession(out, errOut io.Writer, tally *runTally) session {
-	return session{stderr: errOut, relay: relayChildEvent(eventWriter{w: out}, tally)}
+	return session{stderr: errOut, relay: relayChildEvent(eventWriter{w: out, now: realNowMS}, tally)}
 }
 
 // withUsage attaches a model id and one Model call's usage to a scripted

@@ -7,13 +7,11 @@ import (
 	"time"
 )
 
-// nowMS is the Driver's only clock: event timestamps and the durations
-// derived from them are read through this package var so tests can pin a
-// fixed value — without a clock seam the golden Pass log could never compare
-// byte for byte (same injection idiom as bashToolMaxOutput and
-// chatRetryAttempts). Exposed as epoch milliseconds because that is the unit
-// the canonical event timestamp carries.
-var nowMS = func() int64 { return time.Now().UnixMilli() }
+// realNowMS is the Driver's wall clock in epoch milliseconds, the unit the
+// canonical event timestamp carries. It is handed to a module when it is built
+// rather than read from a package global: a var a test reassigns is state no
+// run owns, and a byte-comparable Pass log needs one clock per run.
+func realNowMS() int64 { return time.Now().UnixMilli() }
 
 // event is one JSONL line of the Driver's stdout: the canonical event of
 // issue #19, carrying only the fields the seven non-result kinds this Driver
@@ -116,10 +114,16 @@ func (t tokenTotals) add(o tokenTotals) tokenTotals {
 // HTML escaping is switched off: assistant prose and tool output keep '<',
 // '>' and '&' literally on the wire, and JSON's mandatory escaping still
 // covers the line-separator characters that would otherwise break a line.
-type eventWriter struct{ w io.Writer }
+// now is this writer's clock, stated once when the writer is built: every line
+// one run emits is stamped on the same clock, and a writer built without one
+// stamps nothing but a nil dereference.
+type eventWriter struct {
+	w   io.Writer
+	now func() int64
+}
 
 func (ew eventWriter) emit(e event) error {
-	e.Timestamp = nowMS()
+	e.Timestamp = ew.now()
 	return ew.encode(e)
 }
 
@@ -127,7 +131,7 @@ func (ew eventWriter) emit(e event) error {
 // than an event so the always-present result fields cannot be dropped by an
 // omitempty meant for the kinds that leave them unset.
 func (ew eventWriter) emitResult(p resultPayload) error {
-	p.Timestamp = nowMS()
+	p.Timestamp = ew.now()
 	return ew.encode(p)
 }
 
