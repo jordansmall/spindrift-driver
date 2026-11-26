@@ -628,7 +628,7 @@ func runHookScript(path string, payload []byte, stderr io.Writer, limits hookLim
 	} else {
 		cmd.Stderr = stderr
 	}
-	// No cmd.Dir and no cmd.Env, following runBashTool: the hook judges the
+	// No cmd.Dir and no cmd.Env, following the Bash Tool's run: the hook judges the
 	// command in the same cwd and environment the command is about to run in.
 	// Kill the whole group, not just the hook: a grandchild the hook detached
 	// would outlive a bare kill of the hook and keep the output pipes open, which
@@ -637,7 +637,7 @@ func runHookScript(path string, payload []byte, stderr io.Writer, limits hookLim
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	// WaitDelay for the reason runBashTool gives: a grandchild the hook detached
+	// WaitDelay for the reason the Bash Tool's run gives: a grandchild the hook detached
 	// can survive the kill holding the output pipes, and Wait would block on
 	// their EOF forever — a fired bound that never produces a refusal.
 	cmd.WaitDelay = time.Second
@@ -647,7 +647,7 @@ func runHookScript(path string, payload []byte, stderr io.Writer, limits hookLim
 	err := cmd.Wait()
 	if ctx.Err() != nil {
 		// Judged before err, so the kill the bound fired reads as a timeout and not
-		// as the signal death it was. The accepted race runBashTool documents
+		// as the signal death it was. The accepted race the Bash Tool documents
 		// applies here too: a hook that finished between Wait and this check is
 		// reported as timed out.
 		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", path, limits.timeout)
@@ -742,8 +742,8 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 // which is the loss this function exists to prevent.
 //
 // A replacement is capped by toolOutputCap, the output bound of the Tool whose
-// result is being replaced — runBashTool's own — which the caller passes because
-// that bound belongs to the Tool rather than here. A hook that summarises upwards
+// result is being replaced — the cap that Bash Tool was built with — which the
+// caller passes because that bound belongs to the Tool rather than here. A hook that summarises upwards
 // cannot hand the Model a longer result than the command itself was allowed.
 // Nothing re-appends the exit-code line: the replacement is the Tool Result
 // verbatim, and planToolCall keeps the
@@ -770,7 +770,7 @@ func (c *guardChain) summarize(driverTool, command, output string, stderr io.Wri
 	if summary == "" {
 		return output
 	}
-	return truncateToolOutputTo(summary, toolOutputCap)
+	return truncateToolOutput(summary, toolOutputCap)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

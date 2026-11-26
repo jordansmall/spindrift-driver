@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 	// that turns it into one has to sit ahead of every flag parse too — the child
 	// is handed the Driver's argv, never a test flag set.
 	if os.Getenv(subagentHelperEnv) == "1" {
-		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, childClockFromEnv(os.LookupEnv, realNowMS)))
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, childClockFromEnv(os.LookupEnv, realNowMS), newBashLimits()))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
 	// built argv rather than os.Args, so the test binary has no other flag set, and
@@ -1526,16 +1526,14 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	// pipes, and the Tool Result message the next request carries must be
 	// the tail-truncated form — marker, bounded length, tail preserved,
 	// exit-code line last.
-	old := bashToolMaxOutput
-	bashToolMaxOutput = 256
-	defer func() { bashToolMaxOutput = old }()
+	const maxOutput = 256
 
 	got := runDriver(t, map[string][]modelEntry{
 		"m": {
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_g","type":"function","function":{"name":"bash","arguments":"{\"command\":\"seq 1 100000\"}"}}]}}]}`),
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"truncation acknowledged"}}]}`),
 		},
-	}, "flood", withFlags("--model", "m"))
+	}, "flood", withFlags("--model", "m"), withToolOutputCap(maxOutput))
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0 (truncation must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
@@ -1550,10 +1548,10 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 	if tool.Role != "tool" || tool.ToolCallID != "call_g" {
 		t.Errorf("tool result message = %+v, want role tool with tool_call_id call_g", tool)
 	}
-	if len(tool.Content) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
-		t.Errorf("tool content = %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(tool.Content), bashToolMaxOutput)
+	if len(tool.Content) > maxOutput+len(truncatedOutputMarker(maxOutput))+64 {
+		t.Errorf("tool content = %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(tool.Content), maxOutput)
 	}
-	if !strings.Contains(tool.Content, truncatedOutputMarker(bashToolMaxOutput)) {
+	if !strings.Contains(tool.Content, truncatedOutputMarker(maxOutput)) {
 		t.Errorf("tool content = %q, want the truncation marker", tool.Content)
 	}
 	if !strings.HasSuffix(tool.Content, "exit code: 0") {
@@ -1571,20 +1569,18 @@ func TestRunLoopDeliversTruncatedToolOutput(t *testing.T) {
 }
 
 func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
-	// Process-boundary proof: a real `sleep 30` subprocess outlives the
-	// injected short timeout, gets killed, and the Driver keeps looping —
-	// the next request must carry the timeout as an ordinary Tool Result
+	// Process-boundary proof: a real `sleep 30` subprocess outlives the short
+	// timeout this Tool was built with, gets killed, and the Driver keeps
+	// looping — the next request must carry the timeout as an ordinary Tool Result
 	// message, and the scripted final answer must still be reached.
-	old := bashToolTimeout
-	bashToolTimeout = 200 * time.Millisecond
-	defer func() { bashToolTimeout = old }()
+	const timeout = 200 * time.Millisecond
 
 	got := runDriver(t, map[string][]modelEntry{
 		"m": {
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_t","type":"function","function":{"name":"bash","arguments":"{\"command\":\"sleep 30\"}"}}]}}]}`),
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered from timeout"}}]}`),
 		},
-	}, "hang up", withFlags("--model", "m"))
+	}, "hang up", withFlags("--model", "m"), withToolTimeout(timeout))
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0 (timeout must not crash the loop); stderr = %q", got.code, got.stderr)
 	}
@@ -1599,8 +1595,8 @@ func TestRunLoopContinuesAfterToolTimeout(t *testing.T) {
 	if tool.Role != "tool" || tool.ToolCallID != "call_t" {
 		t.Errorf("tool result message = %+v, want role tool with tool_call_id call_t", tool)
 	}
-	if !strings.Contains(tool.Content, "timed out after 200ms") {
-		t.Errorf("tool content = %q, want it to carry the timeout wording naming the injected duration", tool.Content)
+	if want := fmt.Sprintf("timed out after %s", timeout); !strings.Contains(tool.Content, want) {
+		t.Errorf("tool content = %q, want it to carry the timeout wording naming the Tool's own timeout", tool.Content)
 	}
 }
 
@@ -1687,7 +1683,7 @@ func TestRunThirdConsecutiveIdenticalCallIsRefused(t *testing.T) {
 		}
 	}
 	refusal, _ := results[2]["tool_output"].(string)
-	// No exit-code line is the proof the command never started: runBashTool puts
+	// No exit-code line is the proof the command never started: the Bash Tool puts
 	// that line on everything it executes, success and failure alike.
 	if strings.Contains(refusal, "exit code:") {
 		t.Errorf("third tool_output = %q, want no exit-code line because the refused call never ran", refusal)
@@ -1964,7 +1960,7 @@ func TestRunClockIsAParameter(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, fixedClock(pinned))
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, fixedClock(pinned), newBashLimits())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
 	}
@@ -1992,7 +1988,7 @@ func TestRunUnreachableEmitsRawDialErrorEvent(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 when the endpoint refuses connections; stderr = %q", code, stderr.String())
 	}
@@ -2021,7 +2017,7 @@ func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the endpoint refuses connections; stderr = %q", stderr.String())
 	}
@@ -2294,7 +2290,7 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2342,7 +2338,7 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2379,7 +2375,7 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	// The queue holds the one drop entry and chatRetryAttempts is 1, so a second
 	// POST would be an unscripted request -- and runDriver, which checks this for
 	// its callers, is not in play here.
@@ -2424,7 +2420,7 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2527,7 +2523,7 @@ func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 
 	if elapsed < time.Duration(chunks)*gap {
@@ -2583,7 +2579,7 @@ func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2630,7 +2626,7 @@ func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2814,7 +2810,7 @@ func TestRunEmptyResponse(t *testing.T) {
 // parse error — no driver prefix, no wrapping.
 func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a usage error; stderr = %q", code, stderr.String())
 	}
@@ -2828,7 +2824,7 @@ func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 
 func TestRunMissingModel(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code == 0 {
 		t.Fatal("run with missing --model should exit non-zero")
 	}
@@ -2842,7 +2838,7 @@ func TestRunMissingModel(t *testing.T) {
 
 func TestRunEmptyPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code == 0 {
 		t.Fatal("run with empty prompt should exit non-zero")
 	}
@@ -4404,7 +4400,7 @@ func TestRunResponseEndingInNewline(t *testing.T) {
 // JSONL on every exit path, so the usage text itself belongs on stderr.
 func TestRunHelpExitsZeroWithUsageOnStderr(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
+	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 for -h", code)
 	}
@@ -4427,40 +4423,40 @@ func TestParseArgsPositionalPromptNotTrimmed(t *testing.T) {
 }
 
 func TestRunBashToolSuccess(t *testing.T) {
-	result := runBashTool("echo hello").text
+	result := newBashLimits().run("echo hello").text
 	want := "hello\nexit code: 0"
 	if result != want {
-		t.Errorf("runBashTool(echo hello) = %q, want %q", result, want)
+		t.Errorf("newBashLimits().run(echo hello) = %q, want %q", result, want)
 	}
 }
 
 func TestRunBashToolFailureIsResultNotError(t *testing.T) {
 	// A non-zero exit is ordinary tool output for the model, not a Go error.
-	result := runBashTool("echo before; exit 3").text
+	result := newBashLimits().run("echo before; exit 3").text
 	want := "before\nexit code: 3"
 	if result != want {
-		t.Errorf("runBashTool(echo before; exit 3) = %q, want %q", result, want)
+		t.Errorf("newBashLimits().run(echo before; exit 3) = %q, want %q", result, want)
 	}
 }
 
 func TestRunBashToolStatesFailureFromExitStatus(t *testing.T) {
 	// The verdict is the Tool's own statement rather than something a caller reads
 	// back out of the text: a non-zero exit failed, a clean exit did not.
-	if got := runBashTool("printf x; exit 3"); !got.failed {
-		t.Errorf("runBashTool(printf x; exit 3).failed = %v, want true", got.failed)
+	if got := newBashLimits().run("printf x; exit 3"); !got.failed {
+		t.Errorf("newBashLimits().run(printf x; exit 3).failed = %v, want true", got.failed)
 	}
-	if got := runBashTool("printf x"); got.failed {
-		t.Errorf("runBashTool(printf x).failed = %v, want false", got.failed)
+	if got := newBashLimits().run("printf x"); got.failed {
+		t.Errorf("newBashLimits().run(printf x).failed = %v, want false", got.failed)
 	}
 }
 
 func TestRunBashToolIncludesStderr(t *testing.T) {
-	result := runBashTool("echo out; echo err >&2").text
+	result := newBashLimits().run("echo out; echo err >&2").text
 	if !strings.Contains(result, "out") || !strings.Contains(result, "err") {
-		t.Errorf("runBashTool = %q, want both stdout and stderr combined", result)
+		t.Errorf("newBashLimits().run = %q, want both stdout and stderr combined", result)
 	}
 	if !strings.HasSuffix(result, "exit code: 0") {
-		t.Errorf("runBashTool = %q, want trailing exit-code line", result)
+		t.Errorf("newBashLimits().run = %q, want trailing exit-code line", result)
 	}
 }
 
@@ -4476,9 +4472,9 @@ func TestRunBashToolRunsInDriverCwd(t *testing.T) {
 	f.Close()
 	defer os.Remove(name)
 
-	result := runBashTool("echo written > " + name).text
+	result := newBashLimits().run("echo written > " + name).text
 	if !strings.HasSuffix(result, "exit code: 0") {
-		t.Errorf("runBashTool = %q, want success", result)
+		t.Errorf("newBashLimits().run = %q, want success", result)
 	}
 	data, err := os.ReadFile(name)
 	if err != nil {
@@ -4492,9 +4488,9 @@ func TestRunBashToolRunsInDriverCwd(t *testing.T) {
 func TestRunBashToolNonexistentCommandExits127(t *testing.T) {
 	// bash itself starts fine and reports 127 for a command it cannot find;
 	// the model still gets an ordinary Tool Result.
-	result := runBashTool("nonexistent-spindrift-cmd-xyz").text
+	result := newBashLimits().run("nonexistent-spindrift-cmd-xyz").text
 	if !strings.Contains(result, "not found") || !strings.Contains(result, "exit code: 127") {
-		t.Errorf("runBashTool = %q, want error text plus exit-code line", result)
+		t.Errorf("newBashLimits().run = %q, want error text plus exit-code line", result)
 	}
 }
 
@@ -4504,12 +4500,12 @@ func TestRunBashToolUnstartableBashIsWellFormedResult(t *testing.T) {
 	// Setenv before the call: exec.Command resolves bash via LookPath at
 	// command-construction time, inheriting the current env.
 	t.Setenv("PATH", "")
-	result := runBashTool("echo hi").text
+	result := newBashLimits().run("echo hi").text
 	if !strings.HasPrefix(result, "error: cannot start command:") {
-		t.Errorf("runBashTool = %q, want a plain 'error: cannot start command: ...' result", result)
+		t.Errorf("newBashLimits().run = %q, want a plain 'error: cannot start command: ...' result", result)
 	}
 	if strings.Contains(result, "exit code:") {
-		t.Errorf("runBashTool = %q, want no exit-code line when the command never started", result)
+		t.Errorf("newBashLimits().run = %q, want no exit-code line when the command never started", result)
 	}
 }
 
@@ -4517,53 +4513,52 @@ func TestRunBashToolStatesFailureFromACommandThatNeverStarted(t *testing.T) {
 	// Nothing ran, so the text carries no exit-code line at all: only the Tool can
 	// say the call failed, and it does.
 	t.Setenv("PATH", "")
-	got := runBashTool("echo hi")
+	got := newBashLimits().run("echo hi")
 	if !got.failed {
-		t.Errorf("runBashTool(echo hi) with no bash to start: failed = %v, want true; text = %q", got.failed, got.text)
+		t.Errorf("newBashLimits().run(echo hi) with no bash to start: failed = %v, want true; text = %q", got.failed, got.text)
 	}
 }
 
 func TestRunBashToolPreservesTrailingBlankLines(t *testing.T) {
 	// Only the final newline is trimmed so the exit-code line sits flush;
 	// intentional blank lines before it must survive.
-	result := runBashTool("printf 'a\\n\\n\\n'").text
+	result := newBashLimits().run("printf 'a\\n\\n\\n'").text
 	want := "a\n\n\nexit code: 0"
 	if result != want {
-		t.Errorf("runBashTool = %q, want %q", result, want)
+		t.Errorf("newBashLimits().run = %q, want %q", result, want)
 	}
 }
 
 func TestRunBashToolSignalKillReportsSignal(t *testing.T) {
 	// A signal-killed command has no exit code (ExitCode is -1); report the
 	// signal instead of the meaningless -1.
-	result := runBashTool("kill -9 $$").text
+	result := newBashLimits().run("kill -9 $$").text
 	if strings.Contains(result, "exit code: -1") {
-		t.Errorf("runBashTool = %q, want the signal reported instead of -1", result)
+		t.Errorf("newBashLimits().run = %q, want the signal reported instead of -1", result)
 	}
 	if !strings.HasSuffix(result, "exit code: signal killed") {
-		t.Errorf("runBashTool = %q, want trailing 'exit code: signal killed' line", result)
+		t.Errorf("newBashLimits().run = %q, want trailing 'exit code: signal killed' line", result)
 	}
 }
 
 func TestRunBashToolStatesFailureFromTimeout(t *testing.T) {
 	// The timeout verdict belongs to the Tool too: a killed command failed even
 	// though its exit status is a signal the suffix rule would only guess at.
-	old := bashToolTimeout
-	bashToolTimeout = 100 * time.Millisecond
-	defer func() { bashToolTimeout = old }()
+	const timeout = 100 * time.Millisecond
+	tool := bashLimits{timeout: timeout, maxOutput: newBashLimits().maxOutput}
 
-	got := runBashTool("sleep 5")
+	got := tool.run("sleep 5")
 	if !got.failed {
-		t.Errorf("runBashTool(sleep 5).failed = %v, want true; text = %q", got.failed, got.text)
+		t.Errorf("tool.run(sleep 5).failed = %v, want true; text = %q", got.failed, got.text)
 	}
 }
 
 func TestRunBashToolStatesFailureFromSignal(t *testing.T) {
 	// A signal death is a failure the Tool states, not one a caller infers from the
 	// absence of a clean exit-code line.
-	got := runBashTool("kill -9 $$")
+	got := newBashLimits().run("kill -9 $$")
 	if !got.failed {
-		t.Errorf("runBashTool(kill -9 $$).failed = %v, want true; text = %q", got.failed, got.text)
+		t.Errorf("newBashLimits().run(kill -9 $$).failed = %v, want true; text = %q", got.failed, got.text)
 	}
 }
 
@@ -4572,9 +4567,8 @@ func TestRunBashToolTimeoutKillsAndReports(t *testing.T) {
 	// as a timeout naming the duration — distinct from a plain signal kill,
 	// so the model can tell them apart — and no process of that command may
 	// survive the kill.
-	old := bashToolTimeout
-	bashToolTimeout = 100 * time.Millisecond
-	defer func() { bashToolTimeout = old }()
+	const timeout = 100 * time.Millisecond
+	tool := bashLimits{timeout: timeout, maxOutput: newBashLimits().maxOutput}
 
 	// Reach sleep through a per-test temp dir so the exec'd sleeper's argv[0]
 	// (its full path) is unique: pgrep -f can only match this test's process,
@@ -4590,9 +4584,9 @@ func TestRunBashToolTimeoutKillsAndReports(t *testing.T) {
 		t.Fatalf("cannot link sleep into %s: %v", dir, err)
 	}
 
-	result := runBashTool("exec " + probe + " 5").text
-	if !strings.Contains(result, "timed out after 100ms") {
-		t.Errorf("runBashTool(%q) = %q, want a timeout result naming the injected duration", "exec "+probe+" 5", result)
+	result := tool.run("exec " + probe + " 5").text
+	if want := fmt.Sprintf("timed out after %s", timeout); !strings.Contains(result, want) {
+		t.Errorf("tool.run(%q) = %q, want a timeout result naming the Tool's own timeout", "exec "+probe+" 5", result)
 	}
 	out, err := exec.Command("pgrep", "-f", dir).Output()
 	if err == nil && len(bytes.TrimSpace(out)) > 0 {
@@ -4604,56 +4598,49 @@ func TestRunBashToolTimeoutWithOversizedOutput(t *testing.T) {
 	// Truncation and the timeout exit line are separate code paths (truncate
 	// the tail, then append the exit line); this pins their interaction on a
 	// command that both floods the cap and outlives the timeout.
-	oldTimeout := bashToolTimeout
-	oldMax := bashToolMaxOutput
-	bashToolTimeout = 100 * time.Millisecond
-	bashToolMaxOutput = 256
-	defer func() {
-		bashToolTimeout = oldTimeout
-		bashToolMaxOutput = oldMax
-	}()
+	const timeout, maxOutput = 100 * time.Millisecond, 256
+	tool := bashLimits{timeout: timeout, maxOutput: maxOutput}
 
-	result := runBashTool("while true; do seq 1 100000; done").text
+	result := tool.run("while true; do seq 1 100000; done").text
 
 	// pins the timeout path
-	if !strings.Contains(result, "timed out after 100ms") {
-		t.Errorf("runBashTool = %q, want a timeout result naming the injected duration", result)
+	if want := fmt.Sprintf("timed out after %s", timeout); !strings.Contains(result, want) {
+		t.Errorf("tool.run = %q, want a timeout result naming the Tool's own timeout", result)
 	}
 	// pins the truncation path; seq is pure ASCII so the marker names exactly
-	// the injected cap
-	if !strings.Contains(result, truncatedOutputMarker(bashToolMaxOutput)) {
-		t.Errorf("runBashTool = %q, want the truncation marker naming %d kept bytes", result, bashToolMaxOutput)
+	// the cap the Tool was built with
+	if !strings.Contains(result, truncatedOutputMarker(maxOutput)) {
+		t.Errorf("tool.run = %q, want the truncation marker naming %d kept bytes", result, maxOutput)
 	}
-	if len(result) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
-		t.Errorf("runBashTool returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), bashToolMaxOutput)
+	if len(result) > maxOutput+len(truncatedOutputMarker(maxOutput))+64 {
+		t.Errorf("tool.run returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), maxOutput)
 	}
 	// pins the ordering invariant: the exit line is appended after truncation,
 	// so it must survive as the very last thing in the result
-	if !strings.HasSuffix(result, "exit code: timed out after 100ms") {
-		t.Errorf("runBashTool = %q, want trailing 'exit code: timed out after 100ms' line", result)
+	if suffix := "exit code: timed out after " + timeout.String(); !strings.HasSuffix(result, suffix) {
+		t.Errorf("tool.run = %q, want trailing %q line", result, suffix)
 	}
 }
 
 func TestRunBashToolReturnsWhenEscapedChildHoldsPipes(t *testing.T) {
 	// A child that detaches into a new session survives the process-group
 	// SIGKILL and inherits the output-pipe write-ends. os/exec's Wait then
-	// blocks on their EOF unless WaitDelay bounds it — and a runBashTool
-	// that never returns wedges the Driver even though the timeout fired.
-	old := bashToolTimeout
-	bashToolTimeout = 100 * time.Millisecond
-	defer func() { bashToolTimeout = old }()
+	// blocks on their EOF unless WaitDelay bounds it — and a Bash Tool that never
+	// returns wedges the Driver even though the timeout fired.
+	const timeout = 100 * time.Millisecond
+	tool := bashLimits{timeout: timeout, maxOutput: newBashLimits().maxOutput}
 
 	t.Setenv("BASH_TOOL_ESCAPE_HELPER", "1")
 	escaping := os.Args[0] + " & wait"
 	done := make(chan string, 1)
-	go func() { done <- runBashTool(escaping).text }()
+	go func() { done <- tool.run(escaping).text }()
 	select {
 	case result := <-done:
-		if !strings.Contains(result, "timed out after 100ms") {
-			t.Errorf("runBashTool(%q) = %q, want a timeout result", escaping, result)
+		if want := fmt.Sprintf("timed out after %s", timeout); !strings.Contains(result, want) {
+			t.Errorf("tool.run(%q) = %q, want a timeout result", escaping, result)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatalf("runBashTool(%q) did not return within 10s: Wait blocks on the escaped child's pipe", escaping)
+		t.Fatalf("tool.run(%q) did not return within 10s: Wait blocks on the escaped child's pipe", escaping)
 	}
 }
 
@@ -4662,34 +4649,46 @@ func TestRunBashToolTruncatesToTail(t *testing.T) {
 	// the TAIL of that output, capped before the exit-code line is appended
 	// — so the exit-code line always survives and the model sees where the
 	// output ended, not where it began.
-	old := bashToolMaxOutput
-	bashToolMaxOutput = 256
-	defer func() { bashToolMaxOutput = old }()
+	const maxOutput = 256
+	tool := bashLimits{timeout: newBashLimits().timeout, maxOutput: maxOutput}
 
-	result := runBashTool("seq 1 100000").text
+	result := tool.run("seq 1 100000").text
 
-	if len(result) > bashToolMaxOutput+len(truncatedOutputMarker(bashToolMaxOutput))+64 {
-		t.Errorf("runBashTool(seq 1 100000) returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), bashToolMaxOutput)
+	if len(result) > maxOutput+len(truncatedOutputMarker(maxOutput))+64 {
+		t.Errorf("tool.run(seq 1 100000) returned %d bytes, want it bounded by the %d-byte cap plus marker and exit-code line", len(result), maxOutput)
 	}
 	if !strings.HasSuffix(result, "exit code: 0") {
-		t.Errorf("runBashTool = %q, want trailing exit-code line even under truncation", result)
+		t.Errorf("tool.run = %q, want trailing exit-code line even under truncation", result)
 	}
 	if !strings.Contains(result, "99999\n100000") {
-		t.Errorf("runBashTool = %q, want the tail of the generated output (99999, 100000) present", result)
+		t.Errorf("tool.run = %q, want the tail of the generated output (99999, 100000) present", result)
 	}
 	// seq never emits a bare "1" line except as the first line, so finding
 	// "\n1\n" would mean the head survived truncation.
 	if strings.Contains(result, "\n1\n") {
-		t.Errorf("runBashTool = %q, want the head of the generated output dropped", result)
+		t.Errorf("tool.run = %q, want the head of the generated output dropped", result)
 	}
 	if !strings.Contains(result, "truncated") {
-		t.Errorf("runBashTool = %q, want a truncation marker", result)
+		t.Errorf("tool.run = %q, want a truncation marker", result)
 	}
 	// seq output is pure ASCII, so the UTF-8 guard drops nothing and the
 	// kept tail is exactly the cap; the marker must name that real count,
 	// not a literal "N".
-	if !strings.Contains(result, fmt.Sprintf("showing last %d bytes", bashToolMaxOutput)) {
-		t.Errorf("runBashTool = %q, want marker naming the kept byte count %d", result, bashToolMaxOutput)
+	if !strings.Contains(result, fmt.Sprintf("showing last %d bytes", maxOutput)) {
+		t.Errorf("tool.run = %q, want marker naming the kept byte count %d", result, maxOutput)
+	}
+}
+
+func TestBashToolEnforcesTheBoundsItWasBuiltWith(t *testing.T) {
+	// The bound is a property of the Tool this caller built rather than of the
+	// package, so the marker names the cap asked for here and no other test's.
+	const cap = 64
+	result := bashLimits{timeout: 2 * time.Second, maxOutput: cap}.run("seq 1 500").text
+	if !strings.Contains(result, truncatedOutputMarker(cap)) {
+		t.Errorf("run = %q, want the truncation marker naming %d kept bytes", result, cap)
+	}
+	if !strings.HasSuffix(result, "exit code: 0") {
+		t.Errorf("run = %q, want the exit-code line to survive truncation", result)
 	}
 }
 
@@ -4784,7 +4783,7 @@ func assertNoStartEvent(t *testing.T, raw string) {
 func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.json")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4803,7 +4802,7 @@ func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 func TestRunDriverConfigMalformedJSONFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4823,7 +4822,7 @@ func TestRunMissingHookManifestFailsStartup(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "hooks.json")
 	path := writeDriverConfig(t, `{"hook_manifest":"`+missing+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4843,7 +4842,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 	manifest := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}],"post":{"tools":["Bash"]}}`)
 	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4863,7 +4862,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"apiKEy":"sk-x"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4880,7 +4879,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	// be refused outright, never honoured in place of the required --model.
 	smuggle := writeDriverConfig(t, `{"model":"sneaky"}`)
 	var stdout2, stderr2 bytes.Buffer
-	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle), realNowMS)
+	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle), realNowMS, newBashLimits())
 	if code == 0 {
 		t.Fatal("run exited 0, want a refusal: a config field must not supply the model")
 	}
@@ -4899,7 +4898,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 func TestRunDriverConfigWrongTypeFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": 8080}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4934,7 +4933,7 @@ func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
 		default:
 			return "", false
 		}
-	}, realNowMS)
+	}, realNowMS, newBashLimits())
 	// runDriver checks this for its callers, and is not in play here.
 	srv.checkNoUnscriptedRequests(t)
 	if code != 0 {
@@ -4952,7 +4951,7 @@ func TestRunHelpIgnoresBrokenDriverConfig(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	for _, arg := range []string{"--help", "-h"} {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
+		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
 		if code != 0 {
 			t.Errorf("%s with a broken config: exit code = %d, want 0; stderr = %q", arg, code, stderr.String())
 		}
@@ -5298,7 +5297,7 @@ echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 		limits:  newHookLimits(),
 		pre:     []guardHook{{path: rewrite, rewrites: true}},
 		summary: &summaryHook{path: summary},
-	}}, stderr: io.Discard}
+	}}, stderr: io.Discard, bash: newBashLimits()}
 
 	original := "cat ~/.ssh/id_ed25519"
 	plan := toolPlan{

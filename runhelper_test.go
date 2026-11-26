@@ -58,6 +58,11 @@ type runSettings struct {
 	stdoutFile string
 	// now is the clock the run stamps and measures with; nil means the wall clock.
 	now func() int64
+	// bash is the Bash Tool the run's commands execute under. It starts at the
+	// production bounds — the ones main builds — and withToolOutputCap and
+	// withToolTimeout narrow one bound of it, so a run under test names the bounds
+	// its own assertion is about instead of reassigning state no run owns.
+	bash bashLimits
 }
 
 // withFlags appends extra Driver flags after the prompt in argv — --model,
@@ -106,6 +111,19 @@ func withClock(now func() int64) runOption {
 	return func(s *runSettings) { s.now = now }
 }
 
+// withToolOutputCap builds the run's Bash Tool with n as its output cap, so a
+// run that has to flood a command can assert on a bound it can read back.
+func withToolOutputCap(n int) runOption {
+	return func(s *runSettings) { s.bash.maxOutput = n }
+}
+
+// withToolTimeout builds the run's Bash Tool with d as its per-command timeout,
+// so a run that has to outlive a real subprocess does not wait out the
+// production bound to make its point.
+func withToolTimeout(d time.Duration) runOption {
+	return func(s *runSettings) { s.bash.timeout = d }
+}
+
 // completeConfigTimeout is the helper's own idle bound, deliberately not the
 // chatAttemptTimeout package var: tests inject that var to drive timeout
 // scenarios, and a config built while an injection is in effect would otherwise
@@ -135,7 +153,7 @@ func completeConfig(baseURL string) config {
 // else, including the API key the caller overrides, stays the caller's.
 func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts ...runOption) runResult {
 	t.Helper()
-	st := runSettings{}
+	st := runSettings{bash: newBashLimits()}
 	for _, opt := range opts {
 		opt(&st)
 	}
@@ -167,7 +185,7 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 	if now == nil {
 		now = realNowMS
 	}
-	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv, now)
+	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv, now, st.bash)
 	srv.checkNoUnscriptedRequests(t)
 
 	raw := stdout.String()
