@@ -27,7 +27,7 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 		Task  string `json:"task"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return toolPlan{input: input, run: func() toolResult { return failedResult(unparseableArgs, err) }}
+		return toolPlan{input: input, run: func(string) toolResult { return failedResult(unparseableArgs, err) }}
 	}
 	// Looking up against the caller's permitted set covers both refusals the issue
 	// unifies: a name with no Agent File, and one its spawns does not permit. The
@@ -35,13 +35,16 @@ func planSubagentCall(call toolCall, input any, s session) toolPlan {
 	permitted := spawnable(s.cfg.agent, s.cfg.agents)
 	entry, ok := findAgent(permitted, args.Agent)
 	if !ok {
-		return toolPlan{input: input, run: func() toolResult { return failedResult("%s", spawnRefusal(args.Agent, permitted)) }}
+		return toolPlan{input: input, run: func(string) toolResult { return failedResult("%s", spawnRefusal(args.Agent, permitted)) }}
 	}
 	return toolPlan{
 		input:    input,
 		target:   entry.Name,
 		subagent: entry.Name,
-		run:      func() toolResult { return runSubagentTool(entry, args.Task, s) },
+		// A spawn has no subject a host rule rules on, so it declares none and the
+		// chain is not asked about it — not even its jq precondition.
+		presentation: nonePresentation(),
+		run:          func(string) toolResult { return runSubagentTool(entry, args.Task, s) },
 	}
 }
 

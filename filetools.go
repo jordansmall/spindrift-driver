@@ -37,7 +37,7 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 	return toolPlan{
 		input:  input,
 		target: resolved,
-		run: func() toolResult {
+		run: func(string) toolResult {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
 				return toolResult{text: refusal, failed: true}
 			}
@@ -90,7 +90,7 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 	return toolPlan{
 		input:  input,
 		target: resolved,
-		run: func() toolResult {
+		run: func(string) toolResult {
 			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
 				return toolResult{text: refusal, failed: true}
 			}
@@ -131,7 +131,7 @@ func editFileTool(path, oldString, newString string, replaceAll bool) toolResult
 // ran, so the plan states the failure the call text reports rather than leaving a
 // verdict to be inferred from how that text reads.
 func fileErrorPlan(input any, format string, a ...any) toolPlan {
-	return toolPlan{input: input, run: func() toolResult { return failedResult(format, a...) }}
+	return toolPlan{input: input, run: func(string) toolResult { return failedResult(format, a...) }}
 }
 
 // writeFileTool writes content over path, creating the parents the Model did not

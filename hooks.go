@@ -369,7 +369,53 @@ type guardPresentation struct {
 	// often encode runs: a subject nothing can replace never changes, so the chain
 	// is built one request instead of one per hook.
 	feedsRewrite bool
+	// summarizes marks the shape whose finished Tool Result the post-call summary
+	// hook may replace. Only the command shape has one today: no file Tool's
+	// result and no subagent's answer has ever been summarised.
+	summarizes bool
 }
+
+// commandPresentation declares a bash-shaped call to the Guard chain: hooks see
+// it under the protocol's name for bash, its subject is the command, and that
+// command is the one a hook's updatedInput may replace — which is also why it is
+// the shape whose result the summary hook is asked about.
+func commandPresentation(driverTool, command string) guardPresentation {
+	protocolName := hookToolName(driverTool)
+	return guardPresentation{
+		protocolName: protocolName,
+		subject:      command,
+		encode:       func(subject string) ([]byte, error) { return encodeHookRequest(protocolName, subject) },
+		jqMissing:    "error: jq is not available, so the guarded command cannot be run",
+		feedsRewrite: true,
+		summarizes:   true,
+	}
+}
+
+// readPresentation declares a file Tool call to the Guard chain as the Read
+// shape — tool_name "Read" for every file Tool rather than two new protocol
+// names — so one host rule that denies a credential path covers Edit and Write
+// as well as bash. A path has nothing to rewrite, so every hook in the chain is
+// asked about the same one request.
+func readPresentation(path string) guardPresentation {
+	return guardPresentation{
+		protocolName: "Read",
+		subject:      path,
+		// Takes no subject: a path has nothing to rewrite.
+		encode:    func(string) ([]byte, error) { return encodeHookReadRequest(path) },
+		jqMissing: "error: jq is not available, so the guarded read cannot be run",
+	}
+}
+
+// nonePresentation declares that a call has no shape the chain is asked about:
+// a Subagent spawn, or a call this run may not make. Such a call has no subject
+// a host rule rules on, and presenting it would still put it through
+// guardThrough's jq precondition — refusing, on a host without jq, calls that
+// run freely today.
+func nonePresentation() guardPresentation { return guardPresentation{} }
+
+// asksNothing reports the declaration guardThrough must never see: a presentation
+// built by no constructor carries no encoder, and so nothing to ask.
+func (p guardPresentation) asksNothing() bool { return p.encode == nil }
 
 // guardThrough runs p through the pre-call Guard Hooks in manifest order and
 // returns the subject to act on together with the first refusal to hand back as
@@ -456,6 +502,21 @@ func encodeRefusal(err error) string {
 	return fmt.Sprintf("error: guard hook request could not be built: %v", err)
 }
 
+// guard asks the chain about a call its plan already declared and returns the
+// subject to act on with the first refusal, "" for "no objection".
+//
+// Both early answers are load-bearing. A nil chain is the run that configured no
+// Hook Manifest, and it answers before the jq lookup guardThrough makes: there
+// is nothing to guard. A presentation that declares none has to be left alone by
+// a run that does have hooks, so it answers the same way rather than reaching the
+// precondition of a shape it never declared.
+func (c *guardChain) guard(p guardPresentation, stderr io.Writer) (string, string) {
+	if c == nil || p.asksNothing() {
+		return p.subject, ""
+	}
+	return guardThrough(c.pre, p, stderr)
+}
+
 // guardCommand runs command through the chain as a bash-shaped call and returns
 // the command to run together with the refusal. It is the one shape whose
 // subject feeds forward: a hook that answers with updatedInput replaces the
@@ -466,17 +527,7 @@ func encodeRefusal(err error) string {
 // the jq lookup guardThrough makes: there is nothing to guard, so the command
 // goes through as asked.
 func (c *guardChain) guardCommand(command, driverTool string, stderr io.Writer) (string, string) {
-	if c == nil {
-		return command, ""
-	}
-	protocolName := hookToolName(driverTool)
-	return guardThrough(c.pre, guardPresentation{
-		protocolName: protocolName,
-		subject:      command,
-		encode:       func(subject string) ([]byte, error) { return encodeHookRequest(protocolName, subject) },
-		jqMissing:    "error: jq is not available, so the guarded command cannot be run",
-		feedsRewrite: true,
-	}, stderr)
+	return c.guard(commandPresentation(driverTool, command), stderr)
 }
 
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
@@ -534,18 +585,7 @@ func encodeHookReadRequest(path string) ([]byte, error) {
 // A nil chain has no hook to ask about the read, so it answers "" — the same
 // fast path guardCommand takes, before any jq lookup.
 func (c *guardChain) guardRead(filePath string, stderr io.Writer) string {
-	if c == nil {
-		return ""
-	}
-	_, refusal := guardThrough(c.pre, guardPresentation{
-		protocolName: "Read",
-		subject:      filePath,
-		// Takes no subject: a path has nothing to rewrite, so every hook in the
-		// chain is asked about the same one.
-		encode:       func(string) ([]byte, error) { return encodeHookReadRequest(filePath) },
-		jqMissing:    "error: jq is not available, so the guarded read cannot be run",
-		feedsRewrite: false,
-	}, stderr)
+	_, refusal := c.guard(readPresentation(filePath), stderr)
 	return refusal
 }
 
