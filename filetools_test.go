@@ -580,7 +580,9 @@ func TestFileToolDispatchesEdit(t *testing.T) {
 	}
 	// Dispatch reads the run's resolved set, so the session has to carry one: the
 	// top-level set over no roster is the set that holds edit and write.
-	s := session{cfg: config{tools: resolveTools(agentEntry{}, nil)}}
+	cfg := completeConfig("")
+	cfg.tools = resolveTools(agentEntry{}, nil)
+	s := session{cfg: cfg}
 	plan := planToolCall(editCall(`{"path":"a.txt","old_string":"before","new_string":"after"}`), s)
 	want := filepath.Join(dir, "a.txt")
 	if plan.target != want {
@@ -603,7 +605,10 @@ func TestFileToolDispatchesWrite(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	plan := planToolCall(writeCall(`{"path":"dispatched.txt","content":"via planToolCall"}`), session{cfg: config{tools: resolveTools(agentEntry{}, nil)}})
+	cfg := completeConfig("")
+	cfg.tools = resolveTools(agentEntry{}, nil)
+	plan := planToolCall(
+		writeCall(`{"path":"dispatched.txt","content":"via planToolCall"}`), session{cfg: cfg})
 	want := filepath.Join(dir, "dispatched.txt")
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want %q", plan.target, want)
@@ -627,8 +632,10 @@ func TestPlanWriteCallGuardHookDenies(t *testing.T) {
 	script := writeGuardHookScript(t, "deny.sh",
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
+	cfg := completeConfig("")
+	cfg.hooks = chainOf(guardHook{path: script})
 	plan := planWriteCall(writeCall(`{"path":"secret.txt","content":"hunter2"}`), nil,
-		session{cfg: config{hooks: chainOf(guardHook{path: script})}})
+		session{cfg: cfg})
 	res := plan.run()
 
 	want := "error: guard hook " + script + " denied this command: credential path"
@@ -653,8 +660,10 @@ func TestPlanEditCallGuardHookDenies(t *testing.T) {
 	script := writeGuardHookScript(t, "deny.sh",
 		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
+	cfg := completeConfig("")
+	cfg.hooks = chainOf(guardHook{path: script})
 	plan := planEditCall(editCall(`{"path":"notes.txt","old_string":"hunter2","new_string":"redacted"}`), nil,
-		session{cfg: config{hooks: chainOf(guardHook{path: script})}})
+		session{cfg: cfg})
 	res := plan.run()
 
 	if want := "error: guard hook " + script + " denied this command: credential path"; res.text != want {
