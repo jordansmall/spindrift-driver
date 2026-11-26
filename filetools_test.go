@@ -19,12 +19,20 @@ func editCall(args string) toolCall {
 	return toolCall{ID: "call_e", Type: "function", Function: toolCallFunction{Name: "edit", Arguments: args}}
 }
 
+// runFilePlan runs a file Tool plan the way dispatch runs it, through guardRun.
+// The closure acts on the subject the Guard chain hands back rather than on one
+// a test invents, so a hook-free run acts on the resolved path the chain answers
+// with — the same value plan.target reports.
+func runFilePlan(plan toolPlan) toolResult {
+	return session{}.guardRun(plan)
+}
+
 func TestPlanWriteCallCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
 	plan := planWriteCall(writeCall(`{"path":"out.txt","content":"hello, world"}`), nil, session{})
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want a created file: %s", res.text)
 	}
 
@@ -73,7 +81,7 @@ func TestPlanWriteCallMissingPath(t *testing.T) {
 	t.Chdir(dir)
 
 	plan := planWriteCall(writeCall(`{"content":"orphan"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error:") {
 		t.Errorf("result = %q, want an error: prefix", res.text)
 	}
@@ -97,7 +105,7 @@ func TestPlanWriteCallResultNamesBytesAndPath(t *testing.T) {
 	t.Chdir(dir)
 
 	plan := planWriteCall(writeCall(`{"path":"a/b.txt","content":"12345"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("is_error = true for a successful write: %q", res.text)
 	}
@@ -112,7 +120,7 @@ func TestPlanWriteCallCreatesMissingParents(t *testing.T) {
 	t.Chdir(dir)
 
 	plan := planWriteCall(writeCall(`{"path":"nested/deep/file.txt","content":"deep"}`), nil, session{})
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want the parents created: %s", res.text)
 	}
 	want := filepath.Join(dir, "nested", "deep", "file.txt")
@@ -137,7 +145,7 @@ func TestPlanWriteCallOverwritesCompletely(t *testing.T) {
 		t.Fatalf("pre-write: %v", err)
 	}
 	plan := planWriteCall(writeCall(`{"path":"both.txt","content":"new"}`), nil, session{})
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want an overwrite: %s", res.text)
 	}
 	b, err := os.ReadFile(path)
@@ -158,7 +166,7 @@ func TestPlanWriteCallRelativePathResolvesAgainstCwd(t *testing.T) {
 	t.Chdir(other)
 
 	plan := planWriteCall(writeCall(`{"path":"x.txt","content":"rel"}`), nil, session{})
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want a write under the cwd: %s", res.text)
 	}
 	want := filepath.Join(other, "x.txt")
@@ -179,7 +187,7 @@ func TestPlanWriteCallAbsolutePathIsUsedVerbatim(t *testing.T) {
 
 	outside := filepath.Join(t.TempDir(), "elsewhere.txt")
 	plan := planWriteCall(writeCall(`{"path":"`+outside+`","content":"abs"}`), nil, session{})
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want the absolute path written: %s", res.text)
 	}
 	if plan.target != outside {
@@ -203,7 +211,7 @@ func TestPlanWriteCallUnwriteableTarget(t *testing.T) {
 		t.Fatalf("pre-write blocker: %v", err)
 	}
 	plan := planWriteCall(writeCall(`{"path":"blocker/child.txt","content":"nope"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error:") {
 		t.Errorf("result = %q, want an error: prefix", res.text)
 	}
@@ -217,7 +225,7 @@ func TestPlanWriteCallUnwriteableTarget(t *testing.T) {
 
 func TestPlanWriteCallUnparseableArguments(t *testing.T) {
 	plan := planWriteCall(writeCall(`{"path":`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error: cannot parse tool arguments") {
 		t.Errorf("result = %q, want the shared unparseable-arguments error", res.text)
 	}
@@ -243,7 +251,7 @@ func TestPlanEditCallReplacesUniqueMatch(t *testing.T) {
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want %q", plan.target, want)
 	}
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("is_error = true for a unique match: %q", res.text)
 	}
@@ -268,7 +276,7 @@ func TestPlanEditCallOldStringNotFound(t *testing.T) {
 	}
 
 	plan := planEditCall(editCall(`{"path":"a.txt","old_string":"gamma","new_string":"GAMMA"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.Contains(res.text, "not found") {
 		t.Errorf("result = %q, want it to say the old string was not found", res.text)
 	}
@@ -314,7 +322,7 @@ func TestPlanEditCallAmbiguousWithoutReplaceAll(t *testing.T) {
 	}
 
 	plan := planEditCall(editCall(`{"path":"a.txt","old_string":"tick","new_string":"tock"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.Contains(res.text, "2 matches") {
 		t.Errorf("result = %q, want it to report 2 matches", res.text)
 	}
@@ -359,7 +367,7 @@ func TestPlanEditCallReplaceAll(t *testing.T) {
 	}
 
 	plan := planEditCall(editCall(`{"path":"a.txt","old_string":"tick","new_string":"tock","replace_all":true}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("is_error = true for replace_all: %q", res.text)
 	}
@@ -444,7 +452,7 @@ func TestPlanEditCallReplaceAllOnUniqueMatch(t *testing.T) {
 	}
 
 	plan := planEditCall(editCall(`{"path":"a.txt","old_string":"one","new_string":"two","replace_all":true}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("replace_all refused a unique match: %q", res.text)
 	}
@@ -469,7 +477,7 @@ func TestPlanEditCallRelativePathResolvesAgainstCwd(t *testing.T) {
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want %q", plan.target, want)
 	}
-	if res := plan.run(""); res.failed {
+	if res := runFilePlan(plan); res.failed {
 		t.Fatalf("plan reported an error, want the edit under the cwd: %s", res.text)
 	}
 	b, err := os.ReadFile(want)
@@ -486,7 +494,7 @@ func TestPlanEditCallMissingFile(t *testing.T) {
 	t.Chdir(dir)
 
 	plan := planEditCall(editCall(`{"path":"gone.txt","old_string":"x","new_string":"y"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error:") {
 		t.Errorf("result = %q, want an error: prefix", res.text)
 	}
@@ -509,7 +517,7 @@ func TestPlanEditCallEmptyOldString(t *testing.T) {
 	}
 
 	plan := planEditCall(editCall(`{"path":"a.txt","old_string":"","new_string":"oops"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error: old_string") {
 		t.Errorf("result = %q, want an error naming the old_string argument", res.text)
 	}
@@ -530,7 +538,7 @@ func TestPlanEditCallMissingPath(t *testing.T) {
 	t.Chdir(dir)
 
 	plan := planEditCall(editCall(`{"old_string":"x","new_string":"y"}`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error: path is required") {
 		t.Errorf("result = %q, want the shared missing-path error", res.text)
 	}
@@ -548,7 +556,7 @@ func TestPlanEditCallMissingPath(t *testing.T) {
 
 func TestPlanEditCallUnparseableArguments(t *testing.T) {
 	plan := planEditCall(editCall(`{"path":`), nil, session{})
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if !strings.HasPrefix(res.text, "error: cannot parse tool arguments") {
 		t.Errorf("result = %q, want the shared unparseable-arguments error", res.text)
 	}
@@ -563,7 +571,7 @@ func TestPlanEditCallUnparseableArguments(t *testing.T) {
 // prose the old prefix rule would have called clean.
 func TestFileErrorPlanStatesItsOwnVerdict(t *testing.T) {
 	plan := fileErrorPlan(nil, "error: %s", "path is required")
-	if res := plan.run(""); !res.failed {
+	if res := runFilePlan(plan); !res.failed {
 		t.Errorf("failed = false for %q, want a plan that never ran to state failure", res.text)
 	}
 	if res := fileErrorPlan(nil, "a result the prefix rule would have read as clean").run(""); !res.failed {
@@ -588,7 +596,7 @@ func TestFileToolDispatchesEdit(t *testing.T) {
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want the resolved path %q", plan.target, want)
 	}
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("is_error = true for a dispatched edit: %q", res.text)
 	}
@@ -613,7 +621,7 @@ func TestFileToolDispatchesWrite(t *testing.T) {
 	if plan.target != want {
 		t.Errorf("plan.target = %q, want %q", plan.target, want)
 	}
-	res := plan.run("")
+	res := runFilePlan(plan)
 	if res.failed {
 		t.Fatalf("is_error = true for a dispatched write: %q", res.text)
 	}
@@ -626,48 +634,85 @@ func TestFileToolDispatchesWrite(t *testing.T) {
 	}
 }
 
-func TestPlanWriteCallGuardHookDenies(t *testing.T) {
+// TestGuardedWriteCallRefusesAndCreatesNoFile is the denied Write as the Model and
+// the disk see it: the refusal is the Tool Result verbatim and states failure,
+// and neither the file nor the directories leading to it exist because nothing
+// ran. The chain is asked once for the whole call — dispatch asks from the
+// presentation the plan declares, so a Tool that also asked inside its own run
+// would fork the hook script twice for one call. What the chain was handed is
+// read off the hook's own stdin rather than off the plan's fields: a declaration
+// only matters as the payload a host rule gets to rule on.
+func TestGuardedWriteCallRefusesAndCreatesNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
+	asked := filepath.Join(dir, "asks.log")
+	stdin := filepath.Join(dir, "ask-stdin.json")
 	script := writeGuardHookScript(t, "deny.sh",
-		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+		`cat > `+stdin+`
+printf x >> `+asked+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
 	cfg := completeConfig("")
 	cfg.hooks = chainOf(guardHook{path: script})
-	plan := planWriteCall(writeCall(`{"path":"secret.txt","content":"hunter2"}`), nil,
-		session{cfg: cfg})
-	res := plan.run("")
+	s := session{cfg: cfg}
+	plan := planWriteCall(writeCall(`{"path":"out/secret.txt","content":"hunter2"}`), nil, s)
 
+	res := s.guardRun(plan)
+
+	wantPath := filepath.Join(dir, "out", "secret.txt")
 	want := "error: guard hook " + script + " denied this command: credential path"
 	if res.text != want {
-		t.Errorf("plan.run(\"\") = %q, want %q", res.text, want)
+		t.Errorf("Tool Result = %q, want the refusal verbatim %q", res.text, want)
 	}
 	if !res.failed {
-		t.Errorf("is_error = false for %q, want true", res.text)
+		t.Errorf("is_error = false for %q, want a refusal that never reached the disk to state failure", res.text)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "secret.txt")); !os.IsNotExist(err) {
-		t.Errorf("denied write created secret.txt: %v", err)
+	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {
+		t.Errorf("denied write created out/secret.txt: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out")); err == nil {
+		t.Errorf("denied write created the parent directory out anyway")
+	}
+	if got := hookAskCount(t, asked); got != 1 {
+		t.Errorf("chain was asked %d times, want exactly once for one call", got)
+	}
+	handed, err := os.ReadFile(stdin)
+	if err != nil {
+		t.Fatalf("read the deny hook's stdin: %v", err)
+	}
+	if wantPayload := `{"tool_name":"Read","tool_input":{"file_path":"` + wantPath + `"}}`; string(handed) != wantPayload {
+		t.Errorf("Tool Call was presented to the hook as %q, want the Read shape of %s", handed, wantPath)
 	}
 }
 
-func TestPlanEditCallGuardHookDenies(t *testing.T) {
+// TestGuardedEditCallRefusesAndLeavesFileUntouched is the same judgement on the
+// Tool that rewrites: the denial arrives before the file is read, so the bytes on
+// disk are the ones that were there before the call was made. The Edit reaches the
+// hook under the Read shape too, which is what lets one host rule cover every
+// file Tool.
+func TestGuardedEditCallRefusesAndLeavesFileUntouched(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	target := filepath.Join(dir, "notes.txt")
 	if err := os.WriteFile(target, []byte("hunter2"), 0o644); err != nil {
 		t.Fatalf("seed target file: %v", err)
 	}
+	asked := filepath.Join(dir, "asks.log")
+	stdin := filepath.Join(dir, "ask-stdin.json")
 	script := writeGuardHookScript(t, "deny.sh",
-		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+		`cat > `+stdin+`
+printf x >> `+asked+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
 
 	cfg := completeConfig("")
 	cfg.hooks = chainOf(guardHook{path: script})
-	plan := planEditCall(editCall(`{"path":"notes.txt","old_string":"hunter2","new_string":"redacted"}`), nil,
-		session{cfg: cfg})
-	res := plan.run("")
+	s := session{cfg: cfg}
+	plan := planEditCall(editCall(`{"path":"notes.txt","old_string":"hunter2","new_string":"redacted"}`), nil, s)
+
+	res := s.guardRun(plan)
 
 	if want := "error: guard hook " + script + " denied this command: credential path"; res.text != want {
-		t.Errorf("plan.run(\"\") = %q, want %q", res.text, want)
+		t.Errorf("Tool Result = %q, want the refusal verbatim %q", res.text, want)
 	}
 	if !res.failed {
 		t.Errorf("is_error = false for %q, want a refusal that never touched the file to state failure", res.text)
@@ -679,4 +724,61 @@ func TestPlanEditCallGuardHookDenies(t *testing.T) {
 	if string(body) != "hunter2" {
 		t.Errorf("file content = %q, want the denied edit to leave %q untouched", body, "hunter2")
 	}
+	if got := hookAskCount(t, asked); got != 1 {
+		t.Errorf("chain was asked %d times, want exactly once for one call", got)
+	}
+	handed, err := os.ReadFile(stdin)
+	if err != nil {
+		t.Fatalf("read the deny hook's stdin: %v", err)
+	}
+	if wantPayload := `{"tool_name":"Read","tool_input":{"file_path":"` + target + `"}}`; string(handed) != wantPayload {
+		t.Errorf("Tool Call was presented to the hook as %q, want the Read shape of %s", handed, target)
+	}
+}
+
+// TestFileCallWithoutAPathAsksNoHook is the other half of the declaration: a
+// Write or Edit that never resolved a path has no subject for a host rule to
+// rule on, so even a chain that denies everything is never asked about it and the
+// plan's own failure is the Tool Result.
+func TestFileCallWithoutAPathAsksNoHook(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	asked := filepath.Join(dir, "asks.log")
+	script := writeGuardHookScript(t, "deny.sh",
+		`printf x >> `+asked+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+
+	cfg := completeConfig("")
+	cfg.tools = resolveTools(agentEntry{}, nil)
+	cfg.hooks = chainOf(guardHook{path: script})
+	s := session{cfg: cfg}
+
+	for _, tc := range []struct {
+		name string
+		call toolCall
+	}{
+		{"write with no path", writeCall(`{"content":"orphan"}`)},
+		{"write with unparseable arguments", writeCall(`{`)},
+		{"edit with no path", editCall(`{"old_string":"a","new_string":"b"}`)},
+		{"edit with unparseable arguments", editCall(`{`)},
+	} {
+		res := s.guardRun(planToolCall(tc.call, s))
+		if !res.failed || !strings.HasPrefix(res.text, "error:") {
+			t.Errorf("%s: Tool Result = (%q, failed=%v), want the plan's own error", tc.name, res.text, res.failed)
+		}
+		if got := hookAskCount(t, asked); got != 0 {
+			t.Errorf("%s: chain was asked %d times, want no hook asked for a call with no subject", tc.name, got)
+		}
+	}
+}
+
+// hookAskCount is how many times the deny script ran, counted from the byte it
+// appends per invocation.
+func hookAskCount(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read hook ask log: %v", err)
+	}
+	return len(b)
 }
