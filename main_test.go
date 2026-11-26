@@ -2723,9 +2723,11 @@ func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
 // One Model call's usage event needs its data source to survive the round
 // trip: the response's model and its OpenAI-shaped usage.
 func TestSendChatReturnsModelAndTokens(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"id":"chatcmpl-9","model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":120,"completion_tokens":34}}`)
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"configured-model": {replyCompletion(`{"id":"chatcmpl-9","model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":120,"completion_tokens":34}}`)},
+	})
 
-	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2745,9 +2747,11 @@ func TestSendChatReturnsModelAndTokens(t *testing.T) {
 // event, so sendChat answers zero tokens — never an error, because a plain
 // llama.cpp endpoint would otherwise fail every run (contract rule 10).
 func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"configured-model": {replyCompletion(`{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	})
 
-	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2762,9 +2766,11 @@ func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
 // Cache read has two spellings on the wire; llama.cpp and vLLM report it flat
 // on the usage object.
 func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_cache_hit_tokens":80}}`)
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"configured-model": {replyCompletion(`{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_cache_hit_tokens":80}}`)},
+	})
 
-	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2776,9 +2782,11 @@ func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
 
 // OpenAI spells the same number inside prompt_tokens_details instead.
 func TestSendChatMapsOpenAIStyleCachedTokensToCacheRead(t *testing.T) {
-	srv := newScriptedChatServer(t, `{"model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}}`)
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"configured-model": {replyCompletion(`{"model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}}`)},
+	})
 
-	reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2796,8 +2804,10 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 		`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
 		`{"model":"","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
 	} {
-		srv := newScriptedChatServer(t, body)
-		reply, err := sendChat(config{baseURL: srv.srv.URL, model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+		srv := newScriptedModelServer(t, map[string][]modelEntry{
+			"configured-model": {replyCompletion(body)},
+		})
+		reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 		if err != nil {
 			t.Fatalf("sendChat(%s): %v", body, err)
 		}
