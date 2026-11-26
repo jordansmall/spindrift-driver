@@ -214,15 +214,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	}
 	// Autonomous tool loop: each turn posts the whole conversation with the
 	// tools parameter; the server decides tool calls (never parsed from text).
-	// The empty-field fallback is what keeps a run that came from anywhere other
-	// than parseArgs — and therefore has no systemPrompt of its own — on the
-	// package prompt it has always used.
-	sys := cfg.systemPrompt
-	if sys == "" {
-		sys = systemPrompt
-	}
 	messages := []chatMessage{
-		{Role: "system", Content: sys},
+		{Role: "system", Content: cfg.systemPrompt},
 		{Role: "user", Content: cfg.prompt},
 	}
 	// Run bookkeeping for the result event is the one tally: the Model-call index
