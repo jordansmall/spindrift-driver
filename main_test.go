@@ -3052,6 +3052,20 @@ func TestParseArgsTimeout(t *testing.T) {
 	}
 }
 
+// TestParseArgsSystemPromptDefault: argument parsing returns a settings struct
+// that is already complete, so a run that selects no Agent File still carries
+// the package default prompt rather than leaving "" for a later layer to
+// recognize and repair.
+func TestParseArgsSystemPromptDefault(t *testing.T) {
+	cfg, err := parseArgs([]string{"--model", "m", "p"}, nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.systemPrompt != systemPrompt {
+		t.Errorf("systemPrompt = %q, want the package default %q", cfg.systemPrompt, systemPrompt)
+	}
+}
+
 func TestParseArgsTimeoutIncludesDriverConfig(t *testing.T) {
 	configPath := writeDriverConfig(t, `{"timeout":"2m"}`)
 
@@ -3960,6 +3974,27 @@ func TestParseArgsModelFlagBeatsAgentEntry(t *testing.T) {
 	}
 	if cfg.systemPrompt != "review things" {
 		t.Errorf("systemPrompt = %q, want the entry body even when --model wins", cfg.systemPrompt)
+	}
+}
+
+// TestParseArgsEmptyAgentBodyKeepsDefaultPrompt pins the case agentFixture
+// cannot produce (it substitutes a body): an Agent File whose body is empty is
+// valid — only name and model are required — and must not post an empty system
+// message. Parsing still hands back a complete prompt.
+func TestParseArgsEmptyAgentBodyKeepsDefaultPrompt(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFile(t, dir, "quiet.md", "---\nname: quiet\nmodel: m-q\n---\n")
+	cfgPath := writeDriverConfig(t, `{"agents_dir":"`+dir+`"}`)
+
+	cfg, err := parseArgs([]string{"--agent", "quiet", "p"}, nil, driverConfigEnv(cfgPath))
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if cfg.agent != "quiet" {
+		t.Errorf("agent = %q, want the entry still selected", cfg.agent)
+	}
+	if cfg.systemPrompt != systemPrompt {
+		t.Errorf("systemPrompt = %q, want the package default %q for an empty entry body", cfg.systemPrompt, systemPrompt)
 	}
 }
 

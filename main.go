@@ -72,9 +72,9 @@ type config struct {
 	// top-level run. It is the fact that makes a run a child, and the tool offer
 	// is read with it: a child never gets the Subagent Tool.
 	agent string
-	// systemPrompt is the selected Agent File's body, the system prompt that
-	// entry's run starts from. "" means no entry, so the package default applies
-	// — which is every hand-built config's case as much as a top-level run's.
+	// systemPrompt is the prompt this run starts from, and parseArgs guarantees it
+	// is never empty: the package default, replaced by the non-empty body of the
+	// entry --agent selected.
 	systemPrompt string
 }
 
@@ -596,10 +596,11 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	}
 
 	cfg := config{
-		model:    *model,
-		baseURL:  *baseURL,
-		maxTurns: *maxTurns,
-		timeout:  *timeout,
+		model:        *model,
+		baseURL:      *baseURL,
+		maxTurns:     *maxTurns,
+		timeout:      *timeout,
+		systemPrompt: systemPrompt,
 	}
 	// the file never carries a non-positive duration (readDriverConfig rejects
 	// those), so the unset-flag case still lands on chatAttemptTimeout
@@ -675,7 +676,11 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		if cfg.model == "" {
 			cfg.model = entry.Model
 		}
-		cfg.systemPrompt = entry.SystemPrompt
+		// An entry body may be empty — only name and model are required — so the
+		// default set above is kept rather than overwritten with "".
+		if entry.SystemPrompt != "" {
+			cfg.systemPrompt = entry.SystemPrompt
+		}
 	}
 	// Below the roster, because an entry can supply the model: a run named by
 	// --agent has one whether or not --model was typed.
