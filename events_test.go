@@ -107,23 +107,18 @@ func resultText(t *testing.T, raw string) string {
 	return text
 }
 
-// pinClock fixes the event clock for a test and restores the real one after.
-func pinClock(t *testing.T, ms int64) {
-	t.Helper()
-	real := nowMS
-	t.Cleanup(func() { nowMS = real })
-	nowMS = func() int64 { return ms }
+// fixedClock builds a clock that always reads ms, for a test that asserts on a
+// stamp and needs the value under test to answer with one it can name.
+func fixedClock(ms int64) func() int64 {
+	return func() int64 { return ms }
 }
 
-// pinSteppingClock fixes the event clock to one that advances step milliseconds
-// on every read. A frozen clock cannot yield a duration, and the result event's
-// duration fields are only pinable when the clock moves — while still staying
-// deterministic enough for a golden log later.
-func pinSteppingClock(t *testing.T, start, step int64) {
-	t.Helper()
-	real := nowMS
-	t.Cleanup(func() { nowMS = real })
-	nowMS = func() int64 {
+// steppingClock builds a clock that advances step milliseconds on every read. A
+// frozen clock cannot yield a duration, and a result event's duration fields are
+// only pinable when the clock moves — while still staying deterministic enough
+// for a golden log.
+func steppingClock(start, step int64) func() int64 {
+	return func() int64 {
 		v := start
 		start += step
 		return v
@@ -131,10 +126,8 @@ func pinSteppingClock(t *testing.T, start, step int64) {
 }
 
 func TestEventEmitterStampsInjectedClock(t *testing.T) {
-	pinClock(t, 1700000000123)
-
 	var buf bytes.Buffer
-	if err := (eventWriter{w: &buf}).emit(event{Kind: "start"}); err != nil {
+	if err := (eventWriter{w: &buf, now: func() int64 { return 1700000000123 }}).emit(event{Kind: "start"}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
@@ -147,10 +140,8 @@ func TestEventEmitterStampsInjectedClock(t *testing.T) {
 }
 
 func TestEventEmitterWritesOneLinePerEvent(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	var buf bytes.Buffer
-	ew := eventWriter{w: &buf}
+	ew := eventWriter{w: &buf, now: realNowMS}
 	if err := ew.emit(event{Kind: "start", MessageID: "msg-1"}); err != nil {
 		t.Fatalf("emit start: %v", err)
 	}
@@ -177,11 +168,9 @@ func TestEventEmitterWritesOneLinePerEvent(t *testing.T) {
 }
 
 func TestEventWireFieldNamesAreSnakeCase(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	var buf bytes.Buffer
 
-	ew := eventWriter{w: &buf}
+	ew := eventWriter{w: &buf, now: realNowMS}
 	if err := ew.emit(event{
 		Kind:       "tool_call",
 		Role:       "assistant",
@@ -236,14 +225,12 @@ func TestEventWireFieldNamesAreSnakeCase(t *testing.T) {
 }
 
 func TestEventToolResultKeepsOutputVerbatimOnOneLine(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	// Shell- and server-controlled text: newlines, tabs, quotes, unicode and
 	// HTML-significant bytes must all survive verbatim inside one line.
 	const output = "line1\nline2\t\"quoted\" <tag> \x26 amp → \u2028\x01 exit code: 1"
 
 	var buf bytes.Buffer
-	err := (eventWriter{w: &buf}).emit(event{
+	err := (eventWriter{w: &buf, now: realNowMS}).emit(event{
 		Kind:       "tool_result",
 		Role:       "assistant",
 		MessageID:  "msg-1",
@@ -283,8 +270,6 @@ func TestEventToolResultKeepsOutputVerbatimOnOneLine(t *testing.T) {
 // because the fallback path (raw string on unparseable arguments) makes the
 // encode rules easy to misread as "anything falsy drops out".
 func TestEventToolInputOnlyAbsentForNullArguments(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	for _, tc := range []struct {
 		name  string
 		input any
@@ -297,7 +282,7 @@ func TestEventToolInputOnlyAbsentForNullArguments(t *testing.T) {
 		{"false", false, true},
 	} {
 		var buf bytes.Buffer
-		if err := (eventWriter{w: &buf}).emit(event{
+		if err := (eventWriter{w: &buf, now: realNowMS}).emit(event{
 			Kind:      "tool_call",
 			MessageID: "msg-1",
 			ToolID:    "call-1",
@@ -314,10 +299,8 @@ func TestEventToolInputOnlyAbsentForNullArguments(t *testing.T) {
 }
 
 func TestEventOmitsFieldsTheKindDoesNotFill(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	var buf bytes.Buffer
-	if err := (eventWriter{w: &buf}).emit(event{Kind: "start", MessageID: "msg-1"}); err != nil {
+	if err := (eventWriter{w: &buf, now: realNowMS}).emit(event{Kind: "start", MessageID: "msg-1"}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
@@ -332,10 +315,8 @@ func TestEventOmitsFieldsTheKindDoesNotFill(t *testing.T) {
 }
 
 func TestEventUsageStatesAllSixTokenFields(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	var buf bytes.Buffer
-	err := (eventWriter{w: &buf}).emit(event{
+	err := (eventWriter{w: &buf, now: realNowMS}).emit(event{
 		Kind:      "usage",
 		MessageID: "msg-1",
 		Model:     "gpt-4o-mini",
@@ -367,10 +348,8 @@ func TestEventUsageStatesAllSixTokenFields(t *testing.T) {
 // reader must never have to guess whether a missing duration means zero or "not
 // reported" (#19), the same rule that keeps tokenTotals omitempty-free.
 func TestEventResultStatesZeroDurationAndSummary(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	var buf bytes.Buffer
-	err := (eventWriter{w: &buf}).emitResult(resultPayload{
+	err := (eventWriter{w: &buf, now: func() int64 { return 1700000000000 }}).emitResult(resultPayload{
 		Kind:   "result",
 		Tokens: tokenTotals{Input: 11, Output: 3},
 		Models: []string{"m-a"},

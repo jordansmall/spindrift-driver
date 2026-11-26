@@ -37,8 +37,7 @@ func TestMain(m *testing.M) {
 	// that turns it into one has to sit ahead of every flag parse too — the child
 	// is handed the Driver's argv, never a test flag set.
 	if os.Getenv(subagentHelperEnv) == "1" {
-		pinChildClockFromEnv()
-		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
+		os.Exit(runWithClock(childClockFromEnv(os.LookupEnv, realNowMS), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
 	// built argv rather than os.Args, so the test binary has no other flag set, and
@@ -49,65 +48,60 @@ func TestMain(m *testing.M) {
 }
 
 // envTestNowMS names the pinned event clock a spawned child Driver is handed
-// through its environment: "<start>:<step>", read by pinChildClockFromEnv in the
+// through its environment: "<start>:<step>", read by childClockFromEnv in the
 // child branch of TestMain.
 const envTestNowMS = "SPINDRIFT_TEST_NOW_MS"
 
-// pinChildClockFromEnv gives a spawned child Driver the stepping clock
-// pinSteppingClock gives an in-process run, so a golden Pass log can carry a
-// relayed child line byte for byte: the relay keeps the child's own timestamp
-// (relaySubagentOutput), and the environment is the only channel to a child this
-// binary starts — a clock pin has to travel that way or not at all.
+// childClockFromEnv builds the stepping clock a spawned child Driver runs on —
+// the counterpart of the withClock a runDriver call is handed in-process, so a
+// golden Pass log can carry a relayed child line byte for byte: the relay keeps
+// the child's own timestamp (relaySubagentOutput), and the environment is the
+// only channel to a child this binary starts — a clock has to travel that way or
+// not at all.
 //
-// Unset or unparsable leaves the real clock running rather than failing the
-// child: a bad pin is one test's defect, and the wall-clock stamp it produces
-// fails that test's own timestamp assertion instead of stopping every spawn test
-// from running a real Driver — and a non-positive step counts as unparsable, a
-// frozen or rewinding grid stamping every relayed line identically.
-func pinChildClockFromEnv() {
-	spec, ok := os.LookupEnv(envTestNowMS)
+// Unset or unparsable returns fallback rather than failing the child: a bad pin
+// is one test's defect, and the wall-clock stamp it produces fails that test's
+// own timestamp assertion instead of stopping every spawn test from running a
+// real Driver — and a non-positive step counts as unparsable, a frozen or
+// rewinding grid stamping every relayed line identically.
+func childClockFromEnv(lookupEnv func(string) (string, bool), fallback func() int64) func() int64 {
+	spec, ok := lookupEnv(envTestNowMS)
 	if !ok {
-		return
+		return fallback
 	}
 	startField, stepField, found := strings.Cut(spec, ":")
 	if !found {
-		return
+		return fallback
 	}
 	start, err := strconv.ParseInt(startField, 10, 64)
 	if err != nil {
-		return
+		return fallback
 	}
 	step, err := strconv.ParseInt(stepField, 10, 64)
 	if err != nil || step <= 0 {
-		return
+		return fallback
 	}
-	nowMS = func() int64 {
-		v := start
-		start += step
-		return v
-	}
+	return steppingClock(start, step)
 }
 
-// TestPinChildClockFromEnvIgnoresANonPositiveStep: a step of 0 or less takes the
+// TestChildClockFromEnvIgnoresANonPositiveStep: a step of 0 or less takes the
 // unparsable fallback, since a frozen or rewinding grid is no clock to relay.
-func TestPinChildClockFromEnvIgnoresANonPositiveStep(t *testing.T) {
+func TestChildClockFromEnvIgnoresANonPositiveStep(t *testing.T) {
 	for _, spec := range []string{"1700000000000:0", "1700000000000:-100"} {
 		t.Run(spec, func(t *testing.T) {
 			t.Setenv(envTestNowMS, spec)
-			real := nowMS
-			defer func() { nowMS = real }()
 			ticks, i := []int64{1, 2, 3}, 0
-			nowMS = func() int64 {
+			preexisting := func() int64 {
 				v := ticks[i]
 				if i < len(ticks)-1 {
 					i++
 				}
 				return v
 			}
-			pinChildClockFromEnv()
+			clock := childClockFromEnv(os.LookupEnv, preexisting)
 			for _, want := range []int64{1, 2} {
-				if got := nowMS(); got != want {
-					t.Errorf("clock after pinChildClockFromEnv(%q) = %d, want the pre-existing clock %d: a step of 0 or less would freeze or rewind every stamp, so the spec must be refused and the clock left alone", spec, got, want)
+				if got := clock(); got != want {
+					t.Errorf("clock from spec %q = %d, want the pre-existing clock %d: a step of 0 or less would freeze or rewind every stamp, so the spec must be refused and the fallback left alone", spec, got, want)
 				}
 			}
 		})
@@ -177,11 +171,9 @@ func TestRunChatRoundTrip(t *testing.T) {
 // reports the run's totals. A usage reader sums every usage event it sees, so a
 // duplicated or missing line here breaks the run totals a reader computes.
 func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
-	pinSteppingClock(t, 1700000000000, 1000)
-
 	got := runDriver(t, map[string][]modelEntry{
 		"gpt-4o-mini": {replyCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"here is the fix"}}]}`)},
-	}, "fix the flaky test", withFlags("--model", "gpt-4o-mini"))
+	}, "fix the flaky test", withFlags("--model", "gpt-4o-mini"), withClock(steppingClock(1700000000000, 1000)))
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
@@ -238,11 +230,9 @@ func TestRunSingleModelCallEmitsStartTextUsageResult(t *testing.T) {
 // absence. The result event must still state both duration fields (#19), the
 // way a usage event states its zero token fields.
 func TestRunSubMillisecondAnswerStillStatesDurationFields(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	got := runDriver(t, map[string][]modelEntry{
 		"gpt-4o-mini": {replyCompletion(`{"model":"gpt-4o-mini","usage":{"prompt_tokens":11,"completion_tokens":3},"choices":[{"message":{"role":"assistant","content":"done"}}]}`)},
-	}, "p", withFlags("--model", "gpt-4o-mini"))
+	}, "p", withFlags("--model", "gpt-4o-mini"), withClock(fixedClock(1700000000000)))
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
@@ -1040,8 +1030,6 @@ func TestRunToolResultIsErrorTracksExitCode(t *testing.T) {
 // plumbing is pinned at the emit seam with a plan built directly rather than a
 // scripted subagent call planToolCall cannot yet plan.
 func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	plan := toolPlan{
 		input:    map[string]any{"agent": "reviewer", "task": "read main.go"},
 		target:   "reviewer",
@@ -1051,7 +1039,7 @@ func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
 
 	var buf bytes.Buffer
 	ev := toolResultEvent("msg-1", "call_1", "subagent", plan, plan.run(""))
-	if err := (eventWriter{w: &buf}).emit(ev); err != nil {
+	if err := (eventWriter{w: &buf, now: realNowMS}).emit(ev); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	got := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))
@@ -1084,8 +1072,6 @@ func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
 // text: prose — a child's answer, a summary — keeps the verdict its Tool gave it,
 // and a result stated clean keeps is_error off the wire entirely.
 func TestToolResultEventCarriesTheStatedVerdict(t *testing.T) {
-	pinClock(t, 1700000000000)
-
 	for _, tc := range []struct {
 		name   string
 		result toolResult
@@ -1102,7 +1088,7 @@ func TestToolResultEventCarriesTheStatedVerdict(t *testing.T) {
 			t.Errorf("%s: is_error = %v, want %v", tc.name, ev.IsError, tc.want)
 		}
 		var buf bytes.Buffer
-		if err := (eventWriter{w: &buf}).emit(ev); err != nil {
+		if err := (eventWriter{w: &buf, now: realNowMS}).emit(ev); err != nil {
 			t.Fatalf("%s: emit: %v", tc.name, err)
 		}
 		_, onWire := decodeLine(t, strings.TrimSuffix(buf.String(), "\n"))["is_error"]
@@ -2090,11 +2076,10 @@ func lastErrorEvent(t *testing.T, raw string) map[string]any {
 
 func TestRunRateLimitRejectionFillsResetAt(t *testing.T) {
 	const pinned int64 = 1700000000000
-	pinClock(t, pinned)
 	const body = "slow down"
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "7"}, body)},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p", withFlags("--model", "m-a"), withClock(fixedClock(pinned)))
 	if got.code != 1 {
 		t.Fatalf("exit code = %d, want 1 on a non-retryable rejection; stderr = %q", got.code, got.stderr)
 	}
@@ -2117,12 +2102,11 @@ func TestRunRateLimitRejectionFillsResetAt(t *testing.T) {
 func TestRunRateLimitResetAtAcceptsHTTPDate(t *testing.T) {
 	// A pinned clock far from the header's date, so passing the pinned value
 	// through instead of reading the date would show up as the wrong instant.
-	pinClock(t, 1700000000000)
 	const date = "Wed, 15 Nov 2023 08:12:01 GMT"
 	want := time.Date(2023, time.November, 15, 8, 12, 1, 0, time.UTC).UnixMilli()
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": date}, "rate limited")},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p", withFlags("--model", "m-a"), withClock(fixedClock(1700000000000)))
 	if got.code != 1 {
 		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
@@ -2139,10 +2123,9 @@ func TestRunRateLimitResetAtAcceptsHTTPDate(t *testing.T) {
 }
 
 func TestRunRateLimitWithoutRetryAfterOmitsResetAt(t *testing.T) {
-	pinClock(t, 1700000000000)
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {reject(http.StatusTooManyRequests, nil, "rate limited")},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p", withFlags("--model", "m-a"), withClock(fixedClock(1700000000000)))
 	if got.code != 1 {
 		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
@@ -2158,10 +2141,9 @@ func TestRunRateLimitResetAtIgnoresUnrepresentableDelta(t *testing.T) {
 	// 2^61 seconds parses as an int64 but does not survive the move to
 	// milliseconds: wrapped, it reads back as a plausible instant for a reset that
 	// never existed, so an unrepresentable delta has to be treated as no reset.
-	pinClock(t, 1700000000000)
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {reject(http.StatusTooManyRequests, map[string]string{"Retry-After": "2305843009213693952"}, "rate limited")},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p", withFlags("--model", "m-a"), withClock(fixedClock(1700000000000)))
 	if got.code != 1 {
 		t.Fatalf("exit code = %d, want 1; stderr = %q", got.code, got.stderr)
 	}
@@ -2456,7 +2438,7 @@ func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
 	cfg.model = "m"
 	cfg.timeout = idle
 	start := time.Now()
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -2650,7 +2632,7 @@ func TestSendChatReturnsModelAndTokens(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2676,7 +2658,7 @@ func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2697,7 +2679,7 @@ func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2715,7 +2697,7 @@ func TestSendChatMapsOpenAIStyleCachedTokensToCacheRead(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2738,7 +2720,7 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 		})
 		cfg := completeConfig(srv.url())
 		cfg.model = "configured-model"
-		reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+		reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 		if err != nil {
 			t.Fatalf("sendChat(%s): %v", body, err)
 		}
@@ -2769,7 +2751,7 @@ func TestSendChatUsesZeroAttemptBudgetAsGiven(t *testing.T) {
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
 	cfg.timeout = 50 * time.Millisecond
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if n := len(srv.recordedRequests(t)); n != 0 {
 		t.Errorf("POSTs = %d, want 0: a budget of 0 spends no attempt, so nothing is sent in its place", n)
 	}

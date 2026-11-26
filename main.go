@@ -200,8 +200,18 @@ func relayChildEvent(events eventWriter, tally *runTally) relayFunc {
 }
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
+// It runs on the wall clock; runWithClock is the same run on a clock the caller
+// states.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
-	events := eventWriter{w: stdout}
+	return runWithClock(realNowMS, args, stdin, stdout, stderr, lookupEnv)
+}
+
+// runWithClock is run on the clock it is handed, so every stamp and every
+// duration one run reports is read off one clock — which is what lets a test
+// pin a whole grid for one stream instead of a value no run owns. Split out of
+// run only until run itself takes its clock as a parameter (#67).
+func runWithClock(now func() int64, args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
+	events := eventWriter{w: stdout, now: now}
 	cfg, err := parseArgs(args, stdin, lookupEnv)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) { // -h/--help: usage is the output, not an error
@@ -225,7 +235,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// toolSeq counts Tool Calls across the whole run, so a server that sends no
 	// call id still gets pair keys that stay unique turn after turn.
 	toolSeq := 0
-	runStart := nowMS()
+	runStart := now()
 	sess := session{cfg: cfg, stderr: stderr, relay: relayChildEvent(events, tally)}
 	var breaker callBreaker
 	for turn := 0; turn < cfg.maxTurns; turn++ {
@@ -234,9 +244,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		// start goes out before the request exists, so its timestamp precedes the
 		// first byte and its message id can only be Driver-assigned (#20).
 		_ = events.emit(event{Kind: "start", MessageID: messageID})
-		apiStart := nowMS()
-		reply, err := sendChat(cfg, messages, stderr)
-		tally.addAPITime(nowMS() - apiStart)
+		apiStart := now()
+		reply, err := sendChat(cfg, messages, stderr, now)
+		tally.addAPITime(now() - apiStart)
 		if err != nil {
 			// A call that failed has no usage to report, so the stream stops at
 			// start here; errorExit adds the error event.
@@ -267,7 +277,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 				Kind:          "result",
 				Text:          assistant.Content,
 				NumTurns:      tally.calls,
-				DurationMs:    nowMS() - runStart,
+				DurationMs:    now() - runStart,
 				DurationAPIMs: tally.apiMS,
 				Tokens:        tally.totals(),
 				Models:        tally.modelIDs(),
@@ -370,8 +380,10 @@ func (r *rejection) Error() string {
 // retryAfterMS turns a Retry-After header into an absolute epoch millisecond:
 // delta-seconds first (the form a rate limiter answers with), then an HTTP-date,
 // which is already absolute and so ignores now. Deltas go through the caller's
-// nowMS reading, never time.Now, or a golden log could never compare byte for
-// byte. A header that is absent, unparsable or negative names no reset, and so
+// clock reading, never time.Now, or a golden log could never compare byte for
+// byte — and that reading is taken before the header is looked at, so it spends
+// a tick of a pinned grid even for an HTTP-date that never uses it. A header
+// that is absent, unparsable or negative names no reset, and so
 // does a delta too large to add to now without wrapping: a wrapped instant is
 // indistinguishable from a real one to whatever reads the event.
 func retryAfterMS(h http.Header, now int64) (int64, bool) {
@@ -1438,7 +1450,9 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 // wins; a server that omits it falls back to the configured --model, because a
 // usage event with no model id would drop the call from the per-model
 // breakdown.
-func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, error) {
+// now is the run's own clock, read only to turn a delta-seconds Retry-After into
+// the absolute instant the error event reports.
+func sendChat(cfg config, messages []chatMessage, stderr io.Writer, now func() int64) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
 	// The offer is the run's own set and nothing else: a config built anywhere but
@@ -1524,7 +1538,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 			// Only a 429 names a reset, and only here — a 429 stays a 4xx that
 			// returns without a retry, exactly as it always did.
 			if resp.StatusCode == http.StatusTooManyRequests {
-				if ms, ok := retryAfterMS(resp.Header, nowMS()); ok {
+				if ms, ok := retryAfterMS(resp.Header, now()); ok {
 					rej.resetAt = ms
 				}
 			}

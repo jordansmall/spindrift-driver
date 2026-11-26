@@ -75,7 +75,7 @@ const goldenRunDir = "/golden-run"
 // the committed golden byte for byte.
 //
 // The stream is produced in-process — run() into a bytes.Buffer with
-// pinSteppingClock fixing the clock and scriptedModelServer fixing every
+// withClock(steppingClock(…)) fixing the clock and scriptedModelServer fixing every
 // response — because the nix check gives the suite bash and coreutils only (no
 // jq, no git, no network), so regeneration cannot shell out.
 //
@@ -156,11 +156,6 @@ func TestGoldenPassLog(t *testing.T) {
 // other event are the ones this artifact has always pinned.
 func goldenPassStream(t *testing.T) []byte {
 	t.Helper()
-	// A stepping clock, not a frozen one: the result event's durations have to be
-	// non-zero to be worth pinning. The step is read-per-event, not wall clock, so
-	// 250ms keeps the pinned numbers plausible rather than degenerate: a quarter
-	// second between events, a quarter second per round trip, a several-second run.
-	pinSteppingClock(t, 1700000000000, 250)
 
 	// The file Tools really write and really read back, so they get a directory of
 	// their own rather than the repo this test runs in. Their absolute tool_target is
@@ -225,7 +220,7 @@ func goldenPassStream(t *testing.T) []byte {
 	}
 
 	// The children this run spawns are separate processes that pin their own clock
-	// from this spec on the way in (pinChildClockFromEnv), which is the only thing
+	// from this spec on the way in (childClockFromEnv), which is the only thing
 	// that makes a relayed child line byte-stable: the relay forwards the child's
 	// stamp rather than restamping it. The roster is what the parent's Subagent calls
 	// resolve against, and the helper's endpoint is the one the parent and both
@@ -248,6 +243,11 @@ func goldenPassStream(t *testing.T) []byte {
 			reject(http.StatusTooManyRequests, map[string]string{"Retry-After": goldenRetryAfter}, goldenRateLimitBody),
 		},
 	}, "inspect the repo and report",
+		// A stepping clock, not a frozen one: the result event's durations have to be
+		// non-zero to be worth pinning. The step is read-per-event, not wall clock, so
+		// 250ms keeps the pinned numbers plausible rather than degenerate: a quarter
+		// second between events, a quarter second per round trip, a several-second run.
+		withClock(steppingClock(1700000000000, 250)),
 		withFlags("--model", goldenParentModel),
 		withEnv(envAPIKey, goldenFakeKey),
 		withEnv(envTestNowMS, fmt.Sprintf("%d:%d", goldenChildClockStart, goldenChildClockStep)),
