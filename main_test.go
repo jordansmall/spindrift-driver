@@ -4199,27 +4199,51 @@ func TestRunOfferIsWhatTheEntryGrants(t *testing.T) {
 	}
 }
 
-// TestRunSystemPromptFallsBackToDefault: every caller of run that never went
-// through parseArgs hands over a config with an empty systemPrompt field, and
-// those runs have always started from the package prompt. The fallback keeps
-// them byte-identical.
-func TestRunSystemPromptFallsBackToDefault(t *testing.T) {
-	// The empty HOME is what keeps this the roster-free top-level run the fallback
-	// is described for: the helper runs on real os.LookupEnv, so a home holding (or
-	// one that fails to parse) Agent Files would otherwise steer the run itself.
-	got := runDriver(t, map[string][]modelEntry{
-		"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
-	}, "p", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
-	if got.code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
-	}
-	msgs := got.messageBodies(t)
-	if len(msgs) != 1 || len(msgs[0]) != 2 {
-		t.Fatalf("messages = %+v, want one POST of two messages", msgs)
-	}
-	if msgs[0][0].Role != "system" || msgs[0][0].Content != systemPrompt {
-		t.Errorf("system message = %+v, want the package default prompt %q", msgs[0][0], systemPrompt)
-	}
+// TestRunPostsTheParsedSystemPrompt: argument parsing is the only source of the
+// system prompt, so what the run posts is byte-identical to what parseArgs handed
+// it — the package default for a plain run, the Agent File body for an --agent run.
+func TestRunPostsTheParsedSystemPrompt(t *testing.T) {
+	// The empty HOME is what keeps each run's prompt determined by its own argv
+	// alone: the helper runs on real os.LookupEnv, so a home holding (or one that
+	// fails to parse) Agent Files would otherwise steer the run itself.
+	t.Run("plain run posts the package default", func(t *testing.T) {
+		got := runDriver(t, map[string][]modelEntry{
+			"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+		}, "p", withFlags("--model", "m"), withEnv("HOME", t.TempDir()))
+		if got.code != 0 {
+			t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
+		}
+		msgs := got.messageBodies(t)
+		if len(msgs) != 1 || len(msgs[0]) != 2 {
+			t.Fatalf("messages = %+v, want one POST of two messages", msgs)
+		}
+		if msgs[0][0].Role != "system" || msgs[0][0].Content != systemPrompt {
+			t.Errorf("system message = %+v, want the package default prompt %q", msgs[0][0], systemPrompt)
+		}
+	})
+
+	// The --agent run is the direction that matters: an entry body that reached the
+	// config but not the wire means the run answered as the default agent instead.
+	t.Run("agent run posts the entry body verbatim", func(t *testing.T) {
+		got := runDriver(t, map[string][]modelEntry{
+			"m": {replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+		}, "p",
+			withRoster(agentSpec{name: "reviewer", model: "m-r", body: "review things"}),
+			withFlags("--agent", "reviewer"),
+			withFlags("--model", "m"),
+			withEnv("HOME", t.TempDir()),
+		)
+		if got.code != 0 {
+			t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
+		}
+		msgs := got.messageBodies(t)
+		if len(msgs) != 1 || len(msgs[0]) != 2 {
+			t.Fatalf("messages = %+v, want one POST of two messages", msgs)
+		}
+		if msgs[0][0].Role != "system" || msgs[0][0].Content != "review things" {
+			t.Errorf("system message = %+v, want the --agent entry body %q verbatim", msgs[0][0], "review things")
+		}
+	})
 }
 
 // TestSystemPromptNamesEveryTool: a Model only reaches for a Tool it has been told
