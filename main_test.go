@@ -986,58 +986,6 @@ func (s *scriptedChatServer) messageBodies(t *testing.T) [][]recordedMessage {
 	return out
 }
 
-// statusSequenceServer answers the i-th POST with the i-th scripted HTTP
-// status and, once the script runs out, with a valid chat completion carrying
-// final. scriptedChatServer cannot express "fail twice, then succeed", so the
-// retry tests need their own fake; it also records arrival times so backoff
-// spacing can be asserted.
-type statusSequenceServer struct {
-	mu       sync.Mutex
-	statuses []int
-	arrivals []time.Time
-	final    string
-	srv      *httptest.Server
-}
-
-func newStatusSequenceServer(t *testing.T, final string, statuses ...int) *statusSequenceServer {
-	s := &statusSequenceServer{statuses: statuses, final: final}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		s.mu.Lock()
-		n := len(s.arrivals)
-		s.arrivals = append(s.arrivals, time.Now())
-		code := http.StatusOK
-		if n < len(s.statuses) {
-			code = s.statuses[n]
-		}
-		s.mu.Unlock()
-		if code != http.StatusOK {
-			http.Error(w, "scripted failure", code)
-			return
-		}
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`))
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
-}
-
-func (s *statusSequenceServer) postCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.arrivals)
-}
-
-// gaps returns the wait between consecutive POST arrivals.
-func (s *statusSequenceServer) gaps() []time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]time.Duration, 0, len(s.arrivals))
-	for i := 1; i < len(s.arrivals); i++ {
-		out = append(out, s.arrivals[i].Sub(s.arrivals[i-1]))
-	}
-	return out
-}
-
 func TestRunAutonomousLoopFullSequence(t *testing.T) {
 	// three rounds: tool call, tool call, final answer
 	//
@@ -2064,53 +2012,6 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 	}
 }
 
-// droppedConnServer kills the FIRST POST at the connection level: it hijacks
-// the connection and closes it without writing a single response byte, so the
-// client's Do returns a transport error (EOF), not an HTTP status. Every later
-// POST gets a valid completion. No existing fake can fail a request without
-// producing a status line, so the transport-retry test needs its own.
-type droppedConnServer struct {
-	mu    sync.Mutex
-	posts int
-	final string
-	srv   *httptest.Server
-}
-
-func newDroppedConnServer(t *testing.T, final string) *droppedConnServer {
-	s := &droppedConnServer{final: final}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		s.mu.Lock()
-		s.posts++
-		first := s.posts == 1
-		s.mu.Unlock()
-		if first {
-			hj, ok := w.(http.Hijacker)
-			if !ok {
-				t.Errorf("test server is not hijackable, cannot drop the connection")
-				http.Error(w, "not hijackable", http.StatusNotImplemented)
-				return
-			}
-			conn, _, err := hj.Hijack()
-			if err != nil {
-				t.Errorf("hijack: %v", err)
-				return
-			}
-			conn.Close()
-			return
-		}
-		writeSSE(w, sseChatCompletion(`{"choices":[{"message":{"role":"assistant","content":"`+final+`"}}]}`))
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
-}
-
-func (s *droppedConnServer) postCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.posts
-}
-
 // A dead connection is the classic transient failure: there is no status code
 // to branch on, only the error Do returns, and the retried attempt must carry
 // the same body — the one-shot reader over the marshalled request means a
@@ -2288,32 +2189,6 @@ func lastErrorEvent(t *testing.T, raw string) map[string]any {
 		t.Fatalf("last event kind = %v, want %q: %q", got, "error", raw)
 	}
 	return ev
-}
-
-// rejectionServer answers every POST with one plain rejection of the given
-// status and headers, counting the POSTs so a test can prove the run did not
-// retry.
-func rejectionServer(t *testing.T, status int, headers map[string]string, body string) (*httptest.Server, func() int) {
-	t.Helper()
-	var mu sync.Mutex
-	posts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		mu.Lock()
-		posts++
-		mu.Unlock()
-		for k, v := range headers {
-			w.Header().Set(k, v)
-		}
-		w.WriteHeader(status)
-		io.WriteString(w, body)
-	}))
-	t.Cleanup(srv.Close)
-	return srv, func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		return posts
-	}
 }
 
 func TestRunRateLimitRejectionFillsResetAt(t *testing.T) {
