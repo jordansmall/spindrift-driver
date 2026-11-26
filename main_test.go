@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -511,42 +510,6 @@ func sseChunkFrame(chunk sseChunk) string {
 	return sseFrame(string(encoded))
 }
 
-// scriptedChatServer returns the i-th scripted JSON response for the i-th
-// POST and records every request body for later inspection.
-type scriptedChatServer struct {
-	mu        sync.Mutex
-	responses []string
-	// frame turns a scripted entry into the response body. The completion fake
-	// rewrites whole JSON bodies; the raw-chunk fake pre-frames them itself and
-	// leaves this nil.
-	frame     func(string) string
-	rawBodies [][]byte
-	srv       *httptest.Server
-}
-
-func newScriptedChatServer(t *testing.T, responses ...string) *scriptedChatServer {
-	s := &scriptedChatServer{responses: responses, frame: sseChatCompletion}
-	return s.serve(t)
-}
-
-// newScriptedSSEServer scripts one raw SSE stream per POST: every entry of the
-// i-th list goes out as its own data: frame, so a test owns the chunk
-// boundaries — split answers, split tool-call arguments, a lone usage chunk.
-func newScriptedSSEServer(t *testing.T, streams ...[]string) *scriptedChatServer {
-	bodies := make([]string, len(streams))
-	for i, chunks := range streams {
-		bodies[i] = sseStream(chunks...)
-	}
-	return newScriptedSSERawServer(t, bodies...)
-}
-
-// newScriptedSSERawServer scripts one SSE response body per POST, verbatim, for
-// the streams a chunk list cannot express: keep-alive comments, event: lines, a
-// frame left unterminated.
-func newScriptedSSERawServer(t *testing.T, bodies ...string) *scriptedChatServer {
-	return (&scriptedChatServer{responses: bodies}).serve(t)
-}
-
 // SSE carries more than chunks: a ':' line is a keep-alive comment, an event:
 // line names the frame that follows, and the done marker closes the stream. None
 // of them is a delta, so the answer stays exactly what the data frames said.
@@ -567,31 +530,6 @@ func TestRunStreamIgnoresHeartbeatsEventLinesAndDoneMarker(t *testing.T) {
 	if n := strings.Count(got.stderr, "POST "); n != 1 {
 		t.Errorf("stderr carries %d POST line(s), want the one progress line: %q", n, got.stderr)
 	}
-}
-
-func (s *scriptedChatServer) serve(t *testing.T) *scriptedChatServer {
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		s.mu.Lock()
-		n := len(s.rawBodies)
-		s.rawBodies = append(s.rawBodies, body)
-		resp := ""
-		exhausted := n >= len(s.responses)
-		if !exhausted {
-			resp = s.responses[n]
-		}
-		if s.frame != nil {
-			resp = s.frame(resp)
-		}
-		s.mu.Unlock()
-		if exhausted {
-			http.Error(w, "no scripted response left", http.StatusInternalServerError)
-			return
-		}
-		writeSSE(w, resp)
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
 }
 
 // A streamed answer is still exactly one text event and exactly one usage event:
@@ -938,30 +876,6 @@ type recordedMessage struct {
 	Content    string     `json:"content"`
 	ToolCalls  []toolCall `json:"tool_calls"`
 	ToolCallID string     `json:"tool_call_id"`
-}
-
-func (s *scriptedChatServer) requestBodies(t *testing.T) [][]byte {
-	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([][]byte, len(s.rawBodies))
-	copy(out, s.rawBodies)
-	return out
-}
-
-func (s *scriptedChatServer) messageBodies(t *testing.T) [][]recordedMessage {
-	t.Helper()
-	var out [][]recordedMessage
-	for _, raw := range s.requestBodies(t) {
-		var reqBody struct {
-			Messages []recordedMessage `json:"messages"`
-		}
-		if err := json.Unmarshal(raw, &reqBody); err != nil {
-			t.Fatalf("request body is not valid JSON: %v; body = %q", err, raw)
-		}
-		out = append(out, reqBody.Messages)
-	}
-	return out
 }
 
 func TestRunAutonomousLoopFullSequence(t *testing.T) {
