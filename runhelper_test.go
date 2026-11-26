@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -63,6 +64,10 @@ type runSettings struct {
 	// withToolTimeout narrow one bound of it, so a run under test names the bounds
 	// its own assertion is about instead of reassigning state no run owns.
 	bash bashLimits
+	// chat is the retry budget the run's chat attempts spend. It starts at the
+	// production pair main builds, and withRetryBudget replaces it, so a run that
+	// must count attempts counts the ones its own assertion names.
+	chat chatPolicy
 }
 
 // withFlags appends extra Driver flags after the prompt in argv — --model,
@@ -124,10 +129,17 @@ func withToolTimeout(d time.Duration) runOption {
 	return func(s *runSettings) { s.bash.timeout = d }
 }
 
-// completeConfigTimeout is the helper's own idle bound, deliberately not the
-// chatAttemptTimeout package var: tests inject that var to drive timeout
-// scenarios, and a config built while an injection is in effect would otherwise
-// inherit a bound no caller of this helper asked for.
+// withRetryBudget builds the run's chat policy with attempts total attempts and
+// backoff as the first wait, so a run that has to spend or hoard a retry does
+// not have to arrange that many real failures at the production spacing.
+func withRetryBudget(attempts int, backoff time.Duration) runOption {
+	return func(s *runSettings) { s.chat = chatPolicy{attempts: attempts, backoff: backoff} }
+}
+
+// completeConfigTimeout is the helper's own idle bound: shorter than the
+// built-in default so a run stuck on a scripted endpoint that never answers
+// fails in seconds rather than minutes. A caller that wants a different bound
+// for its run passes --timeout, the channel an operator uses.
 const completeConfigTimeout = 30 * time.Second
 
 // completeConfig returns Settings that are complete as returned — model,
@@ -153,7 +165,7 @@ func completeConfig(baseURL string) config {
 // else, including the API key the caller overrides, stays the caller's.
 func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts ...runOption) runResult {
 	t.Helper()
-	st := runSettings{bash: newBashLimits()}
+	st := runSettings{bash: newBashLimits(), chat: newChatPolicy()}
 	for _, opt := range opts {
 		opt(&st)
 	}
@@ -185,7 +197,7 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 	if now == nil {
 		now = realNowMS
 	}
-	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv, now, st.bash)
+	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv, now, st.bash, st.chat)
 	srv.checkNoUnscriptedRequests(t)
 
 	raw := stdout.String()
@@ -567,6 +579,28 @@ func TestRunDriverHookManifestOptionGuardsTheRun(t *testing.T) {
 	}
 	if !hookMarkerExists(t, marker) {
 		t.Errorf("marker %s does not exist: the command did not run with no hook_manifest configured", marker)
+	}
+}
+
+// The retry-budget option reaches the run rather than the package: with a budget
+// of one attempt the run posts once and stops, even though the queue holds a
+// refusal per attempt at the production budget of 3.
+func TestRunDriverRetryBudgetOptionReachesTheRun(t *testing.T) {
+	got := runDriver(t, map[string][]modelEntry{
+		"m-a": {
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+			reject(http.StatusInternalServerError, nil, "scripted failure"),
+		},
+	}, "p",
+		withRetryBudget(1, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
+	if got.code == 0 {
+		t.Fatalf("exit code = 0, want non-zero against an endpoint that only refuses; stderr = %q", got.stderr)
+	}
+	if n := len(got.requests); n != 1 {
+		t.Errorf("POSTs = %d, want exactly 1 for a run built with 1 attempt: %q", n, got.stderr)
 	}
 }
 
