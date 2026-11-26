@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 	// that turns it into one has to sit ahead of every flag parse too — the child
 	// is handed the Driver's argv, never a test flag set.
 	if os.Getenv(subagentHelperEnv) == "1" {
-		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, childClockFromEnv(os.LookupEnv, realNowMS), newBashLimits()))
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, childClockFromEnv(os.LookupEnv, realNowMS), newBashLimits(), newChatPolicy()))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
 	// built argv rather than os.Args, so the test binary has no other flag set, and
@@ -1790,17 +1790,16 @@ func TestRunThreeConsecutiveRefusalsEndTheRun(t *testing.T) {
 }
 
 func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered after retries"}}]}`),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(3, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0 after the transient 5xxs; stderr = %q", got.code, got.stderr)
 	}
@@ -1816,17 +1815,16 @@ func TestRunRetriesServerErrorThenSucceeds(t *testing.T) {
 // a retry loop that hammers the server immediately is the failure mode this
 // guards against.
 func TestRunRetryBackoffSpacesAttempts(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 3, 60*time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"slow and steady"}}]}`),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(3, 60*time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", got.code, got.stderr)
 	}
@@ -1834,10 +1832,10 @@ func TestRunRetryBackoffSpacesAttempts(t *testing.T) {
 		t.Fatalf("gaps between POSTs = %d, want 2 (3 POSTs); got %v", len(got.gaps), got.gaps)
 	}
 	if got.gaps[0] < 60*time.Millisecond {
-		t.Errorf("first retry waited %s, want at least the injected backoff 60ms", got.gaps[0])
+		t.Errorf("first retry waited %s, want at least the 60ms backoff this run was built with", got.gaps[0])
 	}
 	if got.gaps[1] < 120*time.Millisecond {
-		t.Errorf("second retry waited %s, want at least double the injected backoff 120ms", got.gaps[1])
+		t.Errorf("second retry waited %s, want at least double this run's backoff, 120ms", got.gaps[1])
 	}
 	if got.gaps[1] <= got.gaps[0] {
 		t.Errorf("waits = %v, want the second strictly longer than the first (doubling)", got.gaps)
@@ -1849,10 +1847,6 @@ func TestRunRetryBackoffSpacesAttempts(t *testing.T) {
 // to forge an extra "spindrift-driver: ..." line, and a long body must not
 // flood the single-line progress log.
 func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	filler := strings.Repeat("x", 400)
 	body := "first line\nspindrift-driver: FORGED 1\n" + filler
 	got := runDriver(t, map[string][]modelEntry{
@@ -1860,7 +1854,10 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 			reject(http.StatusInternalServerError, nil, body),
 			reject(http.StatusInternalServerError, nil, body),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(2, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code == 0 {
 		t.Errorf("exit code = 0, want non-zero when every attempt 500s")
 	}
@@ -1896,10 +1893,6 @@ func TestRunServerErrorBodyStaysOneLine(t *testing.T) {
 // the same body — the one-shot reader over the marshalled request means a
 // request cannot simply be resent.
 func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {
 			// One delta and no sseDone: the stream has to break mid-body the way a
@@ -1907,7 +1900,10 @@ func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
 			dropAfterFrames(sseFrame(textChunk("stale partial answer"))),
 			replyCompletion(`{"choices":[{"message":{"role":"assistant","content":"recovered after dropped conn"}}]}`),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(3, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0 after the dropped connection; stderr = %q", got.code, got.stderr)
 	}
@@ -1925,18 +1921,18 @@ func TestRunRetriesDroppedConnectionThenSucceeds(t *testing.T) {
 }
 
 func TestRunServerErrorStatus(t *testing.T) {
-	// this fake never recovers, so cap the attempts and shorten the backoff or
-	// the suite would pay the full default retry schedule
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
+	// The fake never recovers, so this run is built with 2 attempts and a 1ms first
+	// wait: at the production pair the suite would sit out the whole retry schedule.
 
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {
 			reject(http.StatusInternalServerError, nil, "model not found"),
 			reject(http.StatusInternalServerError, nil, "model not found"),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(2, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code == 0 {
 		t.Fatal("non-200 response should exit non-zero")
 	}
@@ -1960,7 +1956,7 @@ func TestRunClockIsAParameter(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, fixedClock(pinned), newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, fixedClock(pinned), newBashLimits(), newChatPolicy())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
 	}
@@ -1979,16 +1975,12 @@ func TestRunClockIsAParameter(t *testing.T) {
 // stderr line and the machine-readable event must carry the identical raw text,
 // not a summarised version of it.
 func TestRunUnreachableEmitsRawDialErrorEvent(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 2, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	deadURL := srv.URL
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 when the endpoint refuses connections; stderr = %q", code, stderr.String())
 	}
@@ -2006,10 +1998,6 @@ func TestRunUnreachableEmitsRawDialErrorEvent(t *testing.T) {
 // ago, whereas a hardcoded address such as 127.0.0.1:1 may be filtered (a
 // hang, not a refusal) or already in use.
 func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 3, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("dead endpoint received POST %s", r.URL.Path)
 	}))
@@ -2017,7 +2005,7 @@ func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 3, backoff: time.Millisecond})
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the endpoint refuses connections; stderr = %q", stderr.String())
 	}
@@ -2032,13 +2020,28 @@ func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
 	}
 }
 
+// A run's retry budget is the one it was built with: built with a single
+// attempt, a run that only ever meets a 500 spends exactly one POST. The
+// built-in budget is 3, so a second POST here can only mean the loop counted
+// to something other than the number this run was handed.
+func TestRunUsesTheAttemptBudgetItWasBuiltWith(t *testing.T) {
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {reject(http.StatusInternalServerError, nil, "scripted failure")},
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 1, backoff: time.Millisecond})
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero against an endpoint that only refuses; stderr = %q", stderr.String())
+	}
+	if n := len(srv.recordedRequests(t)); n != 1 {
+		t.Errorf("POSTs = %d, want exactly 1 for a run built with 1 attempt: %q", n, stderr.String())
+	}
+}
+
 // The POST count is the discriminating assertion here: too few means the loop
 // abandoned a retry it still had budget for, too many means it cannot stop.
 func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 4, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	got := runDriver(t, map[string][]modelEntry{
 		"m-a": {
 			reject(http.StatusBadGateway, nil, "upstream exploded"),
@@ -2046,7 +2049,10 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 			reject(http.StatusBadGateway, nil, "upstream exploded"),
 			reject(http.StatusBadGateway, nil, "upstream exploded"),
 		},
-	}, "p", withFlags("--model", "m-a"))
+	}, "p",
+		withRetryBudget(4, time.Millisecond),
+		withFlags("--model", "m-a"),
+	)
 	if got.code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once the retry budget is spent; stderr = %q", got.stderr)
 	}
@@ -2054,7 +2060,7 @@ func TestRunGivesUpAfterRetryBudgetExhausted(t *testing.T) {
 		t.Errorf("error event text = %q, want the last failing status", ev)
 	}
 	if n := len(got.requests); n != 4 {
-		t.Errorf("POSTs = %d, want exactly 4 (the full injected budget, no more)", n)
+		t.Errorf("POSTs = %d, want exactly 4 (the full budget this run was built with, no more)", n)
 	}
 	if !strings.Contains(got.stderr, "server returned 502") {
 		t.Errorf("stderr = %q, want the last failing status in the existing server-returned wording", got.stderr)
@@ -2194,14 +2200,10 @@ func TestRunRejectionWhitespaceSurvivesInErrorEvent(t *testing.T) {
 	}
 }
 
-// Retry scope is narrow: a transport error plus 5xx only. The injected budget
-// is generous, so these permanent answers must still cost exactly one POST --
+// Retry scope is narrow: a transport error plus 5xx only. The budget this run is
+// built with is generous, so these permanent answers must still cost exactly one POST --
 // any retry at all shows up as an extra POST, not as a different exit code.
 func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 4, time.Millisecond
-	defer func() { chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff }()
-
 	cases := []struct {
 		name       string
 		entry      modelEntry
@@ -2213,7 +2215,10 @@ func TestRunPermanentFailuresAreNotRetried(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := runDriver(t, map[string][]modelEntry{"m-a": {tc.entry}}, "p", withFlags("--model", "m-a"))
+			got := runDriver(t, map[string][]modelEntry{"m-a": {tc.entry}}, "p",
+				withRetryBudget(4, time.Millisecond),
+				withFlags("--model", "m-a"),
+			)
 			if got.code == 0 {
 				t.Fatalf("exit code = 0, want non-zero; stderr = %q", got.stderr)
 			}
@@ -2253,8 +2258,9 @@ func driverErrorLine(stderr, target string) string {
 
 // assertTimeoutErrorLine pins the terminal diagnostic of a timed-out run to the
 // endpoint and the idle bound that fired: the raw Go error (a bare "context
-// deadline exceeded", or a net-poller timeout) names neither, so both must be added. The caller passes the bound it injected, so
-// each is checked against the timeout it actually configured.
+// deadline exceeded", or a net-poller timeout) names neither, so both must be added.
+// The caller passes the bound its own run was given, so each is checked against the
+// timeout it actually configured.
 func assertTimeoutErrorLine(t *testing.T, stderr, target string, bound time.Duration) {
 	t.Helper()
 	if got := driverErrorLine(stderr, target); !strings.Contains(got, target) || !strings.Contains(got, fmt.Sprint(bound)) {
@@ -2268,12 +2274,6 @@ func assertTimeoutErrorLine(t *testing.T, stderr, target string, bound time.Dura
 // assertion -- without a timeout the run simply waits for the stall to end and
 // exits 0, which no other assertion here can distinguish from success.
 func TestRunStalledRequestTimesOut(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	const stall = 2 * time.Second
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -2290,7 +2290,7 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "50ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2312,12 +2312,6 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 // mode as never answering at all: the deadline fires inside the body read, so
 // that diagnostic has to name the endpoint and the bound too.
 func TestRunStalledResponseBodyTimesOut(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	const stall = 2 * time.Second
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -2338,7 +2332,7 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "50ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2362,12 +2356,6 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 // pre-timeout diagnostic named the failing leg ("read response:"); losing that
 // would leave the operator with a bare "unexpected EOF".
 func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 2*time.Second, 1, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	// Driven through run() directly rather than runDriver: both assertions read the
 	// endpoint URL out of the diagnostic, and runResult exposes no URL.
 	srv := newScriptedModelServer(t, map[string][]modelEntry{
@@ -2375,10 +2363,10 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
-	// The queue holds the one drop entry and chatRetryAttempts is 1, so a second
-	// POST would be an unscripted request -- and runDriver, which checks this for
-	// its callers, is not in play here.
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url(), "--timeout", "2s"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 1, backoff: time.Millisecond})
+	// The queue holds the one drop entry and this run is built with a single
+	// attempt, so a second POST would be an unscripted request -- and runDriver,
+	// which checks this for its callers, is not in play here.
 	srv.checkNoUnscriptedRequests(t)
 
 	if code == 0 {
@@ -2396,16 +2384,12 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	}
 }
 
-// The config value, not the package default, must bound the client: the package
-// var here is far longer than the stall, so a run that finishes early can only
-// be explained by --timeout reaching the client's transport.
-func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 30*time.Second, 2, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
+// The run's configured value, not the built-in default, must bound the client.
+// The built-in default is minutes-scale and far longer than the stall, while the
+// flag here says 100ms — so a run that finishes early can only be explained by
+// --timeout reaching the client's transport, never by whatever default parseArgs
+// starts the flag from.
+func TestRunConfiguredTimeoutOverridesTheBuiltInDefault(t *testing.T) {
 	const stall = 2 * time.Second
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -2420,11 +2404,11 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
-		t.Errorf("run took %s, want the 100ms --timeout to bound it well before the %s package default", elapsed, 30*time.Second)
+		t.Errorf("run took %s, want the 100ms --timeout to bound it well before the %s built-in default", elapsed, defaultChatAttemptTimeout)
 	}
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt times out; elapsed = %s, stderr = %q", elapsed, stderr.String())
@@ -2432,16 +2416,10 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 }
 
 // A run's own settings carry its idle bound, and that bound is what its attempt
-// gets: the package var is only the value parseArgs starts --timeout from, so
-// injecting a far larger chatAttemptTimeout must not widen the attempt. The
-// config's own 50ms is what expires the stall here, never the 10m package var.
+// gets — the policy handed to sendChat carries attempts and backoff only, so
+// nothing but cfg.timeout can widen an attempt. The config's own 50ms is what
+// expires the stall here, never the 5m the --timeout flag falls back to.
 func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 10*time.Minute, 1, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	const stall = 2 * time.Second
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -2454,14 +2432,14 @@ func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// the config's own finite bound, far under the package var the fallback used to
-	// substitute, so only this number can explain an attempt expiring this early
+	// the config's own finite bound, far under the built-in default, so only this
+	// number can explain an attempt expiring this early
 	const idle = 50 * time.Millisecond
 	cfg := completeConfig(srv.URL)
 	cfg.model = "m"
 	cfg.timeout = idle
 	start := time.Now()
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, chatPolicy{attempts: 1, backoff: time.Millisecond}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -2476,8 +2454,8 @@ func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
 	if !strings.Contains(err.Error(), fmt.Sprint(idle)) {
 		t.Errorf("error = %q, want it to name the config's bound %s", err, idle)
 	}
-	if strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
-		t.Errorf("error = %q names the %s package default, want the config's own %s", err, chatAttemptTimeout, idle)
+	if strings.Contains(err.Error(), fmt.Sprint(defaultChatAttemptTimeout)) {
+		t.Errorf("error = %q names the %s built-in default, want the config's own %s", err, defaultChatAttemptTimeout, idle)
 	}
 }
 
@@ -2486,12 +2464,6 @@ func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
 // under a 50ms bound, because every gap stays under it. A whole-attempt cap
 // cannot tell the two apart and kills the run at 50ms.
 func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 1, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	const chunks, gap = 40, 10 * time.Millisecond
 	var want strings.Builder
 	stream := make([]string, 0, chunks+1)
@@ -2523,7 +2495,7 @@ func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL, "--timeout", "50ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 1, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 
 	if elapsed < time.Duration(chunks)*gap {
@@ -2560,26 +2532,20 @@ func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
 // fires inside the body read, so the diagnostic has to name that leg exactly
 // once, without nesting the non-deadline "read response:" wording.
 func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	// one completed chunk, then silence: the answer is half an answer and the
 	// attempt has to expire rather than wait for the rest
 	first := sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"half an answer"}}]}`)
 	// Driven through run() directly rather than runDriver: both assertions read the
 	// endpoint URL out of the diagnostic, and runResult exposes no URL.
 	srv := newScriptedModelServer(t, map[string][]modelEntry{
-		// The queue holds one entry per attempt: chatRetryAttempts is pinned to 2
-		// above, so two stalls are scripted and a third POST would be unscripted.
+		// The queue holds one entry per attempt: this run is built with a budget of
+		// 2, so two stalls are scripted and a third POST would be unscripted.
 		"m-a": {stallAfterFrames(first), stallAfterFrames(first)},
 	})
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url(), "--timeout", "50ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2610,23 +2576,17 @@ func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
 // so the wording stays the plain one that names the endpoint and the bound and
 // says nothing about a read that never started.
 func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
-	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 2, time.Millisecond
-	defer func() {
-		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
-	}()
-
 	// Driven through run() directly rather than runDriver: both assertions read the
 	// endpoint URL out of the diagnostic, and runResult exposes no URL.
 	srv := newScriptedModelServer(t, map[string][]modelEntry{
-		// One silent entry per attempt: chatRetryAttempts is pinned to 2 above, so
-		// two silences are scripted and a third POST would be unscripted.
+		// One silent entry per attempt: this run is built with a budget of 2, so two
+		// silences are scripted and a third POST would be unscripted.
 		"m-a": {stallAfterFrames(""), stallAfterFrames("")},
 	})
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url(), "--timeout", "50ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), chatPolicy{attempts: 2, backoff: time.Millisecond})
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2655,7 +2615,7 @@ func TestSendChatReturnsModelAndTokens(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, newChatPolicy(), []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2681,7 +2641,7 @@ func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, newChatPolicy(), []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2702,7 +2662,7 @@ func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, newChatPolicy(), []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2720,7 +2680,7 @@ func TestSendChatMapsOpenAIStyleCachedTokensToCacheRead(t *testing.T) {
 
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, newChatPolicy(), []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2743,7 +2703,7 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 		})
 		cfg := completeConfig(srv.url())
 		cfg.model = "configured-model"
-		reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+		reply, err := sendChat(cfg, newChatPolicy(), []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 		if err != nil {
 			t.Fatalf("sendChat(%s): %v", body, err)
 		}
@@ -2759,12 +2719,6 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 // one quietly substituted attempt; nothing in the config or the flags can build
 // a 0 today, so this pins only that no substitution came back.
 func TestSendChatUsesZeroAttemptBudgetAsGiven(t *testing.T) {
-	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
-	chatRetryAttempts, chatRetryBackoff = 0, time.Millisecond
-	defer func() {
-		chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff
-	}()
-
 	// The reply is scripted so a substituted attempt would come back with content and
 	// a model — which is what makes the empty reply below a verdict on sendChat.
 	srv := newScriptedModelServer(t, map[string][]modelEntry{
@@ -2774,7 +2728,7 @@ func TestSendChatUsesZeroAttemptBudgetAsGiven(t *testing.T) {
 	cfg := completeConfig(srv.url())
 	cfg.model = "configured-model"
 	cfg.timeout = 50 * time.Millisecond
-	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
+	reply, err := sendChat(cfg, chatPolicy{attempts: 0, backoff: time.Millisecond}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{}, realNowMS)
 	if n := len(srv.recordedRequests(t)); n != 0 {
 		t.Errorf("POSTs = %d, want 0: a budget of 0 spends no attempt, so nothing is sent in its place", n)
 	}
@@ -2810,7 +2764,7 @@ func TestRunEmptyResponse(t *testing.T) {
 // parse error — no driver prefix, no wrapping.
 func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a usage error; stderr = %q", code, stderr.String())
 	}
@@ -2824,7 +2778,7 @@ func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 
 func TestRunMissingModel(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), newChatPolicy())
 	if code == 0 {
 		t.Fatal("run with missing --model should exit non-zero")
 	}
@@ -2838,7 +2792,7 @@ func TestRunMissingModel(t *testing.T) {
 
 func TestRunEmptyPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), newChatPolicy())
 	if code == 0 {
 		t.Fatal("run with empty prompt should exit non-zero")
 	}
@@ -3092,8 +3046,8 @@ func TestParseArgsTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs returned error: %v", err)
 	}
-	if cfg.timeout != chatAttemptTimeout {
-		t.Errorf("default timeout = %v, want %v", cfg.timeout, chatAttemptTimeout)
+	if cfg.timeout != defaultChatAttemptTimeout {
+		t.Errorf("default timeout = %v, want %v", cfg.timeout, defaultChatAttemptTimeout)
 	}
 
 	// prompt before flags: the issue's argv shape
@@ -3156,7 +3110,7 @@ func TestParseArgsTimeoutIncludesDriverConfig(t *testing.T) {
 		},
 		{
 			name: "nothing set",
-			want: chatAttemptTimeout,
+			want: defaultChatAttemptTimeout,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3556,12 +3510,12 @@ func TestParseArgsMalformedHookManifestFailsStartup(t *testing.T) {
 func TestUsageDocumentsTimeoutFlag(t *testing.T) {
 	// --help output is the only place an operator learns the knob exists, so it
 	// must name the flag and the default actually in effect. The default is read
-	// from chatAttemptTimeout rather than typed here, so bumping it fails this
+	// from defaultChatAttemptTimeout rather than typed here, so bumping it fails this
 	// test until the usage text is updated too.
 	if !strings.Contains(usage, "--timeout") {
 		t.Errorf("usage does not document the --timeout flag:\n%s", usage)
 	}
-	if want := chatAttemptTimeout.String(); !strings.Contains(usage, want) {
+	if want := defaultChatAttemptTimeout.String(); !strings.Contains(usage, want) {
 		t.Errorf("usage does not state the default timeout %s:\n%s", want, usage)
 	}
 
@@ -3637,8 +3591,8 @@ func TestUsageNamesDriverConfig(t *testing.T) {
 func TestChatAttemptTimeoutIsMinutesScale(t *testing.T) {
 	// One attempt can stream a whole long generation, so the default must be
 	// minutes-scale; a sub-minute default would expire healthy turns.
-	if chatAttemptTimeout < time.Minute {
-		t.Errorf("chatAttemptTimeout = %v, want at least %v", chatAttemptTimeout, time.Minute)
+	if defaultChatAttemptTimeout < time.Minute {
+		t.Errorf("defaultChatAttemptTimeout = %v, want at least %v", defaultChatAttemptTimeout, time.Minute)
 	}
 }
 
@@ -4400,7 +4354,7 @@ func TestRunResponseEndingInNewline(t *testing.T) {
 // JSONL on every exit path, so the usage text itself belongs on stderr.
 func TestRunHelpExitsZeroWithUsageOnStderr(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits())
+	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS, newBashLimits(), newChatPolicy())
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 for -h", code)
 	}
@@ -4783,7 +4737,7 @@ func assertNoStartEvent(t *testing.T, raw string) {
 func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.json")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4802,7 +4756,7 @@ func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 func TestRunDriverConfigMalformedJSONFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4822,7 +4776,7 @@ func TestRunMissingHookManifestFailsStartup(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "hooks.json")
 	path := writeDriverConfig(t, `{"hook_manifest":"`+missing+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4842,7 +4796,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 	manifest := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}],"post":{"tools":["Bash"]}}`)
 	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4862,7 +4816,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"apiKEy":"sk-x"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4879,7 +4833,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	// be refused outright, never honoured in place of the required --model.
 	smuggle := writeDriverConfig(t, `{"model":"sneaky"}`)
 	var stdout2, stderr2 bytes.Buffer
-	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle), realNowMS, newBashLimits())
+	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle), realNowMS, newBashLimits(), newChatPolicy())
 	if code == 0 {
 		t.Fatal("run exited 0, want a refusal: a config field must not supply the model")
 	}
@@ -4898,7 +4852,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 func TestRunDriverConfigWrongTypeFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": 8080}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4933,7 +4887,7 @@ func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
 		default:
 			return "", false
 		}
-	}, realNowMS, newBashLimits())
+	}, realNowMS, newBashLimits(), newChatPolicy())
 	// runDriver checks this for its callers, and is not in play here.
 	srv.checkNoUnscriptedRequests(t)
 	if code != 0 {
@@ -4951,7 +4905,7 @@ func TestRunHelpIgnoresBrokenDriverConfig(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	for _, arg := range []string{"--help", "-h"} {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits())
+		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS, newBashLimits(), newChatPolicy())
 		if code != 0 {
 			t.Errorf("%s with a broken config: exit code = %d, want 0; stderr = %q", arg, code, stderr.String())
 		}
@@ -5006,8 +4960,8 @@ func TestParseArgsReadsNoConfigFromWorkingDirectory(t *testing.T) {
 	if cfg.apiKey != "" {
 		t.Errorf("apiKey = %q, want empty: something in the working directory was read", cfg.apiKey)
 	}
-	if cfg.timeout != chatAttemptTimeout {
-		t.Errorf("timeout = %v, want the built-in %v: something in the working directory was read", cfg.timeout, chatAttemptTimeout)
+	if cfg.timeout != defaultChatAttemptTimeout {
+		t.Errorf("timeout = %v, want the built-in %v: something in the working directory was read", cfg.timeout, defaultChatAttemptTimeout)
 	}
 }
 

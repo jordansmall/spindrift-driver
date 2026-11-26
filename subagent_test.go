@@ -452,9 +452,9 @@ func TestSubagentFailureIsAnErrorToolResult(t *testing.T) {
 			replyCompletion(completion("parent answer")),
 		},
 		// The child never gets an answer, and a 500 is retried, so its queue holds
-		// one refusal per attempt: chatRetryAttempts (main.go:800) at its default
-		// of 3, the only value a re-exec'd child can see. Should that default
-		// change, the queue runs dry and checkNoUnscriptedRequests fails the test.
+		// one refusal per attempt: newChatPolicy's budget of 3, the only budget a
+		// re-exec'd child can run on. Should that default change, the queue runs
+		// dry and checkNoUnscriptedRequests fails the test.
 		"m-reviewer": {
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
 			reject(http.StatusInternalServerError, nil, "scripted failure"),
@@ -905,9 +905,9 @@ func TestSubagentFailingChildStillContributesItsSpend(t *testing.T) {
 			replyCompletion(usageCompletion("m-parent", "parent answer", 30, 5)),
 		},
 		// The child's first Model call succeeds and spends its tokens; the call after
-		// its bash turn is refused, retried chatRetryAttempts times (main.go:800, and
-		// a re-exec'd child always runs that default of 3), so the tail holds one
-		// rejection per attempt. A dry queue trips checkNoUnscriptedRequests.
+		// its bash turn is refused and retried on newChatPolicy's budget (a re-exec'd
+		// child always runs that default of 3), so the tail holds one rejection per
+		// attempt. A dry queue trips checkNoUnscriptedRequests.
 		"m-reviewer": {
 			replyCompletion(withUsage(childBashTurnResponse, "m-reviewer", 7, 1)),
 			reject(http.StatusInternalServerError, nil, "scripted failure"),

@@ -118,7 +118,7 @@ func TestReadmeDocumentsNixWorkflowAndSmokeTest(t *testing.T) {
 }
 
 // TestReadmeDocumentsChatTimeout pins the README to the --timeout flag: the
-// default is read from chatAttemptTimeout instead of typed here, so raising it
+// default is read from defaultChatAttemptTimeout instead of typed here, so raising it
 // fails this test until the prose states the new value, and a timed-out attempt
 // has to appear among the failure modes an operator can hit.
 func TestReadmeDocumentsChatTimeout(t *testing.T) {
@@ -128,7 +128,7 @@ func TestReadmeDocumentsChatTimeout(t *testing.T) {
 	if !strings.Contains(norm, "--timeout") {
 		t.Errorf("%s does not document the --timeout flag", file)
 	}
-	if want := chatAttemptTimeout.String(); !strings.Contains(norm, want) {
+	if want := defaultChatAttemptTimeout.String(); !strings.Contains(norm, want) {
 		t.Errorf("%s does not state the default timeout %s", file, want)
 	}
 

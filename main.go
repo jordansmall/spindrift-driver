@@ -79,7 +79,7 @@ type config struct {
 }
 
 // usage is a var, not a const: the --timeout and --max-turns defaults are
-// interpolated from chatAttemptTimeout and defaultMaxTurns so the text cannot
+// interpolated from defaultChatAttemptTimeout and defaultMaxTurns so the text cannot
 // drift from the values in effect.
 var usage = `usage: spindrift-driver "prompt" --model <model> [--base-url <url>] [--max-turns <n>] [--timeout <dur>] [--agent <name>]
 
@@ -99,7 +99,7 @@ spawns list limits which agents it may spawn; a run with no --agent flag is unre
 A Tool Call outside that grant comes back as an error Tool Result naming the Tools that run
 may call, so the grant bounds what the Driver will run, not only what the Model is shown.
 --timeout is an idle bound on one chat attempt: the dial, the response headers and the
-gap between received bytes, default ` + chatAttemptTimeout.String() + `. A stream that keeps
+gap between received bytes, default ` + defaultChatAttemptTimeout.String() + `. A stream that keeps
 arriving may run far past it; raise it (--timeout 15m) only when the server thinks for a
 long time before its first token, or when a proxy buffers the response.
 `
@@ -205,7 +205,9 @@ func relayChildEvent(events eventWriter, tally *runTally) relayFunc {
 // whole grid for the wall clock rather than reassigning state no run owns (#67).
 // The Bash Tool it is handed is the one every bash call of that run executes
 // under, for the same reason: its bounds belong to the Tool, not to the package.
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool), now func() int64, bash bashLimits) int {
+// The chatPolicy it is handed is the retry budget every attempt of that run
+// spends, for the same reason again.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool), now func() int64, bash bashLimits, chat chatPolicy) int {
 	events := eventWriter{w: stdout, now: now}
 	cfg, err := parseArgs(args, stdin, lookupEnv)
 	if err != nil {
@@ -240,7 +242,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 		// first byte and its message id can only be Driver-assigned (#20).
 		_ = events.emit(event{Kind: "start", MessageID: messageID})
 		apiStart := now()
-		reply, err := sendChat(cfg, messages, stderr, now)
+		reply, err := sendChat(cfg, chat, messages, stderr, now)
 		tally.addAPITime(now() - apiStart)
 		if err != nil {
 			// A call that failed has no usage to report, so the stream stops at
@@ -584,7 +586,7 @@ func decodeToolArguments(raw string) any {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, realNowMS, newBashLimits()))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, realNowMS, newBashLimits(), newChatPolicy()))
 }
 
 func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, bool)) (config, error) {
@@ -594,13 +596,13 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	model := fs.String("model", "", "model name (required)")
 	maxTurns := fs.Int("max-turns", defaultMaxTurns, "maximum agent turns")
 	agentName := fs.String("agent", "", "run as this Agent File entry: its model id is used unless --model names one, and its body is the system prompt")
-	timeout := fs.Duration("timeout", chatAttemptTimeout, "idle timeout for one chat request: caps the dial, the response headers and the gap between received bytes, not the whole generation; accepts Go durations such as 90s or 2m")
+	timeout := fs.Duration("timeout", defaultChatAttemptTimeout, "idle timeout for one chat request: caps the dial, the response headers and the gap between received bytes, not the whole generation; accepts Go durations such as 90s or 2m")
 	pre, post := splitAtEndOfFlags(args)
 	if err := fs.Parse(reorderFlagsFirst(pre)); err != nil {
 		return config{}, err
 	}
 	// fs.Visit sees only the flags actually given: --timeout defaults to
-	// chatAttemptTimeout rather than the zero value, so *timeout alone cannot
+	// defaultChatAttemptTimeout rather than the zero value, so *timeout alone cannot
 	// tell an unset flag from one the operator typed -- and the Driver Config
 	// must lose to a value that was typed.
 	timeoutSet := false
@@ -632,7 +634,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 		systemPrompt: systemPrompt,
 	}
 	// the file never carries a non-positive duration (readDriverConfig rejects
-	// those), so the unset-flag case still lands on chatAttemptTimeout
+	// those), so the unset-flag case still lands on defaultChatAttemptTimeout
 	if !timeoutSet && file.timeout != 0 {
 		cfg.timeout = file.timeout
 	}
@@ -788,20 +790,29 @@ func promptFrom(args []string, stdin io.Reader) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-// chatRetryAttempts is the total number of attempts made for one chat request
-// (so 3 means two retries); tests inject a smaller value.
-var chatRetryAttempts = 3
+// chatPolicy is how many attempts one chat request gets and how the waits
+// between them grow: attempts is a total, so 3 means two retries, and backoff is
+// the wait before the second attempt, doubled on each further attempt. A zero
+// budget is used as given — no attempt runs, and nothing is substituted for one.
+type chatPolicy struct {
+	attempts int
+	backoff  time.Duration
+}
 
-// chatRetryBackoff is the wait before the second attempt, doubled on each
-// further attempt; tests inject a shorter value.
-var chatRetryBackoff = 100 * time.Millisecond
+// newChatPolicy states the production pair once: three attempts in all, and a
+// first wait of 100ms doubling from there — short enough to ride out a blip,
+// long enough that a struggling server is not hammered.
+func newChatPolicy() chatPolicy {
+	return chatPolicy{attempts: 3, backoff: 100 * time.Millisecond}
+}
 
-// chatAttemptTimeout is an idle bound on one attempt: the dial, the response
-// headers, and the gap between received bytes of the streamed body — a stream
-// that keeps arriving may run far past it. It is the --timeout flag default
-// parseArgs puts into every run's settings, and the bound the test helper
-// starts a complete config from; tests inject a shorter value.
-var chatAttemptTimeout = 5 * time.Minute
+// defaultChatAttemptTimeout is the built-in idle bound on one attempt: the dial,
+// the response headers, and the gap between received bytes of the streamed body
+// — a stream that keeps arriving may run far past it. It is what the --timeout
+// flag and the Driver Config's timeout fall back to when neither is set, stated
+// once so the flag default and the usage text can never report two different
+// numbers.
+const defaultChatAttemptTimeout = 5 * time.Minute
 
 // truncateToolOutput is the one output bound, applied at the cap the Bash Tool
 // was built with: it keeps the last maxOutput bytes of a Tool Result, under
@@ -1461,7 +1472,10 @@ func readChatStream(body io.Reader, status string) (chatReply, error) {
 // breakdown.
 // now is the run's own clock, read only to turn a delta-seconds Retry-After into
 // the absolute instant the error event reports.
-func sendChat(cfg config, messages []chatMessage, stderr io.Writer, now func() int64) (chatReply, error) {
+//
+// chat is the attempt budget and backoff this caller's attempts run on; the
+// idle bound on each attempt is cfg.timeout, the run's own setting.
+func sendChat(cfg config, chat chatPolicy, messages []chatMessage, stderr io.Writer, now func() int64) (chatReply, error) {
 	// base URL may or may not end in /; join safely
 	target := strings.TrimSuffix(cfg.baseURL, "/") + "/chat/completions"
 	// The offer is the run's own set and nothing else: a config built anywhere but
@@ -1477,7 +1491,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer, now func() i
 	if err != nil {
 		return chatReply{}, err
 	}
-	attempts := chatRetryAttempts
+	attempts := chat.attempts
 	timeout := cfg.timeout
 	// The bound is an idle one, so it cannot be http.Client.Timeout: that expires
 	// the whole round trip and would cut off a stream still delivering bytes. Each
@@ -1496,7 +1510,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer, now func() i
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
 	var lastErr error
-	delay := chatRetryBackoff
+	delay := chat.backoff
 	// Only a 5xx or a transport failure is retried, and only inside this one
 	// request: a 4xx, an unparseable chunk and an empty stream are answers, not
 	// flakiness, so they return immediately.
