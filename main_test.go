@@ -2423,9 +2423,13 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 	}
 }
 
-func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
+// A run's own settings carry its idle bound, and that bound is what its attempt
+// gets: the package var is only the value parseArgs starts --timeout from, so
+// injecting a far larger chatAttemptTimeout must not widen the attempt. The
+// config's own 50ms is what expires the stall here, never the 10m package var.
+func TestSendChatUsesTheConfigsOwnIdleBound(t *testing.T) {
 	oldTimeout, oldAttempts, oldBackoff := chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff
-	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 50*time.Millisecond, 1, time.Millisecond
+	chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = 10*time.Minute, 1, time.Millisecond
 	defer func() {
 		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
 	}()
@@ -2442,12 +2446,12 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// A hand-built config leaves cfg.timeout zero, and a zero bound means no wait
-	// at all rather than no limit — the attempt must still land on the finite
-	// package default.
+	// the config's own finite bound, far under the package var the fallback used to
+	// substitute, so only this number can explain an attempt expiring this early
+	const idle = 50 * time.Millisecond
 	cfg := completeConfig(srv.URL)
 	cfg.model = "m"
-	cfg.timeout = 50 * time.Millisecond
+	cfg.timeout = idle
 	start := time.Now()
 	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	elapsed := time.Since(start)
@@ -2456,13 +2460,16 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 		t.Fatalf("sendChat = (%+v, nil), want the attempt to time out", reply)
 	}
 	if elapsed > time.Second {
-		t.Errorf("sendChat took %s, want it bounded by the %s package default, well under the %s stall", elapsed, chatAttemptTimeout, stall)
+		t.Errorf("sendChat took %s, want it bounded by the config's own %s, well under the %s stall", elapsed, idle, stall)
 	}
 	if !strings.Contains(err.Error(), srv.URL) {
 		t.Errorf("error = %q, want it to name the endpoint %s", err, srv.URL)
 	}
-	if !strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
-		t.Errorf("error = %q, want it to name the bound %s", err, chatAttemptTimeout)
+	if !strings.Contains(err.Error(), fmt.Sprint(idle)) {
+		t.Errorf("error = %q, want it to name the config's bound %s", err, idle)
+	}
+	if strings.Contains(err.Error(), fmt.Sprint(chatAttemptTimeout)) {
+		t.Errorf("error = %q names the %s package default, want the config's own %s", err, chatAttemptTimeout, idle)
 	}
 }
 
