@@ -200,17 +200,10 @@ func relayChildEvent(events eventWriter, tally *runTally) relayFunc {
 }
 
 // run is the process-boundary seam: tests drive it in-process, main wraps it.
-// It runs on the wall clock; runWithClock is the same run on a clock the caller
-// states.
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
-	return runWithClock(realNowMS, args, stdin, stdout, stderr, lookupEnv)
-}
-
-// runWithClock is run on the clock it is handed, so every stamp and every
-// duration one run reports is read off one clock — which is what lets a test
-// pin a whole grid for one stream instead of a value no run owns. Split out of
-// run only until run itself takes its clock as a parameter (#67).
-func runWithClock(now func() int64, args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool)) int {
+// The clock it is handed is the one its event stream stamps and its durations
+// measure, so a run reads one clock end to end and a test can substitute a
+// whole grid for the wall clock rather than reassigning state no run owns (#67).
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool), now func() int64) int {
 	events := eventWriter{w: stdout, now: now}
 	cfg, err := parseArgs(args, stdin, lookupEnv)
 	if err != nil {
@@ -583,7 +576,7 @@ func decodeToolArguments(raw string) any {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, realNowMS))
 }
 
 func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, bool)) (config, error) {

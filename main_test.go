@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 	// that turns it into one has to sit ahead of every flag parse too — the child
 	// is handed the Driver's argv, never a test flag set.
 	if os.Getenv(subagentHelperEnv) == "1" {
-		os.Exit(runWithClock(childClockFromEnv(os.LookupEnv, realNowMS), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv))
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, childClockFromEnv(os.LookupEnv, realNowMS)))
 	}
 	// Registered here, before m.Run() parses the command line: the Driver takes a
 	// built argv rather than os.Args, so the test binary has no other flag set, and
@@ -1952,6 +1952,33 @@ func TestRunServerErrorStatus(t *testing.T) {
 	}
 }
 
+// The clock is a parameter of the run rather than package state: a run handed a
+// frozen clock stamps its result with a value no wall-clock reading can produce.
+// Every stamp-pinning test in the suite rides this seam.
+func TestRunClockIsAParameter(t *testing.T) {
+	const pinned = 1700000000000
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		writeSSE(w, sseChatCompletion(`{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"pinned answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, fixedClock(pinned))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	// The text assertion is what proves the stamp belongs to a run that actually
+	// completed against the scripted answer rather than to a failed one.
+	got := resultEvent(t, stdout.String())
+	if text, _ := got["text"].(string); text != "pinned answer" {
+		t.Errorf("result text = %q, want the scripted answer", text)
+	}
+	if ts, _ := got["timestamp"].(float64); int64(ts) != pinned {
+		t.Errorf("result timestamp = %v, want the clock the run was handed (%d): %q", got["timestamp"], pinned, stdout.String())
+	}
+}
+
 // A transport failure is the same error on both surfaces: the operator's
 // stderr line and the machine-readable event must carry the identical raw text,
 // not a summarised version of it.
@@ -1965,7 +1992,7 @@ func TestRunUnreachableEmitsRawDialErrorEvent(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 when the endpoint refuses connections; stderr = %q", code, stderr.String())
 	}
@@ -1994,7 +2021,7 @@ func TestRunExitsNonZeroWhenEndpointUnreachable(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m", "--base-url", deadURL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero when the endpoint refuses connections; stderr = %q", stderr.String())
 	}
@@ -2267,7 +2294,7 @@ func TestRunStalledRequestTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2315,7 +2342,7 @@ func TestRunStalledResponseBodyTimesOut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2352,7 +2379,7 @@ func TestRunMidBodyTransportErrorNamesReadLeg(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	// The queue holds the one drop entry and chatRetryAttempts is 1, so a second
 	// POST would be an unscripted request -- and runDriver, which checks this for
 	// its callers, is not in play here.
@@ -2397,7 +2424,7 @@ func TestRunConfiguredTimeoutOverridesPackageDefault(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m", "--base-url", srv.URL, "--timeout", "100ms"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -2500,7 +2527,7 @@ func TestRunStreamedTrickleRunsOnPastTheIdleBound(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 
 	if elapsed < time.Duration(chunks)*gap {
@@ -2556,7 +2583,7 @@ func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2603,7 +2630,7 @@ func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	elapsed := time.Since(start)
 	srv.checkNoUnscriptedRequests(t)
 
@@ -2787,7 +2814,7 @@ func TestRunEmptyResponse(t *testing.T) {
 // parse error — no driver prefix, no wrapping.
 func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a usage error; stderr = %q", code, stderr.String())
 	}
@@ -2801,7 +2828,7 @@ func TestRunUsageErrorEmitsOneErrorEvent(t *testing.T) {
 
 func TestRunMissingModel(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"say hi"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code == 0 {
 		t.Fatal("run with missing --model should exit non-zero")
 	}
@@ -2815,7 +2842,7 @@ func TestRunMissingModel(t *testing.T) {
 
 func TestRunEmptyPrompt(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"--model", "m"}, strings.NewReader("   \n"), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code == 0 {
 		t.Fatal("run with empty prompt should exit non-zero")
 	}
@@ -4377,7 +4404,7 @@ func TestRunResponseEndingInNewline(t *testing.T) {
 // JSONL on every exit path, so the usage text itself belongs on stderr.
 func TestRunHelpExitsZeroWithUsageOnStderr(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"-h"}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false }, realNowMS)
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 for -h", code)
 	}
@@ -4757,7 +4784,7 @@ func assertNoStartEvent(t *testing.T, raw string) {
 func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.json")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4776,7 +4803,7 @@ func TestRunDriverConfigMissingNamedFileFailsStartup(t *testing.T) {
 func TestRunDriverConfigMalformedJSONFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4796,7 +4823,7 @@ func TestRunMissingHookManifestFailsStartup(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "hooks.json")
 	path := writeDriverConfig(t, `{"hook_manifest":"`+missing+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4816,7 +4843,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 	manifest := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}],"post":{"tools":["Bash"]}}`)
 	path := writeDriverConfig(t, `{"hook_manifest":"`+manifest+`"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4836,7 +4863,7 @@ func TestRunMalformedHookManifestSummaryFailsStartup(t *testing.T) {
 func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"apiKEy":"sk-x"}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4853,7 +4880,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 	// be refused outright, never honoured in place of the required --model.
 	smuggle := writeDriverConfig(t, `{"model":"sneaky"}`)
 	var stdout2, stderr2 bytes.Buffer
-	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle))
+	code = run([]string{"p"}, strings.NewReader(""), &stdout2, &stderr2, driverConfigEnv(smuggle), realNowMS)
 	if code == 0 {
 		t.Fatal("run exited 0, want a refusal: a config field must not supply the model")
 	}
@@ -4872,7 +4899,7 @@ func TestRunDriverConfigUnknownFieldFailsStartup(t *testing.T) {
 func TestRunDriverConfigWrongTypeFailsStartup(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": 8080}`)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+	code := run([]string{"p", "--model", "m"}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 for a startup error; stderr = %q", code, stderr.String())
 	}
@@ -4907,7 +4934,7 @@ func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
 		default:
 			return "", false
 		}
-	})
+	}, realNowMS)
 	// runDriver checks this for its callers, and is not in play here.
 	srv.checkNoUnscriptedRequests(t)
 	if code != 0 {
@@ -4925,7 +4952,7 @@ func TestRunHelpIgnoresBrokenDriverConfig(t *testing.T) {
 	path := writeDriverConfig(t, `{"base_url": `)
 	for _, arg := range []string{"--help", "-h"} {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path))
+		code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr, driverConfigEnv(path), realNowMS)
 		if code != 0 {
 			t.Errorf("%s with a broken config: exit code = %d, want 0; stderr = %q", arg, code, stderr.String())
 		}
