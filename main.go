@@ -769,9 +769,9 @@ var chatRetryBackoff = 100 * time.Millisecond
 
 // chatAttemptTimeout is an idle bound on one attempt: the dial, the response
 // headers, and the gap between received bytes of the streamed body — a stream
-// that keeps arriving may run far past it. It is the fallback default
-// for hand-built configs and the --timeout flag default; tests inject a
-// shorter value.
+// that keeps arriving may run far past it. It is the --timeout flag default
+// parseArgs puts into every run's settings, and the bound the test helper
+// starts a complete config from; tests inject a shorter value.
 var chatAttemptTimeout = 5 * time.Minute
 
 // truncateToolOutput is the one output bound: it keeps the last
@@ -1437,12 +1437,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 	if attempts < 1 {
 		attempts = 1
 	}
-	// A hand-built config carries no --timeout, and a zero timeout means no bound
-	// at all rather than no wait, so fall back to the package default.
 	timeout := cfg.timeout
-	if timeout <= 0 {
-		timeout = chatAttemptTimeout
-	}
 	// The bound is an idle one, so it cannot be http.Client.Timeout: that expires
 	// the whole round trip and would cut off a stream still delivering bytes. Each
 	// leg gets its own instead — the transport bounds the dial and the wait for
