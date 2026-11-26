@@ -96,6 +96,26 @@ func withStdoutFile(path string) runOption {
 	return func(s *runSettings) { s.stdoutFile = path }
 }
 
+// completeConfigTimeout is the helper's own idle bound, deliberately not the
+// chatAttemptTimeout package var: tests inject that var to drive timeout
+// scenarios, and a config built while an injection is in effect would otherwise
+// inherit a bound no caller of this helper asked for.
+const completeConfigTimeout = 30 * time.Second
+
+// completeConfig returns Settings that are complete as returned — model,
+// endpoint, turn cap, idle bound, Tool set and system prompt (#66) — so a caller
+// overwrites only the field its own assertion is about.
+func completeConfig(baseURL string) config {
+	return config{
+		model:        "complete-config-model",
+		baseURL:      baseURL,
+		maxTurns:     defaultMaxTurns,
+		timeout:      completeConfigTimeout,
+		tools:        resolveTools(agentEntry{}, nil),
+		systemPrompt: systemPrompt,
+	}
+}
+
 // runDriver runs the Driver in-process against a scripted Model and reports what
 // came of it.
 //
@@ -527,4 +547,29 @@ func toolResultFor(t *testing.T, events []map[string]any, toolID string) (map[st
 		}
 	}
 	return nil, false
+}
+
+// TestCompleteConfigIsCompleteForARun pins the contract of completeConfig: the
+// settings it returns are the settings a run starts from, so no caller fills a
+// field in later (#66).
+func TestCompleteConfigIsCompleteForARun(t *testing.T) {
+	cfg := completeConfig("http://127.0.0.1:9/v1")
+	if cfg.model == "" {
+		t.Error("model is empty, want a model a run can post with")
+	}
+	if cfg.baseURL != "http://127.0.0.1:9/v1" {
+		t.Errorf("baseURL = %q, want the endpoint passed in", cfg.baseURL)
+	}
+	if cfg.timeout <= 0 {
+		t.Errorf("timeout = %v, want a positive idle bound", cfg.timeout)
+	}
+	if cfg.maxTurns <= 0 {
+		t.Errorf("maxTurns = %d, want a positive turn cap", cfg.maxTurns)
+	}
+	if len(cfg.tools.specs()) == 0 {
+		t.Error("offered Tool set is empty, want the set a run posts with")
+	}
+	if cfg.systemPrompt == "" {
+		t.Error("systemPrompt is empty, want the prompt a run starts from")
+	}
 }

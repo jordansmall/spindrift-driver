@@ -1175,7 +1175,9 @@ func TestRunToolPairForUnknownTool(t *testing.T) {
 // table entry knows keeps the unknown-tool wording, and a name the set holds
 // still plans its own work.
 func TestPlanToolCallBoundsTheRunSet(t *testing.T) {
-	s := session{cfg: config{tools: resolveTools(agentEntry{Name: "solo", Tools: []string{"bash"}}, nil)}}
+	cfg := completeConfig("")
+	cfg.tools = resolveTools(agentEntry{Name: "solo", Tools: []string{"bash"}}, nil)
+	s := session{cfg: cfg}
 
 	for _, name := range []string{"edit", "write", "subagent"} {
 		plan := planToolCall(toolCall{ID: "call_" + name, Type: "function", Function: toolCallFunction{Name: name, Arguments: "{}"}}, s)
@@ -2443,8 +2445,11 @@ func TestSendChatHandBuiltConfigFallsBackToPackageTimeout(t *testing.T) {
 	// A hand-built config leaves cfg.timeout zero, and a zero bound means no wait
 	// at all rather than no limit — the attempt must still land on the finite
 	// package default.
+	cfg := completeConfig(srv.URL)
+	cfg.model = "m"
+	cfg.timeout = 50 * time.Millisecond
 	start := time.Now()
-	reply, err := sendChat(config{baseURL: srv.URL, model: "m"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -2633,7 +2638,9 @@ func TestSendChatReturnsModelAndTokens(t *testing.T) {
 		"configured-model": {replyCompletion(`{"id":"chatcmpl-9","model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":120,"completion_tokens":34}}`)},
 	})
 
-	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	cfg := completeConfig(srv.url())
+	cfg.model = "configured-model"
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2657,7 +2664,9 @@ func TestSendChatWithoutUsageObjectReturnsZeroTokens(t *testing.T) {
 		"configured-model": {replyCompletion(`{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
 	})
 
-	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	cfg := completeConfig(srv.url())
+	cfg.model = "configured-model"
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2676,7 +2685,9 @@ func TestSendChatMapsPromptCacheHitTokensToCacheRead(t *testing.T) {
 		"configured-model": {replyCompletion(`{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_cache_hit_tokens":80}}`)},
 	})
 
-	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	cfg := completeConfig(srv.url())
+	cfg.model = "configured-model"
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2692,7 +2703,9 @@ func TestSendChatMapsOpenAIStyleCachedTokensToCacheRead(t *testing.T) {
 		"configured-model": {replyCompletion(`{"model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}}`)},
 	})
 
-	reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	cfg := completeConfig(srv.url())
+	cfg.model = "configured-model"
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("sendChat: %v", err)
 	}
@@ -2713,7 +2726,9 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 		srv := newScriptedModelServer(t, map[string][]modelEntry{
 			"configured-model": {replyCompletion(body)},
 		})
-		reply, err := sendChat(config{baseURL: srv.url(), model: "configured-model"}, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+		cfg := completeConfig(srv.url())
+		cfg.model = "configured-model"
+		reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
 		if err != nil {
 			t.Fatalf("sendChat(%s): %v", body, err)
 		}
