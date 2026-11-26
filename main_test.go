@@ -4878,13 +4878,16 @@ func TestRunDriverConfigWrongTypeFailsStartup(t *testing.T) {
 // proceeds on flags exactly as it would with no config feature at all.
 func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
 	home := t.TempDir()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w, sseChatCompletion(`{"model":"m","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
-	}))
-	defer srv.Close()
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"m": {replyCompletion(`{"model":"m","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	})
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"p", "--model", "m", "--base-url", srv.URL}, strings.NewReader(""), &stdout, &stderr, func(name string) (string, bool) {
+	// Driven through run() rather than runDriver: runDriver pins the Driver
+	// Config path itself (runDriverConfig -> t.Setenv(envConfigPath, ...)) and
+	// config.go prefers that override, so the default ~/.config path under
+	// test here would never be consulted.
+	code := run([]string{"p", "--model", "m", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(name string) (string, bool) {
 		switch name {
 		case "HOME":
 			return home, true
@@ -4892,6 +4895,8 @@ func TestRunDefaultDriverConfigAbsentIsNotAnError(t *testing.T) {
 			return "", false
 		}
 	})
+	// runDriver checks this for its callers, and is not in play here.
+	srv.checkNoUnscriptedRequests(t)
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 with no default config file; stderr = %q", code, stderr.String())
 	}
