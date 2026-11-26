@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +40,12 @@ type modelEntry struct {
 	// client the way a proxy dying mid-stream does. Non-empty wins over frames, and
 	// such an entry carries no status because the reply started successfully.
 	dropAfter string
+	// stall marks the entry an answer that starts and never finishes. It needs a
+	// discriminator of its own rather than a non-empty field like the kinds above:
+	// the stall before the first byte carries no frames at all, so emptiness cannot
+	// tell it apart from an entry that forgot its kind. frames still holds whatever
+	// goes out before the silence.
+	stall bool
 }
 
 // replyFrames scripts one answer as raw SSE frames.
@@ -51,6 +58,12 @@ func replyCompletion(body string) modelEntry { return modelEntry{completion: bod
 // dropAfterFrames scripts one answer as raw frames that reach the client before
 // the connection is dropped, so the stream is truncated rather than completed.
 func dropAfterFrames(frames string) modelEntry { return modelEntry{dropAfter: frames} }
+
+// stallAfterFrames scripts one answer that starts and never finishes: the raw
+// frames go out flushed, then the endpoint says nothing more until the client hangs
+// up. stallAfterFrames("") is the silence before the first byte — not even a
+// status line is written, so the round trip itself must expire.
+func stallAfterFrames(frames string) modelEntry { return modelEntry{stall: true, frames: frames} }
 
 // reject scripts the endpoint refusing one request: the status, the refusal
 // headers and the error body, none of them reshaped.
@@ -136,6 +149,17 @@ func newScriptedModelServer(t *testing.T, queues map[string][]modelEntry) *scrip
 				return
 			}
 			conn.Close()
+		case entry.stall:
+			// The handler lets go the moment the client does, so a stalled stream
+			// cannot wedge the deferred server close if the bound ever stops firing:
+			// only an endpoint still being waited on keeps stalling.
+			if entry.frames != "" {
+				// Through writeSSE so the frames are flushed and therefore provably
+				// with the client before the silence starts.
+				writeSSE(w, entry.frames)
+			}
+			<-r.Context().Done()
+			return
 		case entry.frames == "" && entry.completion == "":
 			// No constructor builds an entry with neither field, so reaching this means a
 			// new entry kind forgot its discriminator in the switch above.
@@ -674,6 +698,107 @@ func postModelTruncated(t *testing.T, url, body string) (int, string, string, er
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, resp.Header.Get("Content-Type"), string(raw), err
+}
+
+// stalledModelClient is the client the stall tests post with. A stalled endpoint
+// neither ends the stream nor hangs up, so the only bound on how long a stalled
+// round trip can take is the one the caller sets: 100ms is many times the local
+// round trip these tests otherwise need, and far short of the test binary's
+// timeout a hung read would otherwise be bounded by.
+var stalledModelClient = &http.Client{Timeout: 100 * time.Millisecond}
+
+// postModelStalled posts under stalledModelClient and hands back the live
+// response: a stalled stream is asserted by reading it twice — what arrived, and
+// what a further wait produced — so the body cannot be drained and closed here the
+// way postModel does.
+func postModelStalled(t *testing.T, url, body string) *http.Response {
+	t.Helper()
+	resp, err := stalledModelClient.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// clientGaveUp reports whether err is the client's own deadline cutting a round
+// trip or a stream short — or the abort that follows it — rather than the
+// endpoint finishing the body. That distinction is the whole result of a stall
+// test: io.EOF would mean the answer completed after all.
+func clientGaveUp(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline") ||
+		strings.Contains(msg, "abort") ||
+		strings.Contains(msg, "cancel")
+}
+
+// A stall entry carrying frames is the endpoint that starts answering and then
+// stops: the scripted frames really reach the client (writeSSE flush included)
+// and the stream then says nothing more — no done marker and no clean EOF, only
+// the client's own deadline ending the next read.
+func TestScriptedModelServerStallAfterFramesFlushesThenGoesSilent(t *testing.T) {
+	frames := sseFrame(textChunk("half an answer"))
+
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {stallAfterFrames(frames)},
+	})
+
+	resp := postModelStalled(t, s.url()+"/chat/completions", `{"model":"m-a","messages":[]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+
+	delivered := make([]byte, len(frames))
+	if _, err := io.ReadFull(resp.Body, delivered); err != nil {
+		t.Fatalf("read the %d scripted frame bytes: %v", len(frames), err)
+	}
+	if got := string(delivered); got != frames {
+		t.Errorf("bytes delivered = %q, want the flushed frames %q", got, frames)
+	}
+	if strings.Contains(string(delivered), "[DONE]") {
+		t.Errorf("bytes delivered = %q, want no done marker: a stalled stream does not complete", delivered)
+	}
+
+	// Nothing more is coming, so only the client hanging up can end this read.
+	_, err := resp.Body.Read(make([]byte, 1))
+	if !clientGaveUp(err) {
+		t.Errorf("read after the scripted frames ended with %v, want the client to give up: nil means further bytes arrived, io.EOF means the endpoint finished the stream", err)
+	}
+
+	if n := len(s.requestBodies(t)); n != 1 {
+		t.Errorf("recorded %d request bodies, want 1", n)
+	}
+}
+
+// The stall before the first byte answers nothing at all: not even a status line
+// reaches the client, so the round trip itself has to expire. The recorded POST is
+// what makes that a statement about the endpoint rather than about the connection
+// — the request demonstrably got to the handler, and the handler is what stayed
+// quiet.
+func TestScriptedModelServerStallBeforeFirstByteNeverAnswers(t *testing.T) {
+	s := newScriptedModelServer(t, map[string][]modelEntry{
+		"m-a": {stallAfterFrames("")},
+	})
+
+	resp, err := stalledModelClient.Post(s.url()+"/chat/completions", "application/json", strings.NewReader(`{"model":"m-a","messages":[]}`))
+	if resp != nil {
+		resp.Body.Close()
+		t.Errorf("response = status %d, want no response at all: the silence starts before the status line", resp.StatusCode)
+	}
+	if !clientGaveUp(err) {
+		t.Errorf("POST error = %v, want the client's deadline to expire the round trip", err)
+	}
+
+	if n := len(s.requestBodies(t)); n != 1 {
+		t.Errorf("recorded %d request bodies, want 1: the POST reached the handler, so the silence is the handler's", n)
+	}
 }
 
 // An exhausted queue is a scripting mistake, not an answer: the server replies 500
