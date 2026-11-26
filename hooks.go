@@ -396,7 +396,9 @@ func commandPresentation(driverTool, command string) guardPresentation {
 // shape — tool_name "Read" for every file Tool rather than two new protocol
 // names — so one host rule that denies a credential path covers Edit and Write
 // as well as bash. A path has nothing to rewrite, so every hook in the chain is
-// asked about the same one request.
+// asked about the same one request: the rule that refuses a silent hook for
+// withholding a rewrite is command-only policy, and any updatedInput a hook
+// answers a read with is ignored.
 func readPresentation(path string) guardPresentation {
 	return guardPresentation{
 		protocolName: "Read",
@@ -518,19 +520,6 @@ func (c *guardChain) guard(p guardPresentation, stderr io.Writer) (string, strin
 	return guardThrough(c.pre, p, stderr)
 }
 
-// guardCommand runs command through the chain as a bash-shaped call and returns
-// the command to run together with the refusal. It is the one shape whose
-// subject feeds forward: a hook that answers with updatedInput replaces the
-// command the rest of the chain sees and the command the caller runs. The
-// chain's fail-closed judgement is guardThrough's.
-//
-// A nil chain is the run that configured no Hook Manifest, and it answers before
-// the jq lookup guardThrough makes: there is nothing to guard, so the command
-// goes through as asked.
-func (c *guardChain) guardCommand(command, driverTool string, stderr io.Writer) (string, string) {
-	return c.guard(commandPresentation(driverTool, command), stderr)
-}
-
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
 // the non-empty updatedInput.command the hook handed back, or command itself.
 // A hook the manifest declares a rewriter owes that answer for any command worth
@@ -565,29 +554,10 @@ func encodeHookRequest(protocolName, command string) ([]byte, error) {
 }
 
 // encodeHookReadRequest builds the stdin one hook is handed when the call under
-// guard is a file Tool reading or writing path. See guardRead for why the tool
-// name is Read and not the Driver's own name for the call.
+// guard is a file Tool reading or writing path, in the shape readPresentation
+// declares — tool_name "Read" rather than the Driver's own name for the call.
 func encodeHookReadRequest(path string) ([]byte, error) {
 	return encodeHookPayload(hookRequest{ToolName: "Read", ToolInput: hookToolInput{FilePath: path}})
-}
-
-// guardRead runs filePath through the chain as a Read-shaped call and returns
-// the refusal to hand back as the Tool Result, "" for "no objection".
-// The call is presented as the Read tool's own request — tool_name "Read" for
-// both file Tools, not two new protocol names — so one host rule that denies
-// reading a credential path covers Edit and Write as well as bash without being
-// rewritten. The hooks asked are the ones guarding reads, which an empty tools
-// list already means.
-//
-// With feedsRewrite off the chain stops at the verdicts: a read has no input to
-// rewrite, so the rule that refuses a silent rewriter is command-only policy,
-// and any updatedInput a hook answers a read with is ignored.
-//
-// A nil chain has no hook to ask about the read, so it answers "" — the same
-// fast path guardCommand takes, before any jq lookup.
-func (c *guardChain) guardRead(filePath string, stderr io.Writer) string {
-	_, refusal := c.guard(readPresentation(filePath), stderr)
-	return refusal
 }
 
 // encodeHookPostRequest builds the stdin the summary hook is handed for a
@@ -734,7 +704,7 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 //
 // Fail open, where the pre-call chain fails closed — and it is the same
 // hook mechanics underneath, so the shared helper's refusal is dropped
-// on purpose. guardCommand refuses because a hook it cannot hear from is
+// on purpose. guardThrough refuses because a hook it cannot hear from is
 // indistinguishable from one that would have approved, and running an unguarded
 // command is the harm. Here the Driver is holding a real Tool Result already: a
 // summary hook that hangs, exits non-zero, floods, or answers with noise costs
