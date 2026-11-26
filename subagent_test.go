@@ -1421,6 +1421,60 @@ func TestSubagentChildHonoursTheConfiguredDenyHook(t *testing.T) {
 	}
 }
 
+// TestSubagentCallIsShownToNoHook is the ADR's claim for the Subagent Tool made
+// testable: a spawn declares no shape of its own, so no hook is shown it — not
+// even a pre entry naming no tools, which toolMatches reads as every tool. The
+// script denies whatever it is shown and touches a marker on every run, and the
+// child here makes no Tool Call of its own, so a marker can only mean the
+// parent's spawn was put in front of the chain. That a denied call made *by the
+// child* is refused is TestSubagentChildHonoursTheConfiguredDenyHook, which also
+// proves the child's clean call runs; nothing is repeated here.
+func TestSubagentCallIsShownToNoHook(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "hook-ran.marker")
+	hookPath := writeGuardHookScript(t, "deny-everything.sh",
+		`: > `+marker+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"no call is allowed here"}}'`)
+
+	got := runDriver(t, map[string][]modelEntry{
+		"m-parent": {
+			replyCompletion(parentToolCallResponse),
+			replyCompletion(completion("parent answer")),
+		},
+		"m-reviewer": {
+			replyCompletion(completion("child answer")),
+		},
+	}, "p",
+		withRoster(agentSpec{name: "reviewer", model: "m-reviewer", body: "review things"}),
+		// No "tools" key at all: this entry is asked about every tool the chain is
+		// asked about, which is exactly why the spawn must not be one of them.
+		withHookManifest(`{"pre":[{"path":"`+hookPath+`"}]}`),
+		withFlags("--model", "m-parent"),
+	)
+	if got.code != 0 {
+		t.Fatalf("exit code = %d, want 0 — a spawn no hook was shown is an ordinary run; stdout = %q stderr = %q", got.code, got.stdout, got.stderr)
+	}
+	raw := string(got.stdout)
+
+	if hookMarkerExists(t, marker) {
+		t.Errorf("marker %s exists: the hook ran, so the parent's Subagent call was shown to it", marker)
+	}
+
+	_, subagentResult := spawnPair(t, raw)
+	if v, present := subagentResult["is_error"]; present {
+		t.Errorf("Subagent Tool Result is_error = %v, want a spawn that ran: %v", v, subagentResult)
+	}
+	out, _ := subagentResult["tool_output"].(string)
+	if strings.Contains(out, hookPath) || strings.Contains(out, "no call is allowed here") {
+		t.Errorf("Subagent Tool Result tool_output = %q, want no guard refusal for a call no hook is shown", out)
+	}
+	if got := subagentResult["tool_output"]; got != "child answer" {
+		t.Errorf("Subagent Tool Result tool_output = %v, want the child's answer: the spawn has to run", got)
+	}
+	if got := parentResult(t, raw)["text"]; got != "parent answer" {
+		t.Errorf("parent result text = %v, want the parent's own final answer", got)
+	}
+}
+
 // TestSubagentChildGuardComesFromTheConfiguredManifest is the config half of the
 // criterion: with the same roster, the same hook script still on disk, and the
 // same scripted child turn, a Driver Config that names no hook_manifest leaves
