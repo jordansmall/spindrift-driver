@@ -2745,6 +2745,39 @@ func TestSendChatWithoutModelFallsBackToConfiguredModel(t *testing.T) {
 	}
 }
 
+// The attempt budget is used as given: a budget of 0 spends no attempt, so the
+// endpoint is never contacted and sendChat hands back the zero reply alongside
+// the nil error the loop left behind. #66 deleted the clamp that turned a 0 into
+// one quietly substituted attempt; nothing in the config or the flags can build
+// a 0 today, so this pins only that no substitution came back.
+func TestSendChatUsesZeroAttemptBudgetAsGiven(t *testing.T) {
+	oldAttempts, oldBackoff := chatRetryAttempts, chatRetryBackoff
+	chatRetryAttempts, chatRetryBackoff = 0, time.Millisecond
+	defer func() {
+		chatRetryAttempts, chatRetryBackoff = oldAttempts, oldBackoff
+	}()
+
+	// The reply is scripted so a substituted attempt would come back with content and
+	// a model — which is what makes the empty reply below a verdict on sendChat.
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		"configured-model": {replyCompletion(`{"model":"llama-3.1-8b","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)},
+	})
+
+	cfg := completeConfig(srv.url())
+	cfg.model = "configured-model"
+	cfg.timeout = 50 * time.Millisecond
+	reply, err := sendChat(cfg, []chatMessage{{Role: "user", Content: "p"}}, &bytes.Buffer{})
+	if n := len(srv.recordedRequests(t)); n != 0 {
+		t.Errorf("POSTs = %d, want 0: a budget of 0 spends no attempt, so nothing is sent in its place", n)
+	}
+	if err != nil {
+		t.Errorf("err = %v, want nil: no attempt ran, so there is no attempt failure to report", err)
+	}
+	if reply.Message.Content != "" || reply.Reasoning != "" || reply.Model != "" || reply.Tokens != (tokenTotals{}) {
+		t.Errorf("reply = %+v, want the zero reply: no attempt ran, so nothing assembled", reply)
+	}
+}
+
 func TestRunEmptyResponse(t *testing.T) {
 	// the streaming analogue of the old {"choices":[]}: a stream that closes
 	// without ever carrying a chunk

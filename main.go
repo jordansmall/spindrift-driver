@@ -1431,12 +1431,7 @@ func sendChat(cfg config, messages []chatMessage, stderr io.Writer) (chatReply, 
 	if err != nil {
 		return chatReply{}, err
 	}
-	// clamped so an injected knob of 0 (or less) still makes one attempt
-	// instead of reporting an empty answer with a nil error.
 	attempts := chatRetryAttempts
-	if attempts < 1 {
-		attempts = 1
-	}
 	timeout := cfg.timeout
 	// The bound is an idle one, so it cannot be http.Client.Timeout: that expires
 	// the whole round trip and would cut off a stream still delivering bytes. Each
