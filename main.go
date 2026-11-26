@@ -203,7 +203,9 @@ func relayChildEvent(events eventWriter, tally *runTally) relayFunc {
 // The clock it is handed is the one its event stream stamps and its durations
 // measure, so a run reads one clock end to end and a test can substitute a
 // whole grid for the wall clock rather than reassigning state no run owns (#67).
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool), now func() int64) int {
+// The Bash Tool it is handed is the one every bash call of that run executes
+// under, for the same reason: its bounds belong to the Tool, not to the package.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv func(string) (string, bool), now func() int64, bash bashLimits) int {
 	events := eventWriter{w: stdout, now: now}
 	cfg, err := parseArgs(args, stdin, lookupEnv)
 	if err != nil {
@@ -229,7 +231,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 	// call id still gets pair keys that stay unique turn after turn.
 	toolSeq := 0
 	runStart := now()
-	sess := session{cfg: cfg, stderr: stderr, relay: relayChildEvent(events, tally)}
+	sess := session{cfg: cfg, stderr: stderr, relay: relayChildEvent(events, tally), bash: bash}
 	var breaker callBreaker
 	for turn := 0; turn < cfg.maxTurns; turn++ {
 		tally.recordCall()
@@ -443,6 +445,10 @@ type session struct {
 	// session travels into a plan closure by value: a tally of its own would add
 	// to a copy.
 	relay relayFunc
+	// bash is the Bash Tool this run executes commands with, bounds included, so
+	// the cap a summary hook is held to is the cap of the Tool that produced the
+	// result it is replacing.
+	bash bashLimits
 }
 
 // guardRun is the one Guard sequence every planned call runs inside, so the
@@ -468,7 +474,7 @@ func (s session) guardRun(plan toolPlan) toolResult {
 		// replace the text and prose cannot say what a command exited with.
 		// The cap handed over is the Bash Tool's, because the result being replaced
 		// was already held to it.
-		res.text = s.cfg.hooks.summarize(plan.presentation.protocolName, subject, res.text, s.stderr, bashToolMaxOutput)
+		res.text = s.cfg.hooks.summarize(plan.presentation.protocolName, subject, res.text, s.stderr, s.bash.maxOutput)
 	}
 	return res
 }
@@ -554,14 +560,14 @@ func planBashCall(call toolCall, input any, s session) toolPlan {
 	// instead of in this closure is what makes a declared presentation impossible
 	// to run without.
 	//
-	// The subject runBashTool receives is the chain's answer, so a rewrite of host
-	// policy replaces the command that executes while tool_target keeps reporting
-	// the command the Model asked for.
+	// The subject the built Tool's run receives is the chain's answer, so a rewrite
+	// of host policy replaces the command that executes while tool_target keeps
+	// reporting the command the Model asked for.
 	return toolPlan{
 		input:        input,
 		target:       args.Command,
 		presentation: commandPresentation(call.Function.Name, args.Command),
-		run:          runBashTool,
+		run:          s.bash.run,
 	}
 }
 
@@ -578,7 +584,7 @@ func decodeToolArguments(raw string) any {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, realNowMS))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, realNowMS, newBashLimits()))
 }
 
 func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, bool)) (config, error) {
@@ -782,13 +788,6 @@ func promptFrom(args []string, stdin io.Reader) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-// bashToolTimeout bounds one bash tool call; tests inject a short value.
-var bashToolTimeout = 120 * time.Second
-
-// bashToolMaxOutput caps how many bytes of command output a Tool Result
-// keeps; tests inject a small value.
-var bashToolMaxOutput = 10 * 1024
-
 // chatRetryAttempts is the total number of attempts made for one chat request
 // (so 3 means two retries); tests inject a smaller value.
 var chatRetryAttempts = 3
@@ -804,21 +803,16 @@ var chatRetryBackoff = 100 * time.Millisecond
 // starts a complete config from; tests inject a shorter value.
 var chatAttemptTimeout = 5 * time.Minute
 
-// truncateToolOutput is the Bash Tool's own output bound: it keeps the last
-// bashToolMaxOutput bytes of a Tool Result, under which it is the identity.
-func truncateToolOutput(result string) string {
-	return truncateToolOutputTo(result, bashToolMaxOutput)
-}
-
-// truncateToolOutputTo is the same bound at an explicit cap, which is what a
-// summary hook's replacement is held to: the floor has to be the cap of the Tool
-// whose result the hook replaced, so that a summariser cannot hand the Model a
-// longer result than the command itself was allowed.
-func truncateToolOutputTo(result string, maxBytes int) string {
-	if len(result) <= maxBytes {
+// truncateToolOutput is the one output bound, applied at the cap the Bash Tool
+// was built with: it keeps the last maxOutput bytes of a Tool Result, under
+// which it is the identity. Both a command's own output and a summary hook's
+// replacement come through here, so a summariser cannot hand the Model a longer
+// result than the command itself was allowed.
+func truncateToolOutput(result string, maxOutput int) string {
+	if len(result) <= maxOutput {
 		return result
 	}
-	tail := result[len(result)-maxBytes:]
+	tail := result[len(result)-maxOutput:]
 	// never split a multi-byte UTF-8 rune: drop continuation bytes at the cut
 	for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
 		tail = tail[1:]
@@ -833,14 +827,29 @@ func truncatedOutputMarker(kept int) string {
 	return fmt.Sprintf("... output truncated, showing last %d bytes ...", kept)
 }
 
-// runBashTool executes one tool call's shell command and returns the Tool
-// Result: combined stdout+stderr plus a trailing exit-code line, and the
-// verdict that exit produced — a failing command is still an ordinary Tool
-// Result for the model, never a Go error, so nothing but this value can say the
-// call failed. It runs under bash -c in the Driver's own cwd (no persistence
-// between calls).
-func runBashTool(command string) toolResult {
-	ctx, cancel := context.WithTimeout(context.Background(), bashToolTimeout)
+// bashLimits are the two bounds the Bash Tool is built with: timeout is how long
+// a command may run before its process group is killed, and maxOutput is how
+// many bytes of its output a Tool Result keeps. run holds to both, so a Tool
+// Result can never be longer or older than the Tool that made it.
+type bashLimits struct {
+	timeout   time.Duration
+	maxOutput int
+}
+
+// newBashLimits states the production bounds once: two minutes per command, and
+// the last 10 KiB of its output kept.
+func newBashLimits() bashLimits {
+	return bashLimits{timeout: 120 * time.Second, maxOutput: 10 * 1024}
+}
+
+// run executes one tool call's shell command and returns the Tool Result:
+// combined stdout+stderr plus a trailing exit-code line, and the verdict that
+// exit produced — a failing command is still an ordinary Tool Result for the
+// model, never a Go error, so nothing but this value can say the call failed.
+// It runs under bash -c in the Driver's own cwd (no persistence between calls),
+// bound by the timeout and the output cap these limits carry.
+func (b bashLimits) run(command string) toolResult {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	// kill the whole process group on timeout: children of bash would
@@ -866,14 +875,14 @@ func runBashTool(command string) toolResult {
 	result := strings.TrimSuffix(output.String(), "\n")
 	// keep only the tail: truncating here — before the exit-code line is appended
 	// — guarantees that line always survives.
-	result = truncateToolOutput(result)
+	result = truncateToolOutput(result, b.maxOutput)
 	if ctx.Err() != nil {
 		// a command finishing in the window between Wait returning and this
 		// check can be misreported as a timeout; accepted race, since avoiding
 		// it would need a second Wait.
 		// must be distinct from a plain signal kill so the model can tell a
 		// timeout apart from a command that died on a signal
-		return toolResult{text: result + fmt.Sprintf("\nexit code: timed out after %s", bashToolTimeout), failed: true}
+		return toolResult{text: result + fmt.Sprintf("\nexit code: timed out after %s", b.timeout), failed: true}
 	}
 	if err == nil {
 		return toolResult{text: result + "\nexit code: 0"}

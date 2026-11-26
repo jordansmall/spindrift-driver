@@ -448,7 +448,7 @@ func TestGuardChainNilChainPaysNothing(t *testing.T) {
 		t.Errorf("nil chain read presentation = %q, want the empty string", got)
 	}
 	out := "file listing\nexit code: 0"
-	if got := chain.summarize("bash", "ls", out, nil, bashToolMaxOutput); got != out {
+	if got := chain.summarize("bash", "ls", out, nil, newBashLimits().maxOutput); got != out {
 		t.Errorf("nil chain summarize = %q, want the original Tool Result %q", got, out)
 	}
 }
@@ -997,7 +997,7 @@ func TestSummarizeToolOutputReplacesTheToolResult(t *testing.T) {
 	script := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 	if got != "SUMMARY" {
 		t.Errorf("summarize = %q, want the hook's replacement SUMMARY", got)
@@ -1010,7 +1010,7 @@ func TestSummarizeToolOutputHandsTheHookTheCommandAndTheToolResult(t *testing.T)
 		`cat > `+stdin+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	if got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", summarizeFixtureOutput, nil, bashToolMaxOutput); got != "SUMMARY" {
+	if got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", summarizeFixtureOutput, nil, newBashLimits().maxOutput); got != "SUMMARY" {
 		t.Fatalf("summarize = %q, want SUMMARY", got)
 	}
 
@@ -1053,7 +1053,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWhenTheSummaryCannotBeHad(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			hook := &summaryHook{path: writeGuardHookScript(t, "summarize.sh", tc.body)}
 
-			got := (&guardChain{limits: newHookLimits(), summary: hook}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+			got := (&guardChain{limits: newHookLimits(), summary: hook}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 			if got != "file listing\nexit code: 0" {
 				t.Errorf("summarize = %q, want the original Tool Result unchanged", got)
@@ -1067,7 +1067,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWithoutASummaryHook(t *testing.T) {
 	// command's own output, untouched. A run with no Hook Manifest carries no chain
 	// at all rather than an empty one, so that is the receiver under test here.
 	var chain *guardChain
-	got := chain.summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+	got := chain.summarize("bash", "ls", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result", got)
@@ -1077,7 +1077,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWithoutASummaryHook(t *testing.T) {
 func TestSummarizeToolOutputKeepsTheOriginalWhenTheScriptCannotBeStarted(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "never-installed.sh")
 
-	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: missing}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: missing}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result: a summary hook that is not on disk loses the summary, not the answer", got)
@@ -1089,7 +1089,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWhenTheHookHangs(t *testing.T) {
 	limits.timeout = 100 * time.Millisecond
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
-	got := (&guardChain{limits: limits, summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+	got := (&guardChain{limits: limits, summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result: a fired bound loses the summary, not the answer", got)
@@ -1102,7 +1102,7 @@ func TestSummarizeToolOutputSkipsAToolTheEntryDoesNotName(t *testing.T) {
 		`touch `+marker+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script, tools: []string{"Write"}}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script, tools: []string{"Write"}}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, newBashLimits().maxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original for a tool the entry does not name", got)
@@ -1113,7 +1113,7 @@ echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 }
 
 func TestSummarizeToolOutputCapsTheReplacementWithTheToolResultBound(t *testing.T) {
-	// The same floor runBashTool applies, handed over as the cap of the Tool whose
+	// The same floor the Bash Tool applies, handed over as the cap of the Tool whose
 	// result the hook replaced, so a hook summarising upwards cannot hand the Model
 	// a longer result than the command itself was allowed.
 	const toolOutputCap = 64

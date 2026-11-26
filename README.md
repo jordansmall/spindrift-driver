@@ -312,7 +312,7 @@ chain fails closed, and each failure leaves the original output unchanged: a cal
 ran has earned its result. The cases are the ones the chain refuses for — a script that cannot
 be started, a run past the chain's same 5s and 1 MiB bound, a non-zero exit, a flood of stdout, an answer that is nothing readable, and an empty
 replacement, which would trade a real result for the empty string. The Driver's own 10 KiB
-Tool Result cap (`bashToolMaxOutput`) stays in place as the floor under a replacement, so a
+Tool Result cap stays in place as the floor under a replacement, so a
 hook cannot summarise upwards. A refused call is never summarised. That request is
 command-shaped, so the summary hook is handed Bash Tool results only and a file Tool's result
 reaches the Model unchanged, exactly as the Driver wrote it.

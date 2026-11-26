@@ -804,7 +804,7 @@ func TestReadmeDocumentsGuardHooks(t *testing.T) {
 	// The floor under a replacement is the Driver's own Tool Result cap. Read from
 	// the code like the two hook bounds above, so raising it fails here until the
 	// page says the new value.
-	if want := strings.ToLower(fmt.Sprintf("%d KiB", bashToolMaxOutput/1024)); !near(sec, want, "floor", 320) {
+	if want := strings.ToLower(fmt.Sprintf("%d KiB", newBashLimits().maxOutput/1024)); !near(sec, want, "floor", 320) {
 		t.Errorf("the Guard Hooks section does not name the %s Tool Result cap as the floor on a summary replacement", want)
 	}
 	// jq belongs to a guarded run and to nothing else: without it a hook would
