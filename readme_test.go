@@ -746,13 +746,13 @@ func TestReadmeDocumentsGuardHooks(t *testing.T) {
 	}
 	// The bound is read from the code, so raising it fails here until the page says
 	// the new value — the same rule --timeout is pinned under.
-	if want := guardHookTimeout.String(); !strings.Contains(sec, want) {
+	if want := newHookLimits().timeout.String(); !strings.Contains(sec, want) {
 		t.Errorf("the Guard Hooks section does not state the per-hook bound %s", want)
 	}
 	// Likewise the stdout bound. Read as MiB and lowercased to match the normalised
 	// page, so a cap that stops being a whole number of MiB fails here too.
-	if want := strings.ToLower(fmt.Sprintf("%d MiB", guardHookOutputLimit/(1<<20))); !strings.Contains(sec, want) {
-		t.Errorf("the Guard Hooks section does not state the stdout bound %s (%d bytes)", want, guardHookOutputLimit)
+	if want := strings.ToLower(fmt.Sprintf("%d MiB", newHookLimits().outputLimit/(1<<20))); !strings.Contains(sec, want) {
+		t.Errorf("the Guard Hooks section does not state the stdout bound %s (%d bytes)", want, newHookLimits().outputLimit)
 	}
 	// Silence passing is what keeps a manifest from refusing everything.
 	if !near(sec, "silence", "pass", 200) {

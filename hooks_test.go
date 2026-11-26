@@ -34,7 +34,7 @@ func TestLoadHookManifest(t *testing.T) {
 	  ]
 	}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
@@ -58,7 +58,7 @@ func TestLoadHookManifest(t *testing.T) {
 func TestLoadHookManifestEmptyPre(t *testing.T) {
 	path := writeHookManifest(t, `{"pre":[]}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
@@ -72,7 +72,7 @@ func TestLoadHookManifestKeepsFileOrder(t *testing.T) {
 	// denial in slot 0 stays the thing that runs first.
 	path := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/zulu.sh"},{"path":"/lib/hooks/alpha.sh"}]}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
@@ -90,7 +90,7 @@ func TestLoadHookManifestKeepsFileOrder(t *testing.T) {
 func TestLoadHookManifestMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.json")
 
-	_, err := loadHookManifest(path)
+	_, err := loadHookManifest(path, newHookLimits())
 	assertErrMessage(t, err, path, "cannot read")
 }
 
@@ -107,7 +107,7 @@ func TestLoadHookManifestTopLevelNotAnObject(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, "malformed JSON: top-level value is", tc.want, "want an object")
 		})
 	}
@@ -121,7 +121,7 @@ func TestLoadHookManifestMalformedJSON(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, "malformed JSON")
 		})
 	}
@@ -136,7 +136,7 @@ func TestLoadHookManifestUnknownField(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, "unknown field", tc.want)
 		})
 	}
@@ -147,7 +147,7 @@ func TestLoadHookManifestUnknownFieldReportsLexicallyFirst(t *testing.T) {
 	// same file always names the same key.
 	path := writeHookManifest(t, `{"zulu":1,"alpha":2,"Mango":3}`)
 
-	_, err := loadHookManifest(path)
+	_, err := loadHookManifest(path, newHookLimits())
 	assertErrMessage(t, err, path, "unknown field", `"Mango"`)
 	if strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "zulu") {
 		t.Errorf("error %q names a key other than the lexically first", err.Error())
@@ -164,7 +164,7 @@ func TestLoadHookManifestWrongType(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, tc.want)
 		})
 	}
@@ -195,7 +195,7 @@ func TestLoadHookManifestBadEntry(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, tc.want)
 		})
 	}
@@ -228,7 +228,7 @@ func TestGuardHookAppliesTo(t *testing.T) {
 func TestLoadHookManifestNoPreField(t *testing.T) {
 	path := writeHookManifest(t, `{}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error: a manifest that says nothing is a valid manifest", path, err)
 	}
@@ -249,7 +249,7 @@ func TestLoadHookManifestSummaryHook(t *testing.T) {
 	  "post": {"path": "/lib/hooks/summarize.sh", "tools": ["Bash", "Write"]}
 	}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
@@ -272,7 +272,7 @@ func TestLoadHookManifestSummaryHook(t *testing.T) {
 func TestLoadHookManifestSummaryWithoutPre(t *testing.T) {
 	path := writeHookManifest(t, `{"post":{"path":"/lib/hooks/summarize.sh"}}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
 	}
@@ -293,7 +293,7 @@ func TestLoadHookManifestSummaryWithoutPre(t *testing.T) {
 func TestLoadHookManifestNoSummary(t *testing.T) {
 	path := writeHookManifest(t, `{"pre":[{"path":"/lib/hooks/deny.sh"}]}`)
 
-	manifest, err := loadHookManifest(path)
+	manifest, err := loadHookManifest(path, newHookLimits())
 	if err != nil {
 		t.Fatalf("loadHookManifest(%s) = %v, want no error: post is optional", path, err)
 	}
@@ -337,7 +337,7 @@ func TestLoadHookManifestBadSummary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeHookManifest(t, tc.contents)
 
-			_, err := loadHookManifest(path)
+			_, err := loadHookManifest(path, newHookLimits())
 			assertErrMessage(t, err, path, tc.want)
 		})
 	}
@@ -406,10 +406,16 @@ func writeGuardHookScript(t *testing.T, name, body string) string {
 	return path
 }
 
-// chainOf is the guard chain one test needs: the hooks it names, in the order
-// given, which is the order the chain runs them.
+// chainOf is the guard chain one test needs: the production bounds, and the hooks
+// it names in the order given, which is the order the chain runs them.
 func chainOf(hooks ...guardHook) *guardChain {
-	return &guardChain{pre: hooks}
+	return chainWithLimits(newHookLimits(), hooks...)
+}
+
+// chainWithLimits is chainOf for a test that is about a bound: the chain it guards
+// with carries the pair under test instead of a knob the whole binary shares.
+func chainWithLimits(limits hookLimits, hooks ...guardHook) *guardChain {
+	return &guardChain{limits: limits, pre: hooks}
 }
 
 // hookMarkerExists reports whether the script left its marker behind. A stat
@@ -442,7 +448,7 @@ func TestGuardChainNilChainPaysNothing(t *testing.T) {
 		t.Errorf("nil chain read presentation = %q, want the empty string", got)
 	}
 	out := "file listing\nexit code: 0"
-	if got := chain.summarize("bash", "ls", out, nil); got != out {
+	if got := chain.summarize("bash", "ls", out, nil, bashToolMaxOutput); got != out {
 		t.Errorf("nil chain summarize = %q, want the original Tool Result %q", got, out)
 	}
 }
@@ -553,16 +559,38 @@ func TestCommandPresentationFailsClosedWhenTheHookCannotBeRun(t *testing.T) {
 	}
 }
 
+// TestLoadHookManifestGuardsWithTheLimitsItWasBuiltWith pins that a chain's
+// bounds are the pair it was built with: the loader stamps what it is handed onto
+// the chain it returns, and the guard enforces that pair rather than any default.
+func TestLoadHookManifestGuardsWithTheLimitsItWasBuiltWith(t *testing.T) {
+	limits := hookLimits{timeout: 100 * time.Millisecond, outputLimit: 4096}
+	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
+	path := writeHookManifest(t, `{"pre":[{"path":"`+script+`"}]}`)
+
+	chain, err := loadHookManifest(path, limits)
+	if err != nil {
+		t.Fatalf("loadHookManifest(%s) = %v, want no error", path, err)
+	}
+	if chain.limits != limits {
+		t.Errorf("loaded chain limits = %+v, want %+v", chain.limits, limits)
+	}
+
+	_, got := chain.guard(commandPresentation("bash", "ls"), nil)
+
+	want := "error: guard hook " + script + " timed out after 100ms, so the command is blocked"
+	if got != want {
+		t.Errorf("command presentation = %q, want %q", got, want)
+	}
+}
+
 func TestCommandPresentationFailsClosedWhenTheHookHangs(t *testing.T) {
-	// guardHookTimeout is one knob shared by the whole test binary, so it is
-	// restored in Cleanup and this file stays serial: two hang tests running at
-	// once would each be judged against the other's bound.
-	old := guardHookTimeout
-	guardHookTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { guardHookTimeout = old })
+	// The bound is the chain's own, shortened so the test does not wait out five
+	// seconds for the refusal it is about.
+	limits := newHookLimits()
+	limits.timeout = 100 * time.Millisecond
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
-	_, got := chainOf(guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil)
+	_, got := chainWithLimits(limits, guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil)
 
 	want := "error: guard hook " + script + " timed out after 100ms, so the command is blocked"
 	if got != want {
@@ -575,15 +603,14 @@ func TestCommandPresentationFailsClosedKillsTheHooksProcessGroup(t *testing.T) {
 	// killing only the hook would orphan the spinner, still ticking in the
 	// background. The grandchild closes the inherited output fds so it cannot be
 	// what WaitDelay is unblocking on — the test is about the kill, not the wait.
-	old := guardHookTimeout
-	guardHookTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { guardHookTimeout = old })
+	limits := newHookLimits()
+	limits.timeout = 300 * time.Millisecond
 	marker := filepath.Join(t.TempDir(), "ticks")
 	t.Setenv("SPINDRIFT_HOOK_TICK_MARKER", marker)
 	script := writeGuardHookScript(t, "spin.sh", `( exec 1>&- 2>&-; while :; do echo tick >> "$SPINDRIFT_HOOK_TICK_MARKER"; sleep 0.05; done ) &
 sleep 30`)
 
-	_, got := chainOf(guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil)
+	_, got := chainWithLimits(limits, guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil)
 
 	want := "error: guard hook " + script + " timed out after 300ms, so the command is blocked"
 	if got != want {
@@ -757,9 +784,8 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 }
 
 func TestCommandPresentationFailsClosedWhenTheHookOverrunsTheOutputCap(t *testing.T) {
-	old := guardHookOutputLimit
-	guardHookOutputLimit = 4096
-	t.Cleanup(func() { guardHookOutputLimit = old })
+	limits := newHookLimits()
+	limits.outputLimit = 4096
 
 	dir := t.TempDir()
 	secondMarker := filepath.Join(dir, "second-ran")
@@ -772,7 +798,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionRea
 		`touch `+secondMarker+`
 echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too late"}}'`)
 
-	_, got := chainOf(guardHook{path: first}, guardHook{path: second}).guard(commandPresentation("bash", "ls"), nil)
+	_, got := chainWithLimits(limits, guardHook{path: first}, guardHook{path: second}).guard(commandPresentation("bash", "ls"), nil)
 
 	if !strings.HasPrefix(got, "error: ") {
 		t.Errorf("command presentation = %q, want an error: prefixed refusal", got)
@@ -780,8 +806,8 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 	if !strings.Contains(got, first) {
 		t.Errorf("refusal %q does not name the hook %q", got, first)
 	}
-	if !strings.Contains(got, fmt.Sprintf("%d bytes", guardHookOutputLimit)) {
-		t.Errorf("refusal %q does not name the output bound of %d bytes", got, guardHookOutputLimit)
+	if !strings.Contains(got, fmt.Sprintf("%d bytes", limits.outputLimit)) {
+		t.Errorf("refusal %q does not name the output bound of %d bytes", got, limits.outputLimit)
 	}
 	if !strings.Contains(got, "blocked") {
 		t.Errorf("refusal %q does not say the command is blocked", got)
@@ -794,13 +820,12 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 func TestCommandPresentationOutputExactlyAtTheCapPasses(t *testing.T) {
 	// The bound is inclusive: a hook that fills it is a hook that answered, so an
 	// off-by-one that reads "reached" as "exceeded" refuses every long verdict.
-	old := guardHookOutputLimit
-	guardHookOutputLimit = 4096
-	t.Cleanup(func() { guardHookOutputLimit = old })
+	limits := newHookLimits()
+	limits.outputLimit = 4096
 	script := writeGuardHookScript(t, "exact.sh",
-		fmt.Sprintf(`yes '' | head -c %d`, guardHookOutputLimit))
+		fmt.Sprintf(`yes '' | head -c %d`, limits.outputLimit))
 
-	if _, got := chainOf(guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil); got != "" {
+	if _, got := chainWithLimits(limits, guardHook{path: script}).guard(commandPresentation("bash", "ls"), nil); got != "" {
 		t.Errorf("command presentation = %q, want the empty string (proceed) for output at the cap", got)
 	}
 }
@@ -972,7 +997,7 @@ func TestSummarizeToolOutputReplacesTheToolResult(t *testing.T) {
 	script := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	got := (&guardChain{summary: &summaryHook{path: script}}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 	if got != "SUMMARY" {
 		t.Errorf("summarize = %q, want the hook's replacement SUMMARY", got)
@@ -985,7 +1010,7 @@ func TestSummarizeToolOutputHandsTheHookTheCommandAndTheToolResult(t *testing.T)
 		`cat > `+stdin+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	if got := (&guardChain{summary: &summaryHook{path: script}}).summarize("bash", "ls -l", summarizeFixtureOutput, nil); got != "SUMMARY" {
+	if got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls -l", summarizeFixtureOutput, nil, bashToolMaxOutput); got != "SUMMARY" {
 		t.Fatalf("summarize = %q, want SUMMARY", got)
 	}
 
@@ -1028,7 +1053,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWhenTheSummaryCannotBeHad(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			hook := &summaryHook{path: writeGuardHookScript(t, "summarize.sh", tc.body)}
 
-			got := (&guardChain{summary: hook}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil)
+			got := (&guardChain{limits: newHookLimits(), summary: hook}).summarize("bash", "ls -l", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 			if got != "file listing\nexit code: 0" {
 				t.Errorf("summarize = %q, want the original Tool Result unchanged", got)
@@ -1042,7 +1067,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWithoutASummaryHook(t *testing.T) {
 	// command's own output, untouched. A run with no Hook Manifest carries no chain
 	// at all rather than an empty one, so that is the receiver under test here.
 	var chain *guardChain
-	got := chain.summarize("bash", "ls", "file listing\nexit code: 0", nil)
+	got := chain.summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result", got)
@@ -1052,7 +1077,7 @@ func TestSummarizeToolOutputKeepsTheOriginalWithoutASummaryHook(t *testing.T) {
 func TestSummarizeToolOutputKeepsTheOriginalWhenTheScriptCannotBeStarted(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "never-installed.sh")
 
-	got := (&guardChain{summary: &summaryHook{path: missing}}).summarize("bash", "ls", "file listing\nexit code: 0", nil)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: missing}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result: a summary hook that is not on disk loses the summary, not the answer", got)
@@ -1060,12 +1085,11 @@ func TestSummarizeToolOutputKeepsTheOriginalWhenTheScriptCannotBeStarted(t *test
 }
 
 func TestSummarizeToolOutputKeepsTheOriginalWhenTheHookHangs(t *testing.T) {
-	old := guardHookTimeout
-	guardHookTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { guardHookTimeout = old })
+	limits := newHookLimits()
+	limits.timeout = 100 * time.Millisecond
 	script := writeGuardHookScript(t, "hang.sh", "sleep 30")
 
-	got := (&guardChain{summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil)
+	got := (&guardChain{limits: limits, summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original Tool Result: a fired bound loses the summary, not the answer", got)
@@ -1078,7 +1102,7 @@ func TestSummarizeToolOutputSkipsAToolTheEntryDoesNotName(t *testing.T) {
 		`touch `+marker+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 
-	got := (&guardChain{summary: &summaryHook{path: script, tools: []string{"Write"}}}).summarize("bash", "ls", "file listing\nexit code: 0", nil)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script, tools: []string{"Write"}}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, bashToolMaxOutput)
 
 	if got != "file listing\nexit code: 0" {
 		t.Errorf("summarize = %q, want the original for a tool the entry does not name", got)
@@ -1089,22 +1113,21 @@ echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 }
 
 func TestSummarizeToolOutputCapsTheReplacementWithTheToolResultBound(t *testing.T) {
-	// The same floor runBashTool applies, so a hook summarising upwards cannot hand
-	// the Model a longer result than the command itself was allowed.
-	old := bashToolMaxOutput
-	bashToolMaxOutput = 64
-	defer func() { bashToolMaxOutput = old }()
+	// The same floor runBashTool applies, handed over as the cap of the Tool whose
+	// result the hook replaced, so a hook summarising upwards cannot hand the Model
+	// a longer result than the command itself was allowed.
+	const toolOutputCap = 64
 	long := strings.Repeat("s", 200)
 	script := writeGuardHookScript(t, "summarize.sh",
 		`printf '{"hookSpecificOutput":{"updatedToolOutput":"`+long+`"}}'`)
 
-	got := (&guardChain{summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil)
+	got := (&guardChain{limits: newHookLimits(), summary: &summaryHook{path: script}}).summarize("bash", "ls", "file listing\nexit code: 0", nil, toolOutputCap)
 
-	if !strings.HasPrefix(got, truncatedOutputMarker(bashToolMaxOutput)+"\n") {
-		t.Errorf("summary replacement = %q, want it capped behind %q", got, truncatedOutputMarker(bashToolMaxOutput))
+	if !strings.HasPrefix(got, truncatedOutputMarker(toolOutputCap)+"\n") {
+		t.Errorf("summary replacement = %q, want it capped behind %q", got, truncatedOutputMarker(toolOutputCap))
 	}
-	if tail := long[len(long)-bashToolMaxOutput:]; !strings.HasSuffix(got, tail) {
-		t.Errorf("summary replacement = %q, want the last %d bytes of the hook's summary kept", got, bashToolMaxOutput)
+	if tail := long[len(long)-toolOutputCap:]; !strings.HasSuffix(got, tail) {
+		t.Errorf("summary replacement = %q, want the last %d bytes of the hook's summary kept", got, toolOutputCap)
 	}
 }
 
@@ -1257,7 +1280,7 @@ func TestGuardThroughBuildsANonRewritingRequestOnceForTheChain(t *testing.T) {
 			{path: writeGuardHookScript(t, "record-second.sh", `cat > `+second)},
 		}
 
-		if _, refusal := guardThrough(hooks, readPresentation(func(string) ([]byte, error) {
+		if _, refusal := guardThrough(hooks, newHookLimits(), readPresentation(func(string) ([]byte, error) {
 			encodes++
 			return encodeHookReadRequest(target)
 		}), nil); refusal != "" {
@@ -1281,7 +1304,7 @@ func TestGuardThroughBuildsANonRewritingRequestOnceForTheChain(t *testing.T) {
 	t.Run("an unbuilt request refuses with no hook applying", func(t *testing.T) {
 		encodes := 0
 
-		_, refusal := guardThrough([]guardHook{{path: "never-runs.sh", tools: []string{"Bash"}}},
+		_, refusal := guardThrough([]guardHook{{path: "never-runs.sh", tools: []string{"Bash"}}}, newHookLimits(),
 			readPresentation(func(string) ([]byte, error) {
 				encodes++
 				return nil, fmt.Errorf("boom")
@@ -1300,10 +1323,7 @@ func TestReadPresentationFailsClosedOnAMisbehavingHook(t *testing.T) {
 	// The run-level half of the fail-closed judgement is the shared run's, so the
 	// Read presentation refuses with the exact text the command shape returns for
 	// the same fault — including the rows that say "command" while blocking a read.
-	oldTimeout, oldLimit := guardHookTimeout, guardHookOutputLimit
-	guardHookTimeout = 300 * time.Millisecond
-	guardHookOutputLimit = 4096
-	t.Cleanup(func() { guardHookTimeout, guardHookOutputLimit = oldTimeout, oldLimit })
+	limits := hookLimits{timeout: 300 * time.Millisecond, outputLimit: 4096}
 
 	for _, tc := range []struct{ name, body, want string }{
 		{"non-zero exit", `echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}' >&2; exit 3`, "failed: exit status 3"},
@@ -1317,9 +1337,9 @@ func TestReadPresentationFailsClosedOnAMisbehavingHook(t *testing.T) {
 			// silence. The flood is sized off the cap rather than hardcoded, or this
 			// row drifts to the passing side of it whenever the cap moves.
 			fmt.Sprintf(`yes '' | head -c %d
-echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`, guardHookOutputLimit+1),
-			fmt.Sprintf("wrote more than %d bytes of output, so the command is blocked", guardHookOutputLimit)},
-		{"bound overrun", `sleep 30`, fmt.Sprintf("timed out after %s, so the command is blocked", guardHookTimeout)},
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fine"}}'`, limits.outputLimit+1),
+			fmt.Sprintf("wrote more than %d bytes of output, so the command is blocked", limits.outputLimit)},
+		{"bound overrun", `sleep 30`, fmt.Sprintf("timed out after %s, so the command is blocked", limits.timeout)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The marker opens every script, so a refusal that names a fault inside
@@ -1328,7 +1348,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionRea
 			script := writeGuardHookScript(t, "hook.sh", `: > `+marker+`
 `+tc.body)
 
-			_, got := chainOf(guardHook{path: script}).guard(readPresentation("/home/model/.ssh/id_ed25519"), nil)
+			_, got := chainWithLimits(limits, guardHook{path: script}).guard(readPresentation("/home/model/.ssh/id_ed25519"), nil)
 
 			want := "error: guard hook " + script + " " + tc.want
 			if got != want {
