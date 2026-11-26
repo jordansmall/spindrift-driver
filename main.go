@@ -466,7 +466,9 @@ func (s session) guardRun(plan toolPlan) toolResult {
 	if plan.presentation.summarizes {
 		// The verdict is taken before the summary hook is asked, because its prose may
 		// replace the text and prose cannot say what a command exited with.
-		res.text = s.cfg.hooks.summarize(plan.presentation.protocolName, subject, res.text, s.stderr)
+		// The cap handed over is the Bash Tool's, because the result being replaced
+		// was already held to it.
+		res.text = s.cfg.hooks.summarize(plan.presentation.protocolName, subject, res.text, s.stderr, bashToolMaxOutput)
 	}
 	return res
 }
@@ -675,7 +677,7 @@ func parseArgs(args []string, stdin io.Reader, lookupEnv func(string) (string, b
 	// run unguarded because a file went missing. loadHookManifest already names
 	// the manifest path in every message it returns, so nothing is wrapped here.
 	if file.hookManifest != "" {
-		chain, err := loadHookManifest(file.hookManifest)
+		chain, err := loadHookManifest(file.hookManifest, newHookLimits())
 		if err != nil {
 			return config{}, err
 		}
@@ -802,16 +804,21 @@ var chatRetryBackoff = 100 * time.Millisecond
 // starts a complete config from; tests inject a shorter value.
 var chatAttemptTimeout = 5 * time.Minute
 
-// truncateToolOutput is the one output bound: it keeps the last
+// truncateToolOutput is the Bash Tool's own output bound: it keeps the last
 // bashToolMaxOutput bytes of a Tool Result, under which it is the identity.
-// Both a command's own output and a summary hook's replacement come through
-// here, so a summariser cannot hand the Model a longer result than the command
-// was allowed — the cap is the floor the Driver holds even when a hook fails.
 func truncateToolOutput(result string) string {
-	if len(result) <= bashToolMaxOutput {
+	return truncateToolOutputTo(result, bashToolMaxOutput)
+}
+
+// truncateToolOutputTo is the same bound at an explicit cap, which is what a
+// summary hook's replacement is held to: the floor has to be the cap of the Tool
+// whose result the hook replaced, so that a summariser cannot hand the Model a
+// longer result than the command itself was allowed.
+func truncateToolOutputTo(result string, maxBytes int) string {
+	if len(result) <= maxBytes {
 		return result
 	}
-	tail := result[len(result)-bashToolMaxOutput:]
+	tail := result[len(result)-maxBytes:]
 	// never split a multi-byte UTF-8 rune: drop continuation bytes at the cut
 	for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
 		tail = tail[1:]

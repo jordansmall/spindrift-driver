@@ -14,13 +14,26 @@ import (
 	"time"
 )
 
-// guardHookTimeout bounds one Guard Hook run; tests inject a shorter value.
-var guardHookTimeout = 5 * time.Second
+// hookLimits are the two bounds one Guard chain holds every script it runs to:
+// how long a run may take before its silence counts as no answer, and how much of
+// its stdout the Driver keeps. A chain carries its own pair from the site that
+// built it, so a test that needs a different bound builds a chain with it instead
+// of editing state every other chain in the binary is reading.
+//
+// outputLimit is inclusive: exactly that many bytes is an answer, one byte more is
+// a hook that flooded instead. The bound judges before any verdict is read out of
+// the kept prefix, because a verdict the Driver only half received is not a
+// verdict — the discarded tail may have held the denial.
+type hookLimits struct {
+	timeout     time.Duration
+	outputLimit int
+}
 
-// guardHookOutputLimit caps how much of one Guard Hook's stdout the Driver
-// holds; tests inject a smaller value. The cap is inclusive: exactly this many
-// bytes is an answer, one byte more is a hook that flooded instead.
-var guardHookOutputLimit = 1 << 20
+// newHookLimits states the production pair once, for the site that builds the
+// chain a run guards with: 5s for one hook script and 1 MiB of its stdout.
+func newHookLimits() hookLimits {
+	return hookLimits{timeout: 5 * time.Second, outputLimit: 1 << 20}
+}
 
 // guardHook is one pre-call Guard Hook entry of a Hook Manifest: the script to
 // run, the hook-protocol tool names it applies to, and whether it rewrites the
@@ -58,6 +71,9 @@ type summaryHook struct {
 // carries no chain at all, and every guard method answers it without a jq lookup
 // or a fork.
 type guardChain struct {
+	// limits bounds every script this chain runs; it arrives with the chain rather
+	// than as state the whole binary shares, so no other run can re-bound it.
+	limits  hookLimits
 	pre     []guardHook
 	summary *summaryHook
 }
@@ -90,7 +106,10 @@ var (
 // null or an empty file included, which json would otherwise hand back as a nil
 // map and read as "no hooks"), and any unknown field are all errors naming the
 // path.
-func loadHookManifest(path string) (guardChain, error) {
+//
+// The limits pair is stamped onto the chain returned, so the bounds every script it
+// runs are fixed where the chain is built.
+func loadHookManifest(path string, limits hookLimits) (guardChain, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return guardChain{}, fmt.Errorf("hook manifest %s: cannot read: %v", path, err)
@@ -115,7 +134,7 @@ func loadHookManifest(path string) (guardChain, error) {
 	// Both keys are optional, and each is read independently: a manifest that
 	// names only post-call work still gets its summary hook parsed, so neither
 	// key's absence may short-circuit the other.
-	var manifest guardChain
+	manifest := guardChain{limits: limits}
 	if rawPre, ok := fields["pre"]; ok {
 		if kind := jsonKind(rawPre); kind != "array" {
 			return guardChain{}, fmt.Errorf("hook manifest %s: field %q must be an array, got %s", path, "pre", kind)
@@ -431,7 +450,7 @@ func (p guardPresentation) asksNothing() bool { return p.encode == nil }
 // empty or whitespace-only stdout, an absent or null hookSpecificOutput, and
 // any decision that is not the literal "deny" — those are hooks with no
 // opinion. A script that cannot be started, a run that outlives
-// guardHookTimeout, a non-zero exit, stdout past guardHookOutputLimit, and
+// limits.timeout, a non-zero exit, stdout past limits.outputLimit, and
 // stdout that carries no readable verdict are the fail-closed half: the Driver
 // refuses rather than accept an answer it never got, since it cannot tell a
 // broken hook from an approving one. So is a rewriting hook's answer that rewrote
@@ -442,7 +461,7 @@ func (p guardPresentation) asksNothing() bool { return p.encode == nil }
 // names the hook's path so the operator can find the script to ask why. The
 // missing-jq precondition below is the exception: it belongs to the guarded run
 // rather than to one hook, and each presentation words it for its own subject.
-func guardThrough(hooks []guardHook, p guardPresentation, stderr io.Writer) (string, string) {
+func guardThrough(hooks []guardHook, limits hookLimits, p guardPresentation, stderr io.Writer) (string, string) {
 	if len(hooks) == 0 {
 		// An unguarded run pays nothing: no marshalling, no fork, no wait — and no
 		// jq, since nothing here needs reading. The call goes through as asked.
@@ -482,7 +501,7 @@ func guardThrough(hooks []guardHook, p guardPresentation, stderr io.Writer) (str
 		}
 		// The run is judged before the verdict: a hook that never answered blocks
 		// the call on its own, with nothing left to parse.
-		stdout, refusal := runHookScript(hook.path, payload, stderr)
+		stdout, refusal := runHookScript(hook.path, payload, stderr, limits)
 		var answer hookResponse
 		if refusal == "" {
 			answer, refusal = hookVerdict(hook, stdout)
@@ -517,7 +536,7 @@ func (c *guardChain) guard(p guardPresentation, stderr io.Writer) (string, strin
 	if c == nil || p.asksNothing() {
 		return p.subject, ""
 	}
-	return guardThrough(c.pre, p, stderr)
+	return guardThrough(c.pre, c.limits, p, stderr)
 }
 
 // hookRewrite decides what the chain runs next once a hook raised no refusal:
@@ -586,15 +605,18 @@ func encodeHookPayload(payload any) ([]byte, error) {
 // string and keeps its original output instead: the same run mechanics, the
 // opposite verdict on a failed run, because the two callers have different
 // defaults to fall back on.
-func runHookScript(path string, payload []byte, stderr io.Writer) (stdout []byte, refusal string) {
-	ctx, cancel := context.WithTimeout(context.Background(), guardHookTimeout)
+// The two bounds enforced here come from limits, the pair the calling chain was
+// built with, and the timeout refusal quotes that value back, so a blocked call
+// names the bound that actually stopped it.
+func runHookScript(path string, payload []byte, stderr io.Writer, limits hookLimits) (stdout []byte, refusal string) {
+	ctx, cancel := context.WithTimeout(context.Background(), limits.timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path)
 	// The script is what the host baked — shebang, mode bits and all — so it is
 	// exec'd directly. A shell in between would add a second quoting layer over
 	// text the hook is handed as data, and a manifest path is not a command.
 	cmd.Stdin = bytes.NewReader(payload)
-	out := &cappedWriter{limit: guardHookOutputLimit}
+	out := &cappedWriter{limit: limits.outputLimit}
 	cmd.Stdout = out
 	// A hook's own noise goes to the operator's progress copy, never to the wire:
 	// stdout carries only event lines, so a stray byte from a hook would be a
@@ -628,7 +650,7 @@ func runHookScript(path string, payload []byte, stderr io.Writer) (stdout []byte
 		// as the signal death it was. The accepted race runBashTool documents
 		// applies here too: a hook that finished between Wait and this check is
 		// reported as timed out.
-		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", path, guardHookTimeout)
+		return nil, fmt.Sprintf("error: guard hook %s timed out after %s, so the command is blocked", path, limits.timeout)
 	}
 	if err != nil {
 		// Includes a death on a signal, which exec words as "signal: …" — the
@@ -713,18 +735,20 @@ func hookVerdict(hook guardHook, stdout []byte) (hookResponse, string) {
 //
 // So every one of these returns output untouched: no chain at all, no summary
 // hook configured, or one whose tools list omits this tool (the script never
-// runs), a script that cannot be started, a run past guardHookTimeout, a
-// non-zero exit, stdout past guardHookOutputLimit, stdout that is not readable
+// runs), a script that cannot be started, a run past the chain's time bound, a
+// non-zero exit, stdout past the chain's output cap, stdout that is not readable
 // JSON, an absent hookSpecificOutput, and an absent or empty updatedToolOutput
 // — a summary of nothing would replace a real result with the empty string,
 // which is the loss this function exists to prevent.
 //
-// A replacement is capped by truncateToolOutput, the very bound runBashTool
-// applies, so a hook that summarises upwards cannot hand the Model a longer
-// result than the command itself was allowed. Nothing re-appends the exit-code
-// line: the replacement is the Tool Result verbatim, and planToolCall keeps the
+// A replacement is capped by toolOutputCap, the output bound of the Tool whose
+// result is being replaced — runBashTool's own — which the caller passes because
+// that bound belongs to the Tool rather than here. A hook that summarises upwards
+// cannot hand the Model a longer result than the command itself was allowed.
+// Nothing re-appends the exit-code line: the replacement is the Tool Result
+// verbatim, and planToolCall keeps the
 // command's own verdict for is_error.
-func (c *guardChain) summarize(driverTool, command, output string, stderr io.Writer) string {
+func (c *guardChain) summarize(driverTool, command, output string, stderr io.Writer, toolOutputCap int) string {
 	if c == nil || c.summary == nil {
 		return output
 	}
@@ -737,7 +761,7 @@ func (c *guardChain) summarize(driverTool, command, output string, stderr io.Wri
 	if err != nil {
 		return output
 	}
-	stdout, _ := runHookScript(hook.path, payload, stderr)
+	stdout, _ := runHookScript(hook.path, payload, stderr, c.limits)
 	var response hookResponse
 	if err := json.Unmarshal(stdout, &response); err != nil || response.HookSpecificOutput == nil {
 		return output
@@ -746,7 +770,7 @@ func (c *guardChain) summarize(driverTool, command, output string, stderr io.Wri
 	if summary == "" {
 		return output
 	}
-	return truncateToolOutput(summary)
+	return truncateToolOutputTo(summary, toolOutputCap)
 }
 
 // sortedKeys gives the unknown-field scans a stable order, for the reason

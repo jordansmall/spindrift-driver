@@ -291,9 +291,9 @@ there is ignored. `jq` stays the precondition of a guarded run, file Calls inclu
 `jq` on `PATH` a guarded `edit` is refused naming `jq`, exactly as a guarded command is.
 
 Anything else fails closed, because the Driver cannot tell a broken hook from an approving
-one: a script that cannot be run, a hook that overruns its per-hook bound of 5s
-(`guardHookTimeout`), a hook that writes more than 1 MiB of stdout
-(`guardHookOutputLimit`), a hook that exits non-zero, and an answer that is nothing readable
+one: a script that cannot be run, a hook that overruns the 5s bound its chain was built
+with, a hook that writes more than the 1 MiB of stdout that chain holds, a hook that exits
+non-zero, and an answer that is nothing readable
 all block the call exactly as a deny does.
 
 `jq` is a precondition of a guarded run. The baked hook scripts read the request above out of
@@ -310,8 +310,7 @@ Tool Result exactly as the Model would otherwise receive it. It answers with
 what the Model sees next. A summary hook fails open where the
 chain fails closed, and each failure leaves the original output unchanged: a call that already
 ran has earned its result. The cases are the ones the chain refuses for — a script that cannot
-be started, a run past the same 5s (`guardHookTimeout`) and 1 MiB (`guardHookOutputLimit`)
-bound, a non-zero exit, a flood of stdout, an answer that is nothing readable, and an empty
+be started, a run past the chain's same 5s and 1 MiB bound, a non-zero exit, a flood of stdout, an answer that is nothing readable, and an empty
 replacement, which would trade a real result for the empty string. The Driver's own 10 KiB
 Tool Result cap (`bashToolMaxOutput`) stays in place as the floor under a replacement, so a
 hook cannot summarise upwards. A refused call is never summarised. That request is

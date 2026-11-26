@@ -5112,8 +5112,8 @@ func TestRunGuardHookRewriteReplacesTheCommandThatRuns(t *testing.T) {
 }
 
 // TestRunGuardHookFiresAfterToolCallEvent pins which side of the planning seam
-// the Guard chain sits on: a hook is an executed script with up to
-// guardHookTimeout of its own, so it fires when the call runs — after the
+// the Guard chain sits on: a hook is an executed script with a time bound of its
+// own, so it fires when the call runs — after the
 // tool_call event has left — never while the call is still being parsed. The
 // hook is its own witness: it reads the run's stdout file and touches its marker
 // only when the tool_call line is already on it, so the assertion is about
@@ -5217,6 +5217,7 @@ func TestGuardRunRefusalRunsNothing(t *testing.T) {
 	summary := writeGuardHookScript(t, "summarize.sh",
 		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 	s := session{cfg: config{hooks: &guardChain{
+		limits:  newHookLimits(),
 		pre:     []guardHook{{path: deny}},
 		summary: &summaryHook{path: summary},
 	}}, stderr: io.Discard}
@@ -5294,6 +5295,7 @@ func TestGuardRunSummarizesTheCommandThatRan(t *testing.T) {
 		`cat > `+stdin+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 	s := session{cfg: config{hooks: &guardChain{
+		limits:  newHookLimits(),
 		pre:     []guardHook{{path: rewrite, rewrites: true}},
 		summary: &summaryHook{path: summary},
 	}}, stderr: io.Discard}
@@ -5341,6 +5343,7 @@ echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReas
 		`touch `+summarised+`
 echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
 	s := session{cfg: config{hooks: &guardChain{
+		limits:  newHookLimits(),
 		pre:     []guardHook{{path: deny}},
 		summary: &summaryHook{path: summary},
 	}}, stderr: io.Discard}
