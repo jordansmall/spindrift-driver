@@ -542,19 +542,10 @@ func newScriptedSSEServer(t *testing.T, streams ...[]string) *scriptedChatServer
 
 // newScriptedSSERawServer scripts one SSE response body per POST, verbatim, for
 // the streams a chunk list cannot express: keep-alive comments, event: lines, a
-// frame left unterminated, and the stalls sseStall describes.
+// frame left unterminated.
 func newScriptedSSERawServer(t *testing.T, bodies ...string) *scriptedChatServer {
 	return (&scriptedChatServer{responses: bodies}).serve(t)
 }
-
-// sseStallPrefix marks a scripted response that never finishes.
-const sseStallPrefix = "\x00stall:"
-
-// sseStall scripts a stalled endpoint: everything given as frames reaches the
-// client and is flushed, then the stream says nothing more until the client
-// hangs up. sseStall("") is the stall before the first byte — not even a status
-// line is written, so the round trip itself must expire.
-func sseStall(frames string) string { return sseStallPrefix + frames }
 
 // SSE carries more than chunks: a ':' line is a keep-alive comment, an event:
 // line names the frame that follows, and the done marker closes the stream. None
@@ -595,19 +586,6 @@ func (s *scriptedChatServer) serve(t *testing.T) *scriptedChatServer {
 		s.mu.Unlock()
 		if exhausted {
 			http.Error(w, "no scripted response left", http.StatusInternalServerError)
-			return
-		}
-		if frames, stalled := strings.CutPrefix(resp, sseStallPrefix); stalled {
-			// The handler lets go the moment the client does, so a stalled stream
-			// cannot wedge the deferred server close if the bound ever stops
-			// firing: only an endpoint still being waited on keeps stalling.
-			if frames != "" {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.WriteHeader(http.StatusOK)
-				io.WriteString(w, frames)
-				w.(http.Flusher).Flush()
-			}
-			<-r.Context().Done()
 			return
 		}
 		writeSSE(w, resp)
@@ -2657,12 +2635,19 @@ func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
 	// one completed chunk, then silence: the answer is half an answer and the
 	// attempt has to expire rather than wait for the rest
 	first := sseFrame(`{"model":"m-a","choices":[{"index":0,"delta":{"content":"half an answer"}}]}`)
-	srv := newScriptedSSERawServer(t, sseStall(first), sseStall(first))
+	// Driven through run() directly rather than runDriver: both assertions read the
+	// endpoint URL out of the diagnostic, and runResult exposes no URL.
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		// The queue holds one entry per attempt: chatRetryAttempts is pinned to 2
+		// above, so two stalls are scripted and a third POST would be unscripted.
+		"m-a": {stallAfterFrames(first), stallAfterFrames(first)},
+	})
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
 	elapsed := time.Since(start)
+	srv.checkNoUnscriptedRequests(t)
 
 	if elapsed > time.Second {
 		t.Errorf("run took %s, want each attempt bounded by the 50ms idle bound, not by the scripted stall", elapsed)
@@ -2673,7 +2658,7 @@ func TestRunMidStreamStallTimesOutOnTheReadLeg(t *testing.T) {
 	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "while reading the response") {
 		t.Errorf("error event text = %q, want the response-reading leg named", got)
 	}
-	target := srv.srv.URL + "/chat/completions"
+	target := srv.url() + "/chat/completions"
 	assertTimeoutErrorLine(t, stderr.String(), target, 50*time.Millisecond)
 	if got := driverErrorLine(stderr.String(), target); !strings.Contains(got, "while reading the response") || strings.Contains(got, "read response:") {
 		t.Errorf("error line = %q, want it to name the response-reading leg once without nesting %q", got, "read response:")
@@ -2697,12 +2682,19 @@ func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
 		chatAttemptTimeout, chatRetryAttempts, chatRetryBackoff = oldTimeout, oldAttempts, oldBackoff
 	}()
 
-	srv := newScriptedSSERawServer(t, sseStall(""), sseStall(""))
+	// Driven through run() directly rather than runDriver: both assertions read the
+	// endpoint URL out of the diagnostic, and runResult exposes no URL.
+	srv := newScriptedModelServer(t, map[string][]modelEntry{
+		// One silent entry per attempt: chatRetryAttempts is pinned to 2 above, so
+		// two silences are scripted and a third POST would be unscripted.
+		"m-a": {stallAfterFrames(""), stallAfterFrames("")},
+	})
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := run([]string{"p", "--model", "m-a", "--base-url", srv.srv.URL}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
+	code := run([]string{"p", "--model", "m-a", "--base-url", srv.url()}, strings.NewReader(""), &stdout, &stderr, func(string) (string, bool) { return "", false })
 	elapsed := time.Since(start)
+	srv.checkNoUnscriptedRequests(t)
 
 	if elapsed > time.Second {
 		t.Errorf("run took %s, want each attempt bounded by the 50ms idle bound, not by the scripted stall", elapsed)
@@ -2710,7 +2702,7 @@ func TestRunStallBeforeFirstByteTimesOutOnTheRoundTrip(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("exit code = 0, want non-zero once every attempt goes unanswered; stderr = %q", stderr.String())
 	}
-	target := srv.srv.URL + "/chat/completions"
+	target := srv.url() + "/chat/completions"
 	assertTimeoutErrorLine(t, stderr.String(), target, 50*time.Millisecond)
 	if got := oneErrorEvent(t, stdout.String()); !strings.Contains(got, "timed out") {
 		t.Errorf("error event text = %q, want the attempt timeout", got)
