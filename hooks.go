@@ -293,8 +293,9 @@ func toolMatches(tools []string, protocolName string) bool {
 }
 
 // hookToolName is the Driver's tool name in the hook protocol's vocabulary, the
-// one the manifest is written in. The file Tools never pass through it: guardRead
-// names "Read" for both, so one credential-path rule covers all three Tools.
+// one the manifest is written in. The file Tools never pass through it:
+// readPresentation names "Read" for both, so one credential-path rule covers
+// all three Tools.
 func hookToolName(driverTool string) string {
 	if driverTool == "bash" {
 		return "Bash"

@@ -18,10 +18,15 @@ import (
 // process cwd, which is where a file Tool acts — there is no per-run working
 // directory to consult.
 //
-// The Guard Hook chain is asked inside run rather than at plan time, so the
-// call is judged when it runs: the tool_call event is already on the wire by
-// then, exactly as it is for bash. A refusal states its own failure — it never
-// reached the disk, so there is no write verdict to read.
+// The Guard Hook chain is not asked here: the plan declares its Read
+// presentation and guardRun — the one sequence dispatch runs every plan through
+// — asks the chain when the call runs rather than while it is planned, so the
+// tool_call event is already on the wire before any hook fires, exactly as it is
+// for bash. A refusal therefore arrives before this closure is ever called: it
+// states its own failure, because nothing reached the disk and there is no write
+// verdict to read. The subject handed back is the declared path — a path has
+// nothing for a hook to rewrite — so run acts on the one resolved value the
+// event reported.
 func planWriteCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Path    string `json:"path"`
@@ -35,13 +40,11 @@ func planWriteCall(call toolCall, input any, s session) toolPlan {
 		return fileErrorPlan(input, "error: %v", err)
 	}
 	return toolPlan{
-		input:  input,
-		target: resolved,
-		run: func(string) toolResult {
-			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
-				return toolResult{text: refusal, failed: true}
-			}
-			return writeFileTool(resolved, args.Content)
+		input:        input,
+		target:       resolved,
+		presentation: readPresentation(resolved),
+		run: func(subject string) toolResult {
+			return writeFileTool(subject, args.Content)
 		},
 	}
 }
@@ -65,8 +68,9 @@ func resolveFilePath(path string) (string, error) {
 
 // planEditCall reads one Edit Tool call and plans the exact-text replacement in
 // its file. It shares planWriteCall's reason for resolving the path here rather
-// than inside run, and that one resolved value is both plan.target and the file
-// the edit rewrites.
+// than inside run, for declaring the Read presentation rather than guarding in
+// run, and that one resolved value is both plan.target and the file the edit
+// rewrites.
 func planEditCall(call toolCall, input any, s session) toolPlan {
 	var args struct {
 		Path       string `json:"path"`
@@ -88,13 +92,11 @@ func planEditCall(call toolCall, input any, s session) toolPlan {
 		return fileErrorPlan(input, "error: %v", err)
 	}
 	return toolPlan{
-		input:  input,
-		target: resolved,
-		run: func(string) toolResult {
-			if refusal := s.cfg.hooks.guardRead(resolved, s.stderr); refusal != "" {
-				return toolResult{text: refusal, failed: true}
-			}
-			return editFileTool(resolved, args.OldString, args.NewString, args.ReplaceAll)
+		input:        input,
+		target:       resolved,
+		presentation: readPresentation(resolved),
+		run: func(subject string) toolResult {
+			return editFileTool(subject, args.OldString, args.NewString, args.ReplaceAll)
 		},
 	}
 }
@@ -129,9 +131,15 @@ func editFileTool(path, oldString, newString string, replaceAll bool) toolResult
 
 // fileErrorPlan is a file Tool plan that never touches the filesystem: nothing
 // ran, so the plan states the failure the call text reports rather than leaving a
-// verdict to be inferred from how that text reads.
+// verdict to be inferred from how that text reads. It declares no presentation
+// on purpose: a call that never resolved a path gives the Guard chain no subject
+// to rule on, so no hook is ever asked for it.
 func fileErrorPlan(input any, format string, a ...any) toolPlan {
-	return toolPlan{input: input, run: func(string) toolResult { return failedResult(format, a...) }}
+	return toolPlan{
+		input:        input,
+		presentation: nonePresentation(),
+		run:          func(string) toolResult { return failedResult(format, a...) },
+	}
 }
 
 // writeFileTool writes content over path, creating the parents the Model did not
