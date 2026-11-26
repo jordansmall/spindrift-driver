@@ -1046,11 +1046,11 @@ func TestToolResultEventCarriesThePlansSubagent(t *testing.T) {
 		input:    map[string]any{"agent": "reviewer", "task": "read main.go"},
 		target:   "reviewer",
 		subagent: "reviewer",
-		run:      func() toolResult { return toolResult{text: "the child's answer"} },
+		run:      func(string) toolResult { return toolResult{text: "the child's answer"} },
 	}
 
 	var buf bytes.Buffer
-	ev := toolResultEvent("msg-1", "call_1", "subagent", plan, plan.run())
+	ev := toolResultEvent("msg-1", "call_1", "subagent", plan, plan.run(""))
 	if err := (eventWriter{w: &buf}).emit(ev); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
@@ -1173,7 +1173,10 @@ func TestRunToolPairForUnknownTool(t *testing.T) {
 // makes against one run's resolved set: a name the Tool table knows but this set
 // does not is refused with the callable set named and plans nothing, a name no
 // table entry knows keeps the unknown-tool wording, and a name the set holds
-// still plans its own work.
+// still plans its own work. The refusals go through guardRun, not plan.run, so
+// the pin covers the sequence dispatch actually runs: a refusal declares no
+// presentation, so the chain is asked nothing and the plan's own answer comes
+// back untouched.
 func TestPlanToolCallBoundsTheRunSet(t *testing.T) {
 	cfg := completeConfig("")
 	cfg.tools = resolveTools(agentEntry{Name: "solo", Tools: []string{"bash"}}, nil)
@@ -1185,14 +1188,14 @@ func TestPlanToolCallBoundsTheRunSet(t *testing.T) {
 			t.Errorf("%s plan.target = %q, want a refused call to plan nothing", name, plan.target)
 		}
 		want := fmt.Sprintf("error: cannot call tool %q: this run may call bash", name)
-		if res := plan.run(); !res.failed || res.text != want {
-			t.Errorf("%s run() = (%q, failed=%v), want (%q, failed=true)", name, res.text, res.failed, want)
+		if res := s.guardRun(plan); !res.failed || res.text != want {
+			t.Errorf("%s refused through dispatch = (%q, failed=%v), want (%q, failed=true)", name, res.text, res.failed, want)
 		}
 	}
 
 	unknown := planToolCall(toolCall{ID: "call_q", Type: "function", Function: toolCallFunction{Name: "squiggle", Arguments: "{}"}}, s)
-	if res := unknown.run(); !res.failed || res.text != `error: unknown tool "squiggle"` {
-		t.Errorf("squiggle run() = (%q, failed=%v), want the unknown-tool wording flagged as a failure", res.text, res.failed)
+	if res := s.guardRun(unknown); !res.failed || res.text != `error: unknown tool "squiggle"` {
+		t.Errorf("squiggle refused through dispatch = (%q, failed=%v), want the unknown-tool wording flagged as a failure", res.text, res.failed)
 	}
 
 	granted := planToolCall(toolCall{ID: "call_b", Type: "function", Function: toolCallFunction{Name: "bash", Arguments: `{"command":"echo hi"}`}}, s)
@@ -5193,6 +5196,181 @@ func TestRunGuardHookRefusalReachesModel(t *testing.T) {
 	}
 }
 
+// TestGuardRunRefusalRunsNothing is the guarantee the dispatch Guard sequence
+// owns rather than one Tool's: a plan that declares a presentation cannot reach
+// its own run until the chain has answered. A refusal is the Tool Result
+// verbatim and states its own failure, run is never called so no subject ever
+// reaches the Tool, and with nothing that ran there is no Tool Result for the
+// summary hook to soften.
+func TestGuardRunRefusalRunsNothing(t *testing.T) {
+	deny := writeGuardHookScript(t, "deny.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	summary := writeGuardHookScript(t, "summarize.sh",
+		`echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+	s := session{cfg: config{hooks: &guardChain{
+		pre:     []guardHook{{path: deny}},
+		summary: &summaryHook{path: summary},
+	}}, stderr: io.Discard}
+
+	ran := false
+	plan := toolPlan{
+		input:        map[string]any{"command": "cat ~/.ssh/id_ed25519"},
+		target:       "cat ~/.ssh/id_ed25519",
+		presentation: commandPresentation("bash", "cat ~/.ssh/id_ed25519"),
+		run: func(subject string) toolResult {
+			ran = true
+			return toolResult{text: "ran " + subject}
+		},
+	}
+
+	res := s.guardRun(plan)
+	if ran {
+		t.Errorf("run was called for a refused call: %q", res.text)
+	}
+	if want := "error: guard hook " + deny + " denied this command: credential path"; res.text != want {
+		t.Errorf("refusal = %q, want the chain's refusal verbatim %q", res.text, want)
+	}
+	if !res.failed {
+		t.Errorf("refusal failed = false, want true: a call that never ran has no clean verdict: %+v", res)
+	}
+}
+
+// TestGuardRunRewriteHandsRunTheSubjectTheChainAnswered is the other half of the
+// dispatch Guard sequence: what a rewrite replaces is what executes, so run
+// receives the chain's answer rather than the Model's command — and plan.target,
+// the half already on the wire when the hook fired, still reports the command the
+// Model asked for.
+func TestGuardRunRewriteHandsRunTheSubjectTheChainAnswered(t *testing.T) {
+	rewrite := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`)
+	s := session{cfg: config{hooks: chainOf(guardHook{path: rewrite, rewrites: true})}, stderr: io.Discard}
+
+	original := "cat ~/.ssh/id_ed25519"
+	subject := ""
+	plan := toolPlan{
+		input:        map[string]any{"command": original},
+		target:       original,
+		presentation: commandPresentation("bash", original),
+		run: func(given string) toolResult {
+			subject = given
+			return toolResult{text: "ran " + given}
+		},
+	}
+
+	res := s.guardRun(plan)
+	if subject != "echo scrubbed" {
+		t.Errorf("run was handed subject %q, want the command the chain rewrote to", subject)
+	}
+	if plan.target != original {
+		t.Errorf("plan.target = %q, want the command the Model asked for %q — a rewrite is host policy, not a retro-edit of the call", plan.target, original)
+	}
+	if res.failed {
+		t.Errorf("rewritten call reported failed = true, want failed = false: %+v", res)
+	}
+	if res.text != "ran echo scrubbed" {
+		t.Errorf("run's result = %q, want the output of the subject it was handed", res.text)
+	}
+}
+
+// TestGuardRunSummarizesTheCommandThatRan pins the post-call half of the dispatch
+// sequence to the shape that declares it: the summary hook is asked after run, it
+// is handed the subject that actually executed rather than the target the Model
+// named, its prose replaces the Tool Result, and the verdict stays the command's
+// own because prose cannot say what a command exited with.
+func TestGuardRunSummarizesTheCommandThatRan(t *testing.T) {
+	stdin := filepath.Join(t.TempDir(), "summary-stdin.json")
+	rewrite := writeGuardHookScript(t, "sanitize.sh",
+		`echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo scrubbed"}}}'`)
+	summary := writeGuardHookScript(t, "summarize.sh",
+		`cat > `+stdin+`
+echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+	s := session{cfg: config{hooks: &guardChain{
+		pre:     []guardHook{{path: rewrite, rewrites: true}},
+		summary: &summaryHook{path: summary},
+	}}, stderr: io.Discard}
+
+	original := "cat ~/.ssh/id_ed25519"
+	plan := toolPlan{
+		target:       original,
+		presentation: commandPresentation("bash", original),
+		// A failed command: the summary replaces the text, and only the Tool knows
+		// the exit was non-zero.
+		run: func(given string) toolResult { return toolResult{text: "ran " + given, failed: true} },
+	}
+
+	res := s.guardRun(plan)
+	if res.text != "SUMMARY" {
+		t.Errorf("Tool Result = %q, want the summary hook's replacement", res.text)
+	}
+	if !res.failed {
+		t.Errorf("verdict = clean, want the run's own failure kept under the summary: %+v", res)
+	}
+	written, err := os.ReadFile(stdin)
+	if err != nil {
+		t.Fatalf("read the summary hook's stdin: %v", err)
+	}
+	if !strings.Contains(string(written), `"tool_name":"Bash"`) {
+		t.Errorf("summary hook read %s, want the Bash protocol name", written)
+	}
+	if !strings.Contains(string(written), `"tool_input":{"command":"echo scrubbed"}`) {
+		t.Errorf("summary hook read %s, want the command that actually ran, not the Model's %q", written, original)
+	}
+}
+
+// TestGuardRunNonePresentationAsksNothing is the guarantee a Subagent spawn and a
+// refused-for-any-other-reason call depend on: a plan that declares no
+// presentation is never handed to the chain at all — not even its jq
+// precondition — so a host whose hooks deny every command still runs the calls
+// that present nothing.
+func TestGuardRunNonePresentationAsksNothing(t *testing.T) {
+	tmp := t.TempDir()
+	asked, summarised := filepath.Join(tmp, "asked"), filepath.Join(tmp, "summarised")
+	deny := writeGuardHookScript(t, "deny.sh",
+		`touch `+asked+`
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"credential path"}}'`)
+	summary := writeGuardHookScript(t, "summarize.sh",
+		`touch `+summarised+`
+echo '{"hookSpecificOutput":{"updatedToolOutput":"SUMMARY"}}'`)
+	s := session{cfg: config{hooks: &guardChain{
+		pre:     []guardHook{{path: deny}},
+		summary: &summaryHook{path: summary},
+	}}, stderr: io.Discard}
+
+	for _, tc := range []struct {
+		name         string
+		presentation guardPresentation
+	}{
+		{"declared none", nonePresentation()},
+		{"undeclared", guardPresentation{}},
+	} {
+		ran := false
+		plan := toolPlan{
+			target:       "reviewer",
+			subagent:     "reviewer",
+			presentation: tc.presentation,
+			run: func(string) toolResult {
+				ran = true
+				return toolResult{text: "the child's answer"}
+			},
+		}
+		res := s.guardRun(plan)
+		if !ran {
+			t.Errorf("%s: run was not called, so a call presenting nothing still needs the chain's leave: %q", tc.name, res.text)
+		}
+		if res.failed || res.text != "the child's answer" {
+			t.Errorf("%s: Tool Result = (%q, failed=%v), want the call to run freely", tc.name, res.text, res.failed)
+		}
+		if hookMarkerExists(t, asked) {
+			t.Fatalf("%s: the Guard chain was asked about a call that presents nothing", tc.name)
+		}
+		// The summary hook is the command shape's post-call half: a call that presents
+		// nothing has no result a host rule summarises.
+		if hookMarkerExists(t, summarised) {
+			t.Errorf("%s: the summary hook was asked about a call that presents nothing", tc.name)
+		}
+	}
+}
+
 // TestRunWithNoHookManifestRunsBashCommand: the guard chain must cost an
 // unconfigured run nothing at all — same command, same output, no error flag.
 // The absence is the Driver Config saying nothing, so this is the case a Hook
@@ -5332,7 +5510,7 @@ esac`)
 
 // TestRunGuardBlockedCallDoesNotFeedTheRefusalStreak pins the seam between the
 // Guard Hook and the repeated-call breaker that only the turn loop can show: the
-// denial is authored inside plan.run(), so the call it answers is a call the loop
+// denial is authored by the dispatch Guard sequence, so the call it answers is
 // dispatched, and a dispatched call starts the refusal streak over. A Guard-Hook
 // block is also a Tool Result the Model reads and can act on, which is exactly
 // what a breaker refusal is not — so counting it as a refusal, or letting the two

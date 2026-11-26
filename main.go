@@ -299,7 +299,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, lookupEnv fun
 			verdict := breaker.decide(tc.Function.Name, tc.Function.Arguments)
 			result := verdict.result
 			if verdict.runs() {
-				result = plan.run()
+				result = sess.guardRun(plan)
 			}
 			_ = events.emit(toolResultEvent(messageID, toolID, tc.Function.Name, plan, result))
 			if verdict.endsRun() {
@@ -414,9 +414,16 @@ type toolPlan struct {
 	// subagent is the agent a Subagent Tool call acted on, and "" for every other
 	// tool, so the subagent key stays off every ordinary tool_result line.
 	subagent string
+	// presentation declares how — and whether — the Guard chain is asked about
+	// this call before it runs: commandPresentation for a command,
+	// readPresentation for a file path, and the zero value for a call nothing has
+	// a subject to rule on. Only guardRun reads it, so a plan cannot run past the
+	// chain it declared.
+	presentation guardPresentation
 	// run produces the Tool Result: the text the Model is sent and the verdict the
-	// Tool states.
-	run func() toolResult
+	// Tool states. The subject it is handed is what the Guard chain answered with,
+	// which after a rewrite is not the target the Model's own call reported.
+	run func(subject string) toolResult
 }
 
 // session is what a tool call needs from the run that made it. A Subagent Tool
@@ -431,6 +438,32 @@ type session struct {
 	// session travels into a plan closure by value: a tally of its own would add
 	// to a copy.
 	relay relayFunc
+}
+
+// guardRun is the one Guard sequence every planned call runs inside, so the
+// chain is a property of dispatch rather than of each Tool: a plan that declares
+// a presentation cannot be run without the chain being asked about it.
+//
+// A refusal is the Tool Result and run is never called — with no execution there
+// is nothing to read a verdict from, so the denial states the failure, and with
+// nothing that ran there is no result for the summary hook to replace. What the
+// chain hands back is the subject run acts on. The summary hook is asked only for
+// the shape that declares one, and with the subject that actually ran rather than
+// plan.target, which keeps reporting the command the Model asked for. A declared
+// presentation already carries the protocol name, so the Driver-name mapping
+// summarize still does is a pass-through on it.
+func (s session) guardRun(plan toolPlan) toolResult {
+	subject, refusal := s.cfg.hooks.guard(plan.presentation, s.stderr)
+	if refusal != "" {
+		return toolResult{text: refusal, failed: true}
+	}
+	res := plan.run(subject)
+	if plan.presentation.summarizes {
+		// The verdict is taken before the summary hook is asked, because its prose may
+		// replace the text and prose cannot say what a command exited with.
+		res.text = s.cfg.hooks.summarize(plan.presentation.protocolName, subject, res.text, s.stderr)
+	}
+	return res
 }
 
 // toolResultEvent is the tool_result half of the pair. It only copies the verdict
@@ -481,9 +514,9 @@ func planToolCall(call toolCall, s session) toolPlan {
 	// so neither half of the event pair claims something it acted on, while
 	// tool_name still reports the name the Model asked for.
 	if _, known := nativeToolByName(name); known {
-		return toolPlan{input: input, run: func() toolResult { return failedResult("%s", callRefusal(name, s.cfg.tools)) }}
+		return toolPlan{input: input, run: func(string) toolResult { return failedResult("%s", callRefusal(name, s.cfg.tools)) }}
 	}
-	return toolPlan{input: input, run: func() toolResult { return failedResult("error: unknown tool %q", name) }}
+	return toolPlan{input: input, run: func(string) toolResult { return failedResult("error: unknown tool %q", name) }}
 }
 
 // callRefusal is the answer to a call for a Tool outside this run's resolved
@@ -505,33 +538,23 @@ func planBashCall(call toolCall, input any, s session) toolPlan {
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-		return toolPlan{input: input, run: func() toolResult { return failedResult(unparseableArgs, err) }}
+		return toolPlan{input: input, run: func(string) toolResult { return failedResult(unparseableArgs, err) }}
 	}
-	// The Guard chain runs when the call runs, not when it is planned: a hook is a
-	// script bounded by guardHookTimeout, and planning must stay parsing so the
-	// tool_call event is already on the wire before any hook fires. The refusal is
-	// what the Model is told, and it states its own failure rather than leaning on
-	// how its prefix reads — so the refusal needs no new event grammar, only that
-	// runBashTool is never reached. A rewrite is host policy on what executes, so
-	// it replaces the command runBashTool is handed while tool_target keeps
-	// reporting the command the Model asked for.
+	// The Guard chain is not asked here: the plan declares its presentation, and
+	// guardRun — the one sequence dispatch runs every plan through — asks the
+	// chain when the call runs rather than while it is planned, so the tool_call
+	// event is already on the wire before any hook fires. Asking in dispatch
+	// instead of in this closure is what makes a declared presentation impossible
+	// to run without.
+	//
+	// The subject runBashTool receives is the chain's answer, so a rewrite of host
+	// policy replaces the command that executes while tool_target keeps reporting
+	// the command the Model asked for.
 	return toolPlan{
-		input:  input,
-		target: args.Command,
-		run: func() toolResult {
-			command, refusal := s.cfg.hooks.guardCommand(args.Command, call.Function.Name, s.stderr)
-			if refusal != "" {
-				// A refused call never ran, so there is no exit status to read a verdict
-				// from: the denial is itself the failure. With nothing to summarise, the
-				// summary hook is not asked.
-				return toolResult{text: refusal, failed: true}
-			}
-			res := runBashTool(command)
-			// The verdict is taken before the summary hook is asked, because its prose may
-			// replace the text and prose cannot say what a command exited with.
-			res.text = s.cfg.hooks.summarize(call.Function.Name, command, res.text, s.stderr)
-			return res
-		},
+		input:        input,
+		target:       args.Command,
+		presentation: commandPresentation(call.Function.Name, args.Command),
+		run:          runBashTool,
 	}
 }
 
