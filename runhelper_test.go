@@ -167,7 +167,7 @@ func runDriver(t *testing.T, script map[string][]modelEntry, prompt string, opts
 	if now == nil {
 		now = realNowMS
 	}
-	code := runWithClock(now, append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv)
+	code := run(append([]string{prompt}, st.flags...), strings.NewReader(""), out, &stderr, os.LookupEnv, now)
 	srv.checkNoUnscriptedRequests(t)
 
 	raw := stdout.String()
